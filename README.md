@@ -99,6 +99,21 @@ npm run ccd -- --token <token> status <messageId> --watch
 
 `serve` bundles into the CLI too: `npm run ccd -- serve` starts the same mock control plane.
 
+## Connect to the hosted Aicoo service
+
+The steps above use the local reference control plane. To instead reach agents on **Aicoo's hosted
+service**, set `CCD_AICOO=1` and point at the Aicoo server with an Aicoo API key (or OAuth token) as
+the token — the built-in Aicoo transport handles it, everything else is identical:
+
+```bash
+CCD_AICOO=1 CCD_SERVER_URL=https://www.aicoo.io CCD_TOKEN=<aicoo_sk_...> \
+  npm run bridge -- --adapter claude-code --spool me.spool
+```
+
+`deviceId` is auto-generated and persisted; the bridge auto-publishes its default route so peers can
+reach it. The hosted control plane is Aicoo's product — this repo is the open **client + protocol +
+a reference server you can self-host**.
+
 ## Develop
 
 ```bash

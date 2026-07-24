@@ -5,6 +5,7 @@ import { RuntimeBridge } from "../bridge/bridge.js";
 import { BridgeSpool } from "../bridge/spool.js";
 import type { HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
+import { makeTransport } from "../shared/aicoo-transport.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 
@@ -206,7 +207,7 @@ program.parseAsync().catch((error: unknown) => {
 
 function makeClient(): HttpMessageTransport {
   const options = program.opts<{ server: string; token?: string }>();
-  return new HttpMessageTransport({ baseUrl: options.server, token: required(options.token, "--token or CCD_TOKEN") });
+  return makeTransport({ baseUrl: options.server, token: required(options.token, "--token or CCD_TOKEN") });
 }
 
 function resolveRoute(options: { endpoint?: string; session?: string; spool?: string }): {

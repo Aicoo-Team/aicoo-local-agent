@@ -34,6 +34,10 @@ export interface HttpTransportOptions {
   minReconnectMs?: number;
   maxReconnectMs?: number;
   fetchImpl?: typeof fetch;
+  /** Stable per-machine device identifier. Required by the Aicoo control plane
+   *  (POST /api/v1/local-agent/endpoints), which mints a device credential keyed
+   *  to (principal, deviceId). Ignored by the standalone HttpMessageTransport. */
+  deviceId?: string;
 }
 
 export class HttpMessageTransport implements MessageTransport {
