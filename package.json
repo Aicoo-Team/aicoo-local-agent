@@ -1,0 +1,32 @@
+{
+  "name": "@aicoo/local-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Open agent-to-agent messaging protocol, local runtime bridge, and reference control plane for reaching a live local coding agent (Claude Code / Codex) safely.",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/Aicoo-Team/aicoo-local-agent",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "serve": "tsx src/control-plane/server.ts",
+    "bridge": "tsx src/bridge/main.ts",
+    "ccd": "tsx src/cli/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.211",
+    "@hono/node-server": "^1.19.7",
+    "commander": "^14.0.3",
+    "hono": "^4.12.30",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
