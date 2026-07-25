@@ -12,6 +12,45 @@ two-machine test, and the gotchas that already bit us.**
 
 ---
 
+## Quick start — get your agent reachable (copy-paste)
+
+Run this on the machine whose Claude Code should be reachable. It keeps a bridge running against
+**production** (`https://www.aicoo.io`). Re-run step 4 after any reboot. **Never delete `me.spool`
+or any bridge file** — it holds your session identity and delivery cursor; deleting it invalidates
+every grant others gave you and replays stale messages.
+
+1. **Get the code**
+   ```bash
+   git clone https://github.com/Aicoo-Team/aicoo-local-agent.git 2>/dev/null; cd aicoo-local-agent && git pull
+   ```
+2. **Install** — only `npm ci`, never `npm install`
+   ```bash
+   npm ci
+   ```
+3. **Claude Code ≥ 2.1.211 and logged in** — otherwise incoming messages only get "Not logged in" back
+   ```bash
+   claude --version          # too old? npm i -g @anthropic-ai/claude-code
+   # log in: run `claude`, then `/login`   (or export ANTHROPIC_API_KEY)
+   ```
+4. **Start the bridge in the background** (safe to re-run — it kills a previous one first)
+   ```bash
+   pkill -9 -f bridge/main.ts 2>/dev/null
+   CCD_AICOO=1 CCD_SERVER_URL=https://www.aicoo.io CCD_TOKEN=<your_aicoo_sk_key> \
+     nohup npm run bridge -- --adapter claude-code --spool me.spool > bridge.log 2>&1 &
+   ```
+   `CCD_SERVER_URL` **must** include `www` (the apex strips the `Authorization` header → silent 401).
+5. **Confirm healthy**
+   ```bash
+   cat bridge.log
+   ```
+   Expect a JSON blob with `endpointId` (`ep_…`) and `sessions`; within ~20–60s a
+   `[bridge] default route -> rs_…` line; no crash; then a silent 20s heartbeat (a quiet log =
+   healthy). Note the `endpointId`.
+
+Keep it running. For the two-machine test (§5), each machine runs this with its own key.
+
+---
+
 ## 0. What this is
 
 **The problem:** you're blocked on something only a teammate — or their codebase — can answer
@@ -62,7 +101,9 @@ this is where you bind to a hosted control plane.
 
 ---
 
-## 2. Current status
+## 2. Status, your tasks, and tests
+
+### Where we are
 
 **Done / verified:**
 - Two-machine loop proven end-to-end against a hosted deployment (see status line above). Backed-up
@@ -75,14 +116,36 @@ this is where you bind to a hosted control plane.
   (a phantom session no longer crashes the bridge — it's dropped and a fresh session is created).
 
 **Known-open (not bugs in this loop):**
-- **Answering side must be logged in.** In the proven run, the reply text was *"Please run
-  /login"* — the pipeline was 100% healthy; the receiving Claude Code CLI just wasn't authenticated.
-  Log it in (`claude /login` or `ANTHROPIC_API_KEY`) to get real answers.
+- **Answering side must be logged in.** In the proven run, the reply text was *"Please run /login"* —
+  the pipeline was 100% healthy; the receiving Claude Code CLI just wasn't authenticated.
 - **Server-side hot-path fix** (performance): under load, per-event control-plane work can saturate
-  the DB connection pool and make acks/route updates hang (>5s). The fix is to lighten the realtime
-  hot path (a monotonic auto-increment cursor instead of a per-event `MAX+1` transaction, plus
-  slimmer handlers) — this is control-plane work, tracked on the hosted-backend side.
+  the DB connection pool and make acks/route updates hang (>5s). Fix = lighten the realtime hot path
+  (a monotonic auto-increment cursor instead of a per-event `MAX+1` transaction, plus slimmer
+  handlers) — control-plane work, tracked on the hosted-backend side.
 - **Owner-approved tools** (`canUseTool`) is not wired — see §7.
+
+### What you need to do
+
+| Priority | Task | Done when |
+| --- | --- | --- |
+| **P0** | Validate the two-machine text-only loop on **production** (`www.aicoo.io`) | `request → accept → send → reply` routed back to the asker, correlated to `messageId`; tools off ⇒ no side effect on the receiver |
+| **P0** | Validate the flow in the **desktop app** | Collaborate button + Accept/Allow prompts render and work; if a built-in "Local Agent" toggle exists it registers an endpoint (if not, use the Quick-start bridge) |
+| **P1** | Fix whatever breaks | loop green again — client fixes in this repo; backend fixes on the hosted backend (see §8) |
+| **P1** | Land the **server hot-path fix** | monotonic auto-increment cursor + slimmer handlers replace the per-event `MAX+1` transaction (see Known-open) |
+| **P2** | **Owner-approved tools — design + security review only, don't ship** | a reviewed wiring plan (see §7); do **not** flip tools on in these two days |
+
+### Tests
+
+Two kinds: **functional** (automated — run anywhere) and **scenario** (manual — real machines/accounts).
+
+| Kind | What it checks | How | Status |
+| --- | --- | --- | --- |
+| Functional · automated | contracts, Claude/Codex adapters, control-plane services, bridge e2e (34 tests) | `npm ci && npm run typecheck && npm test` | ✅ green |
+| Functional · single-machine real provider | provider ACK ≤3s + exact correlated reply + hostile prompt causes no side effect | `npm run demo:p1` | ✅ passed |
+| Scenario · two-machine text-only | the full loop across two machines/accounts (the acceptance test) | §5 runbook | ✅ proven on preview — **re-run on prod + desktop** |
+| Scenario · desktop | Collaborate button + Accept/Allow prompts inside the app | manual, in the desktop app | ⏳ to do |
+| Scenario · hostile prompt | tools-off receiver ignores injected "run/delete/write" commands | included in §5 | ✅ single-machine — re-verify two-machine |
+| Scenario · cross-runtime (optional) | a Claude sender reaching a Codex receiver | §5 with `--adapter codex` on B | ⏸ optional |
 
 ---
 
