@@ -54,10 +54,14 @@ class CodexExecTurn implements CodexTurn {
   #closed = false;
 
   constructor(input: CodexTurnStartInput) {
-    this.#child = spawn(input.codexPath ?? "codex", buildArgs(input), {
+    const command = input.codexPath ?? "codex";
+    this.#child = spawn(command, buildArgs(input), {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
+      // Windows cannot execute npm .cmd/.bat shims directly. Limit shell use
+      // to those shims; native executables and POSIX launchers remain direct.
+      shell: requiresWindowsShell(command),
     });
     this.#child.stdin?.end(input.prompt);
     const stdout = createInterface({ input: this.#child.stdout! });
@@ -112,6 +116,13 @@ class CodexExecTurn implements CodexTurn {
   [Symbol.asyncIterator](): AsyncIterator<CodexThreadEvent> {
     return this.#events[Symbol.asyncIterator]();
   }
+}
+
+export function requiresWindowsShell(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
 }
 
 function buildArgs(input: CodexTurnStartInput): string[] {

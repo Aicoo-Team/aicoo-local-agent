@@ -40,6 +40,21 @@ export interface HttpTransportOptions {
   deviceId?: string;
 }
 
+/**
+ * Remove copy/paste artifacts around a bearer token while refusing to silently
+ * rewrite invalid bytes inside the credential. Undici rejects control bytes in
+ * header values before a request is sent, which otherwise surfaces as a vague
+ * `fetch failed` error.
+ */
+export function normalizeBearerToken(token: string): string {
+  const normalized = token.replace(/^[\u0000-\u0020\u007f]+|[\u0000-\u0020\u007f]+$/g, "");
+  if (!normalized) throw new Error("Bearer token must not be empty");
+  if (/[\u0000-\u0020\u007f]/.test(normalized)) {
+    throw new Error("Bearer token contains invalid whitespace or control characters");
+  }
+  return normalized;
+}
+
 export class HttpMessageTransport implements MessageTransport {
   readonly #baseUrl: string;
   readonly #token: string;
@@ -51,7 +66,7 @@ export class HttpMessageTransport implements MessageTransport {
 
   constructor(options: HttpTransportOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/$/, "");
-    this.#token = options.token;
+    this.#token = normalizeBearerToken(options.token);
     this.#timeoutMs = options.timeoutMs ?? 5_000;
     this.#minReconnectMs = options.minReconnectMs ?? 50;
     this.#maxReconnectMs = options.maxReconnectMs ?? 5_000;

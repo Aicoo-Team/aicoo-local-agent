@@ -99,11 +99,37 @@ export async function findClaudeCodeExecutable(): Promise<string | undefined> {
 
 async function findExecutableOnPath(name: string): Promise<string | undefined> {
   const directories = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  const names = executableNames(name);
   for (const directory of directories) {
-    const candidate = resolve(directory, name);
-    if (await isExecutable(candidate)) return candidate;
+    for (const executableName of names) {
+      const candidate = resolve(directory, executableName);
+      if (await isExecutable(candidate)) return candidate;
+    }
   }
   return undefined;
+}
+
+/**
+ * Windows npm installs both an extensionless POSIX shim and native Windows
+ * launchers in the same PATH directory. Never select the extensionless shim on
+ * Windows: child_process cannot execute it there. Prefer a native executable,
+ * then command shims supported by the Codex driver.
+ */
+export function executableNames(
+  name: string,
+  platform: NodeJS.Platform = process.platform,
+  pathExt: string | undefined = process.env.PATHEXT,
+): string[] {
+  if (platform !== "win32") return [name];
+
+  const supported = new Set([".exe", ".cmd", ".bat"]);
+  const configured = (pathExt ?? "")
+    .split(";")
+    .map((extension) => extension.trim().toLowerCase())
+    .filter((extension) => supported.has(extension));
+  const extensions = [...configured, ".exe", ".cmd", ".bat"]
+    .filter((extension, index, all) => all.indexOf(extension) === index);
+  return extensions.map((extension) => `${name}${extension}`);
 }
 
 async function isExecutable(candidate: string): Promise<boolean> {
