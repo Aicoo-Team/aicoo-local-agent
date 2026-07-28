@@ -39,6 +39,11 @@ program.command("bridge")
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option(
+    "--relationship-policy <file>",
+    "JSON allowlist of tools/folders for verified users and devices",
+    process.env.CCD_RELATIONSHIP_POLICY,
+  )
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
   .action(async (options) => {
     const selected = await selectRuntimeAdapter({
@@ -51,6 +56,7 @@ program.command("bridge")
       claudePath: options.claudePath,
       codexStateFile: options.codexState,
       codexPath: options.codexPath,
+      relationshipPolicyFile: options.relationshipPolicy,
       model: options.model,
       log: console.log,
     });

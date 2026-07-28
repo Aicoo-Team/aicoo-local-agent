@@ -159,6 +159,10 @@ The protocol treats an inbound message as **intent and context, never authority*
   runtime's `canUseTool` gate**. The gate calls the owner's resolver, which returns
   `{ behavior: "allow" | "deny", message? }`. It is **fail-closed**: any throw or timeout while
   resolving denies the tool. One approval never implies the next.
+- **Relationship policy.** The reference bridge can load an explicit allowlist keyed by the
+  authenticated sender's principal and device IDs. Tools must be listed, and structured file-tool
+  paths must remain inside listed folders after canonicalization. Missing identity or policy denies
+  access. Tools that cannot be safely path-scoped remain disabled.
 - **Egress discipline.** The reply is an outbound channel back to the sender; the receiver is
   instructed to share only what is appropriate within the current grant and never to reveal
   secrets, credentials, out-of-scope file contents, or third parties' data.

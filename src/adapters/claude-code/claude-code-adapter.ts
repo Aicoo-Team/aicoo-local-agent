@@ -23,7 +23,7 @@ export interface ClaudeCodeAdapterConfig {
   maxBudgetUsdPerSession?: number;
   beforeToolUse?: (
     action: { toolName: string; input: Record<string, unknown> },
-    context: { nativeSessionHandle: string },
+    context: { nativeSessionHandle: string; message?: InboundMessage },
   ) => Promise<void>;
   /**
    * Opt-in permissioned mode (幕 4). When set, the receiver enables `enabledTools`
@@ -33,7 +33,7 @@ export interface ClaudeCodeAdapterConfig {
    */
   resolveToolPermission?: (
     action: { toolName: string; input: Record<string, unknown> },
-    context: { nativeSessionHandle: string },
+    context: { nativeSessionHandle: string; message?: InboundMessage },
   ) => Promise<{ behavior: "allow" | "deny"; message?: string }>;
   enabledTools?: string[];
   driver?: ClaudeAgentDriver;
@@ -347,9 +347,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       strictMcpConfig: true,
       permissionMode: "dontAsk",
       canUseTool: async (toolName, input) => {
+        const activeMessage = session.acceptedTurns[0]?.message;
         await this.#config.beforeToolUse?.(
           { toolName, input },
-          { nativeSessionHandle: session.localHandle },
+          { nativeSessionHandle: session.localHandle, message: activeMessage },
         );
         const resolver = this.#config.resolveToolPermission;
         if (!resolver) {
@@ -362,7 +363,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         try {
           const decision = await resolver(
             { toolName, input },
-            { nativeSessionHandle: session.localHandle },
+            { nativeSessionHandle: session.localHandle, message: activeMessage },
           );
           if (decision.behavior === "allow") {
             return { behavior: "allow" as const, updatedInput: input };

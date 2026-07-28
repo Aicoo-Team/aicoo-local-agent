@@ -54,6 +54,39 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     ]);
   });
 
+  it("passes the active verified sender identity into the tool permission resolver", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    driver.resultDelayMs = 100;
+    const seen: Array<{ principalId?: string; deviceId?: string }> = [];
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: process.cwd(),
+      driver,
+      turnAckTimeoutMs: 500,
+      enabledTools: ["Read"],
+      resolveToolPermission: async (_action, context) => {
+        seen.push({
+          principalId: context.message?.senderPrincipalId,
+          deviceId: context.message?.senderDeviceId,
+        });
+        return { behavior: "allow" };
+      },
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
+      .toMatchObject({ status: "runtime_acked" });
+    const options = driver.starts[0]!.options;
+    expect(options.tools).toEqual(["Read"]);
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
+      signal: new AbortController().signal,
+      toolUseID: "read-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "allow" });
+    expect(seen).toEqual([{ principalId: "prn_a", deviceId: "device-a1" }]);
+  });
+
   it("injects a remote reply as context-only and does not create an automatic reply loop", async () => {
     const driver = new FakeClaudeAgentDriver();
     const adapter = makeAdapter(driver);
@@ -127,6 +160,7 @@ function inbound(
     clientMessageId: `client_${id}`,
     communicationSessionId: "comm_1",
     senderPrincipalId: "prn_a",
+    senderDeviceId: "device-a1",
     target: {
       kind: "runtime_session",
       principalId: "prn_b",

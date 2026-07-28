@@ -114,6 +114,12 @@ CCD_AICOO=1 CCD_SERVER_URL=https://www.aicoo.io CCD_TOKEN=<aicoo_sk_...> \
 reach it. The hosted control plane is Aicoo's product — this repo is the open **client + protocol +
 a reference server you can self-host**.
 
+### Optional relationship permissions
+
+The receiver stays text-only by default. Claude Code owners can opt into a
+user+device-specific tool and folder allowlist with `--relationship-policy`.
+See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
+
 ## Develop
 
 ```bash

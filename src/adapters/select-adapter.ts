@@ -6,6 +6,7 @@ import { ClaudeCodeAdapter } from "./claude-code/claude-code-adapter.js";
 import { CodexAdapter } from "./codex/codex-adapter.js";
 import { FakeRuntimeAdapter } from "./fake/fake-adapter.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
+import { RelationshipPolicy } from "../security/relationship-policy.js";
 
 export type RuntimeAdapterKind = "fake" | "claude-code" | "codex";
 
@@ -19,6 +20,7 @@ export interface RuntimeAdapterSelectionOptions {
   claudePath?: string;
   codexStateFile?: string;
   codexPath?: string;
+  relationshipPolicyFile?: string;
   model?: string;
   log?: (line: string) => void;
 }
@@ -48,6 +50,9 @@ export async function selectRuntimeAdapter(
   }
 
   if (options.kind === "codex") {
+    if (options.relationshipPolicyFile) {
+      throw new Error("relationship tool policies are not supported by the Codex adapter yet; keep Codex text-only");
+    }
     const explicitPath = options.codexPath ? resolve(options.codexPath) : undefined;
     if (explicitPath && !(await isExecutable(explicitPath))) {
       throw new Error(`codex executable is not executable: ${explicitPath}`);
@@ -77,12 +82,24 @@ export async function selectRuntimeAdapter(
     throw new Error(`Claude Code executable is not executable: ${explicitPath}`);
   }
   const configuredPath = explicitPath ?? await findExecutableOnPath("claude");
+  const relationshipPolicy = options.relationshipPolicyFile
+    ? RelationshipPolicy.fromFile(resolve(options.relationshipPolicyFile), resolve(options.workspace))
+    : undefined;
   const adapter = new ClaudeCodeAdapter({
     stateFile: resolve(options.claudeStateFile ?? `${options.spoolFile}.claude.db`),
     cwd: resolve(options.workspace),
     sessionCount: options.sessions,
     ...(configuredPath ? { pathToClaudeCodeExecutable: configuredPath } : {}),
     ...(options.model ? { model: options.model } : {}),
+    ...(relationshipPolicy
+      ? {
+          enabledTools: relationshipPolicy.enabledTools(),
+          resolveToolPermission: async (
+            action: { toolName: string; input: Record<string, unknown> },
+            context: Parameters<NonNullable<import("./claude-code/claude-code-adapter.js").ClaudeCodeAdapterConfig["resolveToolPermission"]>>[1],
+          ) => relationshipPolicy.authorize(action, context.message),
+        }
+      : {}),
     log: options.log,
   });
   return {
