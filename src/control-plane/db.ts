@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS target_offers (
 CREATE TABLE IF NOT EXISTS comm_sessions (
   comm_session_id TEXT PRIMARY KEY,
   requester_principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+  requester_device_id TEXT,
   requester_reply_endpoint_id TEXT NOT NULL REFERENCES endpoints(endpoint_id),
   requester_reply_session_handle TEXT NOT NULL REFERENCES runtime_sessions(session_handle),
   recipient_principal_id TEXT NOT NULL REFERENCES principals(principal_id),
@@ -166,6 +167,7 @@ export function openDb(file: string): AppDatabase {
   const db = new DatabaseSync(file);
   if (file !== ":memory:") db.exec("PRAGMA journal_mode = WAL;");
   db.exec(schema);
+  ensureColumn(db, "comm_sessions", "requester_device_id", "TEXT");
   ensureColumn(db, "messages", "sender_device_id", "TEXT");
   seedMockIdentities(db);
   return db;

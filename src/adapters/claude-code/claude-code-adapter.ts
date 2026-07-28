@@ -338,7 +338,9 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         : {}),
       systemPrompt: this.#config.resolveToolPermission ? permissionedSystemPrompt : systemPrompt,
       tools: this.#config.resolveToolPermission ? (this.#config.enabledTools ?? []) : [],
-      allowedTools: this.#config.resolveToolPermission ? (this.#config.enabledTools ?? []) : [],
+      // Do not pre-approve policy-enabled tools. Leaving this empty ensures each
+      // attempted call reaches canUseTool for relationship/path authorization.
+      allowedTools: [],
       disallowedTools: this.#config.resolveToolPermission
         ? MANAGED_TOOLS.filter((t) => !(this.#config.enabledTools ?? []).includes(t))
         : MANAGED_TOOLS,

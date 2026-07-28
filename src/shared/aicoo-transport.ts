@@ -241,6 +241,7 @@ export class AicooTransport extends HttpMessageTransport {
 interface CommRow {
   commSessionId: string;
   requesterPrincipalId: string;
+  requesterDeviceId?: string | null;
   requesterReplyEndpointId: string;
   requesterReplySessionHandle: string;
   recipientPrincipalId: string;
@@ -261,6 +262,7 @@ function mapCommSession(row: CommRow): CommunicationSession {
     id: row.commSessionId,
     requester: {
       principalId: row.requesterPrincipalId,
+      ...(row.requesterDeviceId ? { deviceId: row.requesterDeviceId } : {}),
       replyEndpointId: row.requesterReplyEndpointId,
       replySessionHandle: row.requesterReplySessionHandle,
     },

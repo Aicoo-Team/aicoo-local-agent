@@ -1,4 +1,13 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { InboundMessage } from "../adapters/runtime-adapter.js";
@@ -14,6 +23,7 @@ const policySchema = z.object({
 }).strict();
 
 export type RelationshipPolicyDocument = z.infer<typeof policySchema>;
+export type RelationshipAccessPreset = "chat-only" | "read-project" | "edit-project";
 
 export interface ToolPermissionDecision {
   behavior: "allow" | "deny";
@@ -40,6 +50,23 @@ const PATH_INPUTS: Readonly<Record<string, readonly string[]>> = {
 // be checked reliably. Keep them blocked until the runtime supplies a stronger
 // OS sandbox and structured child-tool authorization.
 const UNSCOPABLE_TOOLS = new Set(["Bash", "Agent", "Task", "Skill", "Mcp"]);
+const POLICY_SUPPORTED_TOOLS = [
+  "AskUserQuestion",
+  "Edit",
+  "Glob",
+  "Grep",
+  "NotebookEdit",
+  "Read",
+  "WebFetch",
+  "WebSearch",
+  "Write",
+] as const;
+
+const PRESET_TOOLS: Readonly<Record<RelationshipAccessPreset, readonly string[]>> = {
+  "chat-only": [],
+  "read-project": ["Read", "Glob", "Grep"],
+  "edit-project": ["Read", "Glob", "Grep", "Write", "Edit", "NotebookEdit"],
+};
 
 export class RelationshipPolicy {
   readonly #relationships: readonly CompiledRelationship[];
@@ -57,23 +84,25 @@ export class RelationshipPolicy {
   }
 
   static fromFile(file: string, cwd: string): RelationshipPolicy {
-    let raw: unknown;
-    try {
-      raw = JSON.parse(readFileSync(file, "utf8"));
-    } catch (error) {
-      throw new Error(`Could not read relationship policy ${file}: ${String(error)}`);
-    }
-    const parsed = policySchema.safeParse(raw);
-    if (!parsed.success) {
-      throw new Error(`Invalid relationship policy ${file}: ${z.prettifyError(parsed.error)}`);
-    }
-    return new RelationshipPolicy(parsed.data, cwd);
+    return new RelationshipPolicy(readPolicyDocument(file), cwd);
+  }
+
+  static supportedTools(): string[] {
+    return [...POLICY_SUPPORTED_TOOLS];
   }
 
   enabledTools(): string[] {
     return [...new Set(this.#relationships.flatMap((relationship) => [...relationship.tools]))]
       .filter((tool) => !UNSCOPABLE_TOOLS.has(tool))
       .sort();
+  }
+
+  hasToolAccess(message: InboundMessage | undefined): boolean {
+    if (!message?.senderDeviceId) return false;
+    const relationship = this.#relationships.find((candidate) =>
+      candidate.principalId === message.senderPrincipalId
+      && candidate.deviceId === message.senderDeviceId);
+    return Boolean(relationship && relationship.tools.size > 0);
   }
 
   authorize(
@@ -112,6 +141,63 @@ export class RelationshipPolicy {
       }
     }
     return { behavior: "allow" };
+  }
+}
+
+export function upsertRelationshipPreset(input: {
+  file: string;
+  principalId: string;
+  deviceId: string;
+  preset: RelationshipAccessPreset;
+  folder?: string;
+}): RelationshipPolicyDocument {
+  const folder = input.folder?.trim();
+  if (input.preset !== "chat-only" && !folder) {
+    throw new Error(`--folder is required for ${input.preset}`);
+  }
+
+  const existing = readPolicyDocument(input.file);
+  const nextRelationship: RelationshipPolicyDocument["relationships"][number] = {
+    principalId: input.principalId,
+    deviceId: input.deviceId,
+    tools: [...PRESET_TOOLS[input.preset]],
+    folders: folder ? [resolve(folder)] : [],
+  };
+  const relationships = existing.relationships.filter((relationship) =>
+    relationship.principalId !== input.principalId || relationship.deviceId !== input.deviceId);
+  relationships.push(nextRelationship);
+  relationships.sort((left, right) =>
+    `${left.principalId}\u0000${left.deviceId}`.localeCompare(`${right.principalId}\u0000${right.deviceId}`));
+
+  const document: RelationshipPolicyDocument = { version: 1, relationships };
+  writePolicyDocument(input.file, document);
+  return document;
+}
+
+function readPolicyDocument(file: string): RelationshipPolicyDocument {
+  if (!existsSync(file)) return { version: 1, relationships: [] };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error(`Could not read relationship policy ${file}: ${String(error)}`);
+  }
+  const parsed = policySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new Error(`Invalid relationship policy ${file}: ${z.prettifyError(parsed.error)}`);
+  }
+  return parsed.data;
+}
+
+function writePolicyDocument(file: string, document: RelationshipPolicyDocument): void {
+  const target = resolve(file);
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    renameSync(temporary, target);
+    chmodSync(target, 0o600);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
   }
 }
 

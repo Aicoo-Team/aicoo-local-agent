@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CodexAdapter } from "../../src/adapters/codex/codex-adapter.js";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
+import { upsertRelationshipPreset } from "../../src/security/relationship-policy.js";
 import { FakeCodexDriver } from "../helpers/fake-codex-driver.js";
 
 describe("CodexAdapter managed sessions", () => {
@@ -45,6 +46,38 @@ describe("CodexAdapter managed sessions", () => {
       }),
     ]);
     expect(adapter.providerThreadId("codex-managed-1")).toMatch(/^fake-codex-thread-/);
+  });
+
+  it("accepts the shared relationship policy flow but keeps Codex text-only", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "edit-project",
+      folder: directory,
+    });
+    const logs: string[] = [];
+    const driver = new FakeCodexDriver("SAFE_REPLY");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      log: (line) => logs.push(line),
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_policy"), "queue")).status)
+      .toBe("runtime_acked");
+    expect(driver.turns[0]?.prompt).toContain("Do not run commands, read or write files");
+    expect(logs).toContain(
+      "codex relationship requested tool access; continuing chat-only because Codex folder enforcement is not yet a security boundary",
+    );
   });
 
   it("injects a remote reply as context-only and never emits an egress reply event for it", async () => {
@@ -185,6 +218,7 @@ function inbound(
     clientMessageId: `client_${id}`,
     communicationSessionId: "comm_1",
     senderPrincipalId: "prn_a",
+    senderDeviceId: "device_a",
     target: {
       kind: "runtime_session",
       principalId: "prn_b",

@@ -1,9 +1,12 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
-import { RelationshipPolicy } from "../../src/security/relationship-policy.js";
+import {
+  RelationshipPolicy,
+  upsertRelationshipPreset,
+} from "../../src/security/relationship-policy.js";
 
 describe("RelationshipPolicy", () => {
   const directories: string[] = [];
@@ -71,6 +74,44 @@ describe("RelationshipPolicy", () => {
       { toolName: "Bash", input: { command: "pwd" } },
       inbound(),
     )).toMatchObject({ behavior: "deny", message: expect.stringContaining("cannot be safely restricted") });
+  });
+
+  it("creates and updates presets without requiring users to edit JSON", () => {
+    const directory = makeDirectory();
+    const file = join(directory, "relationships.json");
+
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "read-project",
+      folder: directory,
+    });
+    let permissions = RelationshipPolicy.fromFile(file, directory);
+    expect(permissions.authorize(
+      { toolName: "Read", input: { file_path: join(directory, "README.md") } },
+      inbound(),
+    )).toEqual({ behavior: "allow" });
+    expect(permissions.authorize(
+      { toolName: "Write", input: { file_path: join(directory, "README.md") } },
+      inbound(),
+    )).toMatchObject({ behavior: "deny" });
+
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "edit-project",
+      folder: directory,
+    });
+    permissions = RelationshipPolicy.fromFile(file, directory);
+    expect(permissions.authorize(
+      { toolName: "Write", input: { file_path: join(directory, "README.md") } },
+      inbound(),
+    )).toEqual({ behavior: "allow" });
+
+    const document = JSON.parse(readFileSync(file, "utf8")) as { relationships: unknown[] };
+    expect(document.relationships).toHaveLength(1);
   });
 
   function makeDirectory(): string {

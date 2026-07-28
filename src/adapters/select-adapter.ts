@@ -50,9 +50,6 @@ export async function selectRuntimeAdapter(
   }
 
   if (options.kind === "codex") {
-    if (options.relationshipPolicyFile) {
-      throw new Error("relationship tool policies are not supported by the Codex adapter yet; keep Codex text-only");
-    }
     const explicitPath = options.codexPath ? resolve(options.codexPath) : undefined;
     if (explicitPath && !(await isExecutable(explicitPath))) {
       throw new Error(`codex executable is not executable: ${explicitPath}`);
@@ -61,11 +58,20 @@ export async function selectRuntimeAdapter(
     if (!configuredPath) {
       throw new Error("codex executable not found on PATH; install codex or pass --codex-path");
     }
+    const relationshipPolicyFile = options.relationshipPolicyFile
+      ? resolve(options.relationshipPolicyFile)
+      : undefined;
+    if (relationshipPolicyFile) {
+      // Validate the shared onboarding file at startup. Codex reloads it for
+      // each message, while remaining text-only even if it contains tool access.
+      RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+    }
     const adapter = new CodexAdapter({
       stateFile: resolve(options.codexStateFile ?? `${options.spoolFile}.codex.db`),
       cwd: resolve(options.workspace),
       sessionCount: options.sessions,
       codexPath: configuredPath,
+      ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
       ...(options.model ? { model: options.model } : {}),
       log: options.log,
     });
@@ -82,22 +88,29 @@ export async function selectRuntimeAdapter(
     throw new Error(`Claude Code executable is not executable: ${explicitPath}`);
   }
   const configuredPath = explicitPath ?? await findExecutableOnPath("claude");
-  const relationshipPolicy = options.relationshipPolicyFile
-    ? RelationshipPolicy.fromFile(resolve(options.relationshipPolicyFile), resolve(options.workspace))
+  const relationshipPolicyFile = options.relationshipPolicyFile
+    ? resolve(options.relationshipPolicyFile)
     : undefined;
+  if (relationshipPolicyFile) {
+    // Validate once at startup. Authorization reloads the file for every tool
+    // request so an accepted relationship takes effect without restarting.
+    RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+  }
   const adapter = new ClaudeCodeAdapter({
     stateFile: resolve(options.claudeStateFile ?? `${options.spoolFile}.claude.db`),
     cwd: resolve(options.workspace),
     sessionCount: options.sessions,
     ...(configuredPath ? { pathToClaudeCodeExecutable: configuredPath } : {}),
     ...(options.model ? { model: options.model } : {}),
-    ...(relationshipPolicy
+    ...(relationshipPolicyFile
       ? {
-          enabledTools: relationshipPolicy.enabledTools(),
+          enabledTools: RelationshipPolicy.supportedTools(),
           resolveToolPermission: async (
             action: { toolName: string; input: Record<string, unknown> },
             context: Parameters<NonNullable<import("./claude-code/claude-code-adapter.js").ClaudeCodeAdapterConfig["resolveToolPermission"]>>[1],
-          ) => relationshipPolicy.authorize(action, context.message),
+          ) => RelationshipPolicy
+            .fromFile(relationshipPolicyFile, resolve(options.workspace))
+            .authorize(action, context.message),
         }
       : {}),
     log: options.log,

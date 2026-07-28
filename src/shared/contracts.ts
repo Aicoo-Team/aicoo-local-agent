@@ -55,6 +55,8 @@ export interface CommunicationSession {
   id: string;
   requester: {
     principalId: string;
+    /** Server-derived identity of the device that requested this relationship. */
+    deviceId?: string;
     replyEndpointId: string;
     replySessionHandle: string;
   };

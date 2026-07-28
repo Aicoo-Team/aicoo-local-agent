@@ -6,6 +6,10 @@ import { BridgeSpool } from "../bridge/spool.js";
 import type { HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { makeTransport } from "../shared/aicoo-transport.js";
+import {
+  upsertRelationshipPreset,
+  type RelationshipAccessPreset,
+} from "../security/relationship-policy.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 
@@ -144,9 +148,49 @@ connect.command("request")
     print(await makeClient().requestCommunicationSession(input));
   });
 connect.command("list").action(async () => print(await makeClient().listCommunicationSessions()));
-connect.command("accept").argument("<sessionId>").action(async (sessionId) => print(
-  await makeClient().acceptCommunicationSession(sessionId),
-));
+connect.command("accept")
+  .argument("<sessionId>")
+  .addOption(new Option("--access <preset>", "relationship access preset")
+    .choices(["chat-only", "read-project", "edit-project"]))
+  .option("--folder <dir>", "project folder for read/edit access")
+  .option("--policy <file>", "local relationship policy file", "relationships.json")
+  .action(async (sessionId, options) => {
+    const grant = await makeClient().acceptCommunicationSession(sessionId);
+    if (!options.access) {
+      print(grant);
+      return;
+    }
+    const deviceId = grant.requester.deviceId;
+    if (!deviceId) {
+      print({
+        grant,
+        accessPolicy: {
+          status: "not_applied",
+          reason: "The server did not return the requester's verified device ID; access remains chat-only.",
+        },
+      });
+      return;
+    }
+    upsertRelationshipPreset({
+      file: options.policy,
+      principalId: grant.requester.principalId,
+      deviceId,
+      preset: options.access as RelationshipAccessPreset,
+      folder: options.folder,
+    });
+    print({
+      grant,
+      accessPolicy: {
+        status: "saved",
+        preset: options.access,
+        policyFile: options.policy,
+        ...(options.folder ? { folder: options.folder } : {}),
+        note: options.access === "chat-only"
+          ? "Chat-only works with Claude Code and Codex."
+          : "Claude Code enforces this tool preset; Codex safely remains chat-only.",
+      },
+    });
+  });
 connect.command("decline").argument("<sessionId>").action(async (sessionId) => {
   await makeClient().declineCommunicationSession(sessionId);
   console.log("communication session declined");

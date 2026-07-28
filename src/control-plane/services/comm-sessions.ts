@@ -41,13 +41,14 @@ export class CommunicationSessionService {
     const wake: string[] = [];
     transaction(this.db, () => {
       this.db.prepare(
-        `INSERT INTO comm_sessions(comm_session_id, requester_principal_id, requester_reply_endpoint_id,
+        `INSERT INTO comm_sessions(comm_session_id, requester_principal_id, requester_device_id, requester_reply_endpoint_id,
          requester_reply_session_handle, recipient_principal_id, target_kind, target_offer_id,
          requested_ttl_minutes, status, requested_at, request_expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       ).run(
         sessionId,
         auth.principalId,
+        auth.deviceId,
         input.replyEndpointId,
         input.replySessionHandle,
         input.target.principalId,
@@ -61,6 +62,7 @@ export class CommunicationSessionService {
         this.events.append(endpoint.endpointId, "comm.request", {
           communicationSessionId: sessionId,
           requesterPrincipalId: auth.principalId,
+          requesterDeviceId: auth.deviceId,
           targetKind: input.target.kind,
           requestedAt,
           requestExpiresAt,
@@ -74,6 +76,7 @@ export class CommunicationSessionService {
         entityId: sessionId,
         metadata: {
           requesterPrincipalId: auth.principalId,
+          requesterDeviceId: auth.deviceId,
           recipientPrincipalId: input.target.principalId,
           targetKind: input.target.kind,
           requestExpiresAt,
@@ -300,6 +303,7 @@ export class CommunicationSessionService {
 interface CommRow {
   comm_session_id: string;
   requester_principal_id: string;
+  requester_device_id: string | null;
   requester_reply_endpoint_id: string;
   requester_reply_session_handle: string;
   recipient_principal_id: string;
@@ -329,6 +333,7 @@ function mapCommunication(row: CommRow): CommunicationSession {
     id: row.comm_session_id,
     requester: {
       principalId: row.requester_principal_id,
+      ...(row.requester_device_id ? { deviceId: row.requester_device_id } : {}),
       replyEndpointId: row.requester_reply_endpoint_id,
       replySessionHandle: row.requester_reply_session_handle,
     },

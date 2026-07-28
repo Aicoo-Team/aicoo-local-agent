@@ -79,6 +79,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       .toMatchObject({ status: "runtime_acked" });
     const options = driver.starts[0]!.options;
     expect(options.tools).toEqual(["Read"]);
+    expect(options.allowedTools).toEqual([]);
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
       signal: new AbortController().signal,
       toolUseID: "read-tool-call",

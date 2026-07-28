@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { DatabaseSync } from "node:sqlite";
+import { RelationshipPolicy } from "../../security/relationship-policy.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
 import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from "../runtime-adapter.js";
@@ -12,6 +13,7 @@ export interface CodexAdapterConfig {
   cwd: string;
   sessionCount?: number;
   codexPath?: string;
+  relationshipPolicyFile?: string;
   model?: string;
   turnAckTimeoutMs?: number;
   driver?: CodexDriver;
@@ -186,6 +188,21 @@ export class CodexAdapter implements RuntimeAdapter {
     if (mode === "steer") return { status: "steer_not_allowed" } as const;
     if (session.state === "busy" || session.activeTurn) return { status: "queued_busy" } as const;
     if (this.#closing || this.#closed) return { status: "runtime_unavailable" } as const;
+
+    if (this.#config.relationshipPolicyFile) {
+      try {
+        const policy = RelationshipPolicy.fromFile(this.#config.relationshipPolicyFile, this.#config.cwd);
+        if (policy.hasToolAccess(message)) {
+          this.#config.log?.(
+            "codex relationship requested tool access; continuing chat-only because Codex folder enforcement is not yet a security boundary",
+          );
+        }
+      } catch (error) {
+        // Invalid policy must never weaken Codex's text-only isolation. The
+        // message can still receive an automatic text reply.
+        this.#config.log?.(`codex relationship policy could not be loaded; continuing chat-only: ${String(error)}`);
+      }
+    }
 
     const runtimeTurnId = randomUUID();
     const contextOnly = Boolean(message.replyTo);
