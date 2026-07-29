@@ -1,6 +1,7 @@
 import {
   HttpMessageTransport,
   ApiError,
+  normalizeBearerToken,
   type HttpTransportOptions,
 } from "./http-client.js";
 import type {
@@ -43,7 +44,7 @@ export class AicooTransport extends HttpMessageTransport {
   constructor(options: HttpTransportOptions) {
     super(options);
     this.#base = options.baseUrl.replace(/\/$/, "");
-    this.#userToken = options.token;
+    this.#userToken = normalizeBearerToken(options.token);
     this.#timeoutMs = options.timeoutMs ?? 5_000;
     this.#fetch = options.fetchImpl ?? fetch;
     this.#deviceId = options.deviceId?.trim() ?? "";
@@ -100,7 +101,7 @@ export class AicooTransport extends HttpMessageTransport {
       `${LA}/endpoints`,
       { method: "POST", body: { ...input, deviceId: this.#deviceId } },
     );
-    this.#deviceToken = deviceToken;
+    this.#deviceToken = normalizeBearerToken(deviceToken);
     this.#endpoint = endpoint.endpointId;
     this.setEndpointId(endpoint.endpointId);
     return endpoint;

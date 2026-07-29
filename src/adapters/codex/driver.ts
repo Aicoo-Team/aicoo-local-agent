@@ -36,6 +36,11 @@ export interface CodexDriver {
   startTurn(input: CodexTurnStartInput): CodexTurn;
 }
 
+export interface CodexSpawnCommand {
+  command: string;
+  args: string[];
+}
+
 // Verified against codex-cli 0.144.5: `codex exec --json` emits one JSON event per
 // stdout line (thread.started, turn.started, item.*, turn.completed/turn.failed),
 // resume re-emits thread.started with the same thread id, and a failed invocation
@@ -54,10 +59,13 @@ class CodexExecTurn implements CodexTurn {
   #closed = false;
 
   constructor(input: CodexTurnStartInput) {
-    this.#child = spawn(input.codexPath ?? "codex", buildArgs(input), {
+    const command = input.codexPath ?? "codex";
+    const spawnCommand = buildCodexSpawnCommand(command, buildArgs(input));
+    this.#child = spawn(spawnCommand.command, spawnCommand.args, {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
+      windowsVerbatimArguments: false,
     });
     this.#child.stdin?.end(input.prompt);
     const stdout = createInterface({ input: this.#child.stdout! });
@@ -112,6 +120,30 @@ class CodexExecTurn implements CodexTurn {
   [Symbol.asyncIterator](): AsyncIterator<CodexThreadEvent> {
     return this.#events[Symbol.asyncIterator]();
   }
+}
+
+export function requiresWindowsShell(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
+}
+
+export function buildCodexSpawnCommand(
+  command: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): CodexSpawnCommand {
+  if (!requiresWindowsShell(command, platform)) return { command, args };
+
+  // Windows cannot execute npm .cmd/.bat shims directly. Spawn cmd.exe
+  // explicitly so Node still quotes every argv element instead of using
+  // shell:true, which joins the command line with no argument escaping.
+  return {
+    command: env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", command, ...args],
+  };
 }
 
 function buildArgs(input: CodexTurnStartInput): string[] {

@@ -199,6 +199,8 @@ program.showHelpAfterError();
 program.parseAsync().catch((error: unknown) => {
   if (error instanceof ApiError) {
     console.error(JSON.stringify({ status: error.status, code: error.code, body: error.body }, null, 2));
+  } else if (error instanceof Error) {
+    console.error(error.message);
   } else {
     console.error(error);
   }
