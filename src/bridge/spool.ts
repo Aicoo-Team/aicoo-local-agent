@@ -218,6 +218,13 @@ export class BridgeSpool {
     ).run(messageId);
   }
 
+  attemptCount(messageId: string): number {
+    const row = this.db.prepare("SELECT attempt_count FROM spool_messages WHERE message_id = ?").get(messageId) as
+      | { attempt_count: number }
+      | undefined;
+    return row ? Number(row.attempt_count) : 0;
+  }
+
   markResult(messageId: string, status: SpoolStatus, resultCode?: string, runtimeAckId?: string): void {
     this.db.prepare(
       `UPDATE spool_messages SET status = ?, last_result_code = ?, runtime_ack_id = ? WHERE message_id = ?`,

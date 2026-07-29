@@ -4,6 +4,9 @@ import { nowIso } from "../shared/time.js";
 import type { HttpMessageTransport } from "../shared/http-client.js";
 import type { BridgeSpool, SpoolMessage } from "./spool.js";
 
+/** Ceiling on retryable injection attempts before a message dead-letters as failed. */
+export const MAX_INJECTION_ATTEMPTS = 5;
+
 export interface InjectionHooks {
   beforeMessageInject(message: SpoolMessage["envelope"], targetSession: string): Promise<void>;
   beforeToolUse(
@@ -179,35 +182,40 @@ export class Injector {
       }
       return;
     }
-    await this.reportFailure(
-      message,
-      result.status,
-      result.status === "runtime_unavailable" || result.status === "permission_required",
-    );
+    // permission_required is a property of the message and the session binding, not a
+    // transient runtime condition: the binding is never cleared, so a retry can only
+    // ever produce the same answer. Retrying it hot-loops until the grant expires and
+    // the sender never gets a terminal failure.
+    await this.reportFailure(message, result.status, result.status === "runtime_unavailable");
   }
 
   private async reportFailure(message: SpoolMessage, resultCode: string, retryable: boolean): Promise<void> {
+    // Every retryable classification needs a ceiling. attempt_count was already being
+    // written by markInjecting but nothing read it, so listInjectable re-selected
+    // runtime_pending forever. Past the cap the message dead-letters as failed.
+    const exhausted = retryable && this.spool.attemptCount(message.messageId) >= MAX_INJECTION_ATTEMPTS;
+    const willRetry = retryable && !exhausted;
     const attemptId = id("attempt");
     this.spool.recordAttempt({
       attemptId,
       messageId: message.messageId,
-      phase: retryable ? "runtime_pending" : "runtime_failed",
+      phase: willRetry ? "runtime_pending" : "runtime_failed",
       resultCode,
-      retryable,
+      retryable: willRetry,
       createdAt: nowIso(),
     });
-    this.spool.markResult(message.messageId, retryable ? "runtime_pending" : "failed", resultCode);
+    this.spool.markResult(message.messageId, willRetry ? "runtime_pending" : "failed", resultCode);
     try {
       await this.transport.acknowledgeDelivery({
         messageId: message.messageId,
-        phase: retryable ? "runtime_pending" : "runtime_failed",
+        phase: willRetry ? "runtime_pending" : "runtime_failed",
         attemptId,
         resultCode,
-        retryable,
+        retryable: willRetry,
       });
       this.spool.markAttemptReported(attemptId);
     } catch {
-      if (retryable) this.spool.markResult(message.messageId, "blocked_offline", "control_plane_unavailable");
+      if (willRetry) this.spool.markResult(message.messageId, "blocked_offline", "control_plane_unavailable");
     }
   }
 }

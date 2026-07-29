@@ -247,6 +247,64 @@ describe("RelationshipPolicy", () => {
     })).toThrow("Filesystem root cannot be granted");
   });
 
+  it("rejects a hand-edited root grant at load time, not only through the CLI", () => {
+    const directory = makeDirectory();
+    const root = parse(directory).root;
+    const policy = writePolicy(directory, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [root],
+      }],
+    });
+
+    // isWithin used to build the prefix "//" for a root folder, so this document
+    // loaded without error and granted exactly `/`.
+    expect(() => RelationshipPolicy.fromFile(policy, directory))
+      .toThrow("Filesystem root cannot be granted");
+  });
+
+  it("never throws out of authorize, whatever the filesystem says about the path", () => {
+    const directory = makeDirectory();
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const file = join(project, "notes.md");
+    writeFileSync(file, "notes");
+    symlinkSync(join(project, "loop"), join(project, "loop"));
+    const policy = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [project],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(policy, project);
+
+    // canonicalPath rethrows every non-ENOENT errno; inside canUseTool that would be an
+    // uncaught rejection rather than a denial.
+    for (const path of [
+      join(project, "loop", "secret"), // ELOOP
+      join(file, "child"), // ENOTDIR
+      `${join(project, "x")}\0.md`, // NUL byte
+      join(project, "a".repeat(4096)), // ENAMETOOLONG
+    ]) {
+      expect(() => permissions.authorize({ toolName: "Read", input: { file_path: path } }, inbound()))
+        .not.toThrow();
+      expect(permissions.authorize({ toolName: "Read", input: { file_path: path } }, inbound()))
+        .toMatchObject({ behavior: "deny" });
+    }
+
+    // Still a real allow for a path that resolves.
+    expect(permissions.authorize({ toolName: "Read", input: { file_path: file } }, inbound()))
+      .toMatchObject({ behavior: "allow" });
+  });
+
   function makeDirectory(): string {
     const directory = mkdtempSync(join(tmpdir(), "ccd-policy-"));
     directories.push(directory);

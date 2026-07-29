@@ -79,6 +79,11 @@ export class RelationshipPolicy {
     }));
     for (const relationship of this.#relationships) {
       for (const folder of relationship.folders) {
+        // Enforced here rather than only in upsertRelationshipPreset so a hand-edited
+        // document is rejected at load time too, as the docs state unconditionally.
+        if (isFilesystemRoot(folder)) {
+          throw new Error("Filesystem root cannot be granted");
+        }
         if (isWithin(folder, this.#policyFile)) {
           throw new Error("Relationship policy must be stored outside every granted folder");
         }
@@ -108,7 +113,23 @@ export class RelationshipPolicy {
     return Boolean(relationship && relationship.tools.size > 0);
   }
 
+  /**
+   * Never throws. canUseTool has no safe failure mode — an exception escaping into the
+   * SDK callback is an uncaught rejection, not a denial — so every unexpected error
+   * (ELOOP, ENOTDIR, ENAMETOOLONG, NUL bytes) has to come back as a deny.
+   */
   authorize(
+    action: { toolName: string; input: Record<string, unknown> },
+    message: InboundMessage | undefined,
+  ): ToolPermissionDecision {
+    try {
+      return this.#authorize(action, message);
+    } catch {
+      return deny("Relationship policy could not evaluate this tool call");
+    }
+  }
+
+  #authorize(
     action: { toolName: string; input: Record<string, unknown> },
     message: InboundMessage | undefined,
   ): ToolPermissionDecision {
@@ -161,7 +182,7 @@ export function upsertRelationshipPreset(input: {
 
   const existing = readPolicyDocument(input.file);
   const canonicalFolder = folder ? canonicalPath(folder) : undefined;
-  if (canonicalFolder && canonicalFolder === normalizeCase(parse(canonicalFolder).root)) {
+  if (canonicalFolder && isFilesystemRoot(canonicalFolder)) {
     throw new Error("Filesystem root cannot be granted");
   }
   if (canonicalFolder && isWithin(canonicalFolder, canonicalPath(input.file))) {
@@ -241,7 +262,15 @@ function isMissingPathError(error: unknown): boolean {
 }
 
 function isWithin(folder: string, candidate: string): boolean {
-  return candidate === folder || candidate.startsWith(`${folder}${sep}`);
+  if (candidate === folder) return true;
+  // A root folder ("/" or "C:\") already ends in the separator, so appending another
+  // one produces a prefix ("//") that never matches and silently grants everything.
+  const prefix = folder.endsWith(sep) ? folder : `${folder}${sep}`;
+  return candidate.startsWith(prefix);
+}
+
+function isFilesystemRoot(path: string): boolean {
+  return path === normalizeCase(parse(path).root);
 }
 
 function normalizeCase(path: string): string {
