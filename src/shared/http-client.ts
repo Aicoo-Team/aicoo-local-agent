@@ -47,9 +47,9 @@ export interface HttpTransportOptions {
  * `fetch failed` error.
  */
 export function normalizeBearerToken(token: string): string {
-  const normalized = token.replace(/^[\u0000-\u0020\u007f]+|[\u0000-\u0020\u007f]+$/g, "");
+  const normalized = token.replace(/^[\s\u0000-\u001f\u007f\u200b\ufeff]+|[\s\u0000-\u001f\u007f\u200b\ufeff]+$/gu, "");
   if (!normalized) throw new Error("Bearer token must not be empty");
-  if (/[\u0000-\u0020\u007f]/.test(normalized)) {
+  if (/[\s\u0000-\u001f\u007f\u200b\ufeff]/u.test(normalized)) {
     throw new Error("Bearer token contains invalid whitespace or control characters");
   }
   return normalized;

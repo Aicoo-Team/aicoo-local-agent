@@ -113,7 +113,9 @@ async function findExecutableOnPath(name: string): Promise<string | undefined> {
  * Windows npm installs both an extensionless POSIX shim and native Windows
  * launchers in the same PATH directory. Never select the extensionless shim on
  * Windows: child_process cannot execute it there. Prefer a native executable,
- * then command shims supported by the Codex driver.
+ * then command shims supported by the Codex driver. On Windows, access(X_OK)
+ * confirms the path exists; executableNames controls which extensions are
+ * treated as launchable.
  */
 export function executableNames(
   name: string,

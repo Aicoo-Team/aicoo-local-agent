@@ -5,12 +5,14 @@ import { HttpMessageTransport, normalizeBearerToken } from "../../src/shared/htt
 describe("bearer token normalization", () => {
   it("removes copied boundary whitespace and control bytes", () => {
     expect(normalizeBearerToken("\r\n\t aicoo_sk_example \u0000")).toBe("aicoo_sk_example");
+    expect(normalizeBearerToken("\u00a0\u200baicoo_sk_example\ufeff")).toBe("aicoo_sk_example");
   });
 
   it("rejects empty and embedded invalid bytes", () => {
     expect(() => normalizeBearerToken(" \r\n\t ")).toThrow("must not be empty");
     expect(() => normalizeBearerToken("aicoo_sk_\r\nexample")).toThrow("invalid whitespace or control");
     expect(() => normalizeBearerToken("aicoo sk example")).toThrow("invalid whitespace or control");
+    expect(() => normalizeBearerToken("aicoo_sk_\u200bexample")).toThrow("invalid whitespace or control");
   });
 
   it.each([
