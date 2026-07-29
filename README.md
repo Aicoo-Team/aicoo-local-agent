@@ -116,12 +116,10 @@ a reference server you can self-host**.
 
 ### Optional relationship permissions
 
-The receiver stays text-only by default. Claude Code and Codex use the same
-simple `--relationship-policy` onboarding and `--access chat-only` acceptance
-flow. Claude Code owners can additionally opt into the `read-project` or
-`edit-project` user+device-specific tool and folder presets. Codex safely
-remains chat-only because its hooks are not a complete folder-security
-boundary. The verified IDs and JSON update are handled automatically.
+Claude Code and Codex receivers are text-only. The CLI can record a verified
+user+device relationship with `--access chat-only`, but tool-capable presets
+are disabled until each relationship runs in its own OS sandbox. This avoids
+presenting a JSON/path allowlist as a filesystem security boundary.
 See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
 
 ## Develop

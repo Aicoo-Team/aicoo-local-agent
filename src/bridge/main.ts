@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
+import { DEFAULT_RELATIONSHIP_POLICY_FILE } from "../security/relationship-policy.js";
 import { makeTransport } from "../shared/aicoo-transport.js";
 import { RuntimeBridge } from "./bridge.js";
 import { BridgeSpool } from "./spool.js";
@@ -50,7 +51,7 @@ const program = new Command()
   .option(
     "--relationship-policy <file>",
     "JSON allowlist of tools/folders for verified users and devices",
-    process.env.CCD_RELATIONSHIP_POLICY,
+    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
   )
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL);
 

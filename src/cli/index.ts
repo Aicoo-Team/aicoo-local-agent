@@ -7,6 +7,7 @@ import type { HumanInboxSendMessageInput, RequestCommunicationSessionInput } fro
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { makeTransport } from "../shared/aicoo-transport.js";
 import {
+  DEFAULT_RELATIONSHIP_POLICY_FILE,
   upsertRelationshipPreset,
   type RelationshipAccessPreset,
 } from "../security/relationship-policy.js";
@@ -46,7 +47,7 @@ program.command("bridge")
   .option(
     "--relationship-policy <file>",
     "JSON allowlist of tools/folders for verified users and devices",
-    process.env.CCD_RELATIONSHIP_POLICY,
+    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
   )
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
   .action(async (options) => {
@@ -151,9 +152,12 @@ connect.command("list").action(async () => print(await makeClient().listCommunic
 connect.command("accept")
   .argument("<sessionId>")
   .addOption(new Option("--access <preset>", "relationship access preset")
-    .choices(["chat-only", "read-project", "edit-project"]))
-  .option("--folder <dir>", "project folder for read/edit access")
-  .option("--policy <file>", "local relationship policy file", "relationships.json")
+    .choices(["chat-only"]))
+  .option(
+    "--policy <file>",
+    "local relationship policy file",
+    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+  )
   .action(async (sessionId, options) => {
     const grant = await makeClient().acceptCommunicationSession(sessionId);
     if (!options.access) {
@@ -176,7 +180,6 @@ connect.command("accept")
       principalId: grant.requester.principalId,
       deviceId,
       preset: options.access as RelationshipAccessPreset,
-      folder: options.folder,
     });
     print({
       grant,
@@ -184,10 +187,7 @@ connect.command("accept")
         status: "saved",
         preset: options.access,
         policyFile: options.policy,
-        ...(options.folder ? { folder: options.folder } : {}),
-        note: options.access === "chat-only"
-          ? "Chat-only works with Claude Code and Codex."
-          : "Claude Code enforces this tool preset; Codex safely remains chat-only.",
+        note: "Claude Code and Codex remain text-only until per-relationship OS sandboxing is available.",
       },
     });
   });

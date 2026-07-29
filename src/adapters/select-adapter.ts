@@ -92,9 +92,12 @@ export async function selectRuntimeAdapter(
     ? resolve(options.relationshipPolicyFile)
     : undefined;
   if (relationshipPolicyFile) {
-    // Validate once at startup. Authorization reloads the file for every tool
-    // request so an accepted relationship takes effect without restarting.
-    RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+    const policy = RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+    if (policy.enabledTools().length > 0) {
+      options.log?.(
+        "relationship tool access is disabled until per-relationship OS sandboxing is available; continuing text-only",
+      );
+    }
   }
   const adapter = new ClaudeCodeAdapter({
     stateFile: resolve(options.claudeStateFile ?? `${options.spoolFile}.claude.db`),
@@ -102,17 +105,6 @@ export async function selectRuntimeAdapter(
     sessionCount: options.sessions,
     ...(configuredPath ? { pathToClaudeCodeExecutable: configuredPath } : {}),
     ...(options.model ? { model: options.model } : {}),
-    ...(relationshipPolicyFile
-      ? {
-          enabledTools: RelationshipPolicy.supportedTools(),
-          resolveToolPermission: async (
-            action: { toolName: string; input: Record<string, unknown> },
-            context: Parameters<NonNullable<import("./claude-code/claude-code-adapter.js").ClaudeCodeAdapterConfig["resolveToolPermission"]>>[1],
-          ) => RelationshipPolicy
-            .fromFile(relationshipPolicyFile, resolve(options.workspace))
-            .authorize(action, context.message),
-        }
-      : {}),
     log: options.log,
   });
   return {

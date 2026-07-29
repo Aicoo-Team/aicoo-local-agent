@@ -2,13 +2,15 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   readFileSync,
   realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { InboundMessage } from "../adapters/runtime-adapter.js";
 
@@ -28,6 +30,7 @@ export type RelationshipAccessPreset = "chat-only" | "read-project" | "edit-proj
 export interface ToolPermissionDecision {
   behavior: "allow" | "deny";
   message?: string;
+  updatedInput?: Record<string, unknown>;
 }
 
 interface CompiledRelationship {
@@ -41,50 +44,50 @@ const PATH_INPUTS: Readonly<Record<string, readonly string[]>> = {
   Read: ["file_path"],
   Write: ["file_path"],
   Edit: ["file_path"],
-  Glob: ["path"],
-  Grep: ["path"],
-  NotebookEdit: ["notebook_path"],
 };
 
-// These tools can escape a folder allowlist or delegate work whose paths cannot
-// be checked reliably. Keep them blocked until the runtime supplies a stronger
-// OS sandbox and structured child-tool authorization.
-const UNSCOPABLE_TOOLS = new Set(["Bash", "Agent", "Task", "Skill", "Mcp"]);
-const POLICY_SUPPORTED_TOOLS = [
-  "AskUserQuestion",
-  "Edit",
-  "Glob",
-  "Grep",
-  "NotebookEdit",
-  "Read",
-  "WebFetch",
-  "WebSearch",
-  "Write",
-] as const;
+const POLICY_SUPPORTED_TOOLS = ["Edit", "Read", "Write"] as const;
+const POLICY_SUPPORTED_TOOL_SET = new Set<string>(POLICY_SUPPORTED_TOOLS);
 
 const PRESET_TOOLS: Readonly<Record<RelationshipAccessPreset, readonly string[]>> = {
   "chat-only": [],
-  "read-project": ["Read", "Glob", "Grep"],
-  "edit-project": ["Read", "Glob", "Grep", "Write", "Edit", "NotebookEdit"],
+  "read-project": ["Read"],
+  "edit-project": ["Read", "Write", "Edit"],
 };
+
+export const DEFAULT_RELATIONSHIP_POLICY_FILE = join(
+  homedir(),
+  ".aicoo",
+  "local-agent",
+  "relationships.json",
+);
 
 export class RelationshipPolicy {
   readonly #relationships: readonly CompiledRelationship[];
   readonly #cwd: string;
+  readonly #policyFile: string;
 
-  private constructor(document: RelationshipPolicyDocument, cwd: string) {
-    this.#cwd = canonicalPath(resolve(cwd));
+  private constructor(document: RelationshipPolicyDocument, cwd: string, policyFile: string) {
+    this.#cwd = canonicalPath(cwd);
+    this.#policyFile = canonicalPath(policyFile);
     this.#relationships = document.relationships.map((relationship) => ({
       principalId: relationship.principalId,
       deviceId: relationship.deviceId,
       tools: new Set(relationship.tools),
       folders: relationship.folders.map((folder) =>
-        canonicalPath(isAbsolute(folder) ? folder : resolve(cwd, folder))),
+        canonicalPath(toLiteralAbsolute(cwd, folder))),
     }));
+    for (const relationship of this.#relationships) {
+      for (const folder of relationship.folders) {
+        if (isWithin(folder, this.#policyFile)) {
+          throw new Error("Relationship policy must be stored outside every granted folder");
+        }
+      }
+    }
   }
 
   static fromFile(file: string, cwd: string): RelationshipPolicy {
-    return new RelationshipPolicy(readPolicyDocument(file), cwd);
+    return new RelationshipPolicy(readPolicyDocument(file), cwd, file);
   }
 
   static supportedTools(): string[] {
@@ -93,7 +96,7 @@ export class RelationshipPolicy {
 
   enabledTools(): string[] {
     return [...new Set(this.#relationships.flatMap((relationship) => [...relationship.tools]))]
-      .filter((tool) => !UNSCOPABLE_TOOLS.has(tool))
+      .filter((tool) => POLICY_SUPPORTED_TOOL_SET.has(tool))
       .sort();
   }
 
@@ -116,31 +119,31 @@ export class RelationshipPolicy {
       candidate.principalId === message.senderPrincipalId
       && candidate.deviceId === message.senderDeviceId);
     if (!relationship) return deny("No policy for this user and device");
-    if (!relationship.tools.has(action.toolName)) return deny(`Tool ${action.toolName} is not allowed`);
-    if (UNSCOPABLE_TOOLS.has(action.toolName)) {
-      return deny(`Tool ${action.toolName} cannot be safely restricted to allowed folders`);
+    if (!POLICY_SUPPORTED_TOOL_SET.has(action.toolName) || action.toolName.startsWith("mcp__")) {
+      return deny(`Unsupported tool ${action.toolName}`);
     }
+    if (!relationship.tools.has(action.toolName)) return deny(`Tool ${action.toolName} is not allowed`);
 
     const pathKeys = PATH_INPUTS[action.toolName];
-    if (!pathKeys) return { behavior: "allow" };
+    if (!pathKeys) return deny(`Unsupported tool ${action.toolName}`);
     if (relationship.folders.length === 0) return deny(`Tool ${action.toolName} requires an allowed folder`);
 
     const paths = pathKeys.flatMap((key) => {
       const value = action.input[key];
-      return typeof value === "string" && value.trim() ? [value] : [];
+      return typeof value === "string" && value.trim() ? [{ key, value }] : [];
     });
-    if (paths.length === 0 && (action.toolName === "Glob" || action.toolName === "Grep")) {
-      paths.push(this.#cwd);
-    }
     if (paths.length === 0) return deny(`Tool ${action.toolName} did not provide a path`);
 
+    const updatedInput = { ...action.input };
     for (const path of paths) {
-      const candidate = canonicalPath(isAbsolute(path) ? path : resolve(this.#cwd, path));
+      const candidate = canonicalPath(toLiteralAbsolute(this.#cwd, path.value));
+      if (candidate === this.#policyFile) return deny("Relationship policy cannot be accessed by a remote tool");
       if (!relationship.folders.some((folder) => isWithin(folder, candidate))) {
         return deny(`Path is outside the folders allowed for this relationship`);
       }
+      updatedInput[path.key] = candidate;
     }
-    return { behavior: "allow" };
+    return { behavior: "allow", updatedInput };
   }
 }
 
@@ -157,11 +160,18 @@ export function upsertRelationshipPreset(input: {
   }
 
   const existing = readPolicyDocument(input.file);
+  const canonicalFolder = folder ? canonicalPath(folder) : undefined;
+  if (canonicalFolder && canonicalFolder === normalizeCase(parse(canonicalFolder).root)) {
+    throw new Error("Filesystem root cannot be granted");
+  }
+  if (canonicalFolder && isWithin(canonicalFolder, canonicalPath(input.file))) {
+    throw new Error("Relationship policy must be stored outside the granted folder");
+  }
   const nextRelationship: RelationshipPolicyDocument["relationships"][number] = {
     principalId: input.principalId,
     deviceId: input.deviceId,
     tools: [...PRESET_TOOLS[input.preset]],
-    folders: folder ? [resolve(folder)] : [],
+    folders: canonicalFolder ? [canonicalFolder] : [],
   };
   const relationships = existing.relationships.filter((relationship) =>
     relationship.principalId !== input.principalId || relationship.deviceId !== input.deviceId);
@@ -191,6 +201,7 @@ function readPolicyDocument(file: string): RelationshipPolicyDocument {
 
 function writePolicyDocument(file: string, document: RelationshipPolicyDocument): void {
   const target = resolve(file);
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   const temporary = `${target}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600, flag: "wx" });
@@ -206,19 +217,27 @@ function deny(message: string): ToolPermissionDecision {
 }
 
 /**
- * Resolve symlinks in the deepest existing ancestor. This also protects writes
- * to not-yet-created files below a symlinked directory.
+ * Resolve the literal path component-by-component through the filesystem.
+ * Crucially, do not call path.resolve() first: it would collapse `..` before a
+ * preceding symlink is followed, authorizing a different path than the kernel.
  */
 function canonicalPath(input: string): string {
-  let existing = resolve(input);
-  while (!existsSync(existing)) {
-    const parent = dirname(existing);
-    if (parent === existing) break;
-    existing = parent;
+  try {
+    return normalizeCase(realpathSync.native(input));
+  } catch (error) {
+    if (!isMissingPathError(error)) throw error;
+    const parent = dirname(input);
+    if (parent === input) throw error;
+    return normalizeCase(join(canonicalPath(parent), basename(input)));
   }
-  const canonicalExisting = existsSync(existing) ? realpathSync.native(existing) : existing;
-  const suffix = relative(existing, resolve(input));
-  return normalizeCase(resolve(canonicalExisting, suffix));
+}
+
+function toLiteralAbsolute(cwd: string, input: string): string {
+  return isAbsolute(input) ? input : `${cwd}${sep}${input}`;
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 function isWithin(folder: string, candidate: string): boolean {

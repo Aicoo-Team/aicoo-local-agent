@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -51,19 +51,23 @@ describe("CodexAdapter managed sessions", () => {
   it("accepts the shared relationship policy flow but keeps Codex text-only", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
-    const policyFile = join(directory, "relationships.json");
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
     upsertRelationshipPreset({
       file: policyFile,
       principalId: "prn_a",
       deviceId: "device_a",
       preset: "edit-project",
-      folder: directory,
+      folder: project,
     });
     const logs: string[] = [];
     const driver = new FakeCodexDriver("SAFE_REPLY");
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
-      cwd: directory,
+      cwd: project,
       relationshipPolicyFile: policyFile,
       driver,
       turnAckTimeoutMs: 500,
