@@ -210,12 +210,11 @@ curl -H "Authorization: Bearer $TOKEN" "$CONTROL_PLANE/api/v1/local-agent/messag
 ## 7. Owner-approved tools (read before touching)
 
 Do **not** flip tools on blindly. The machinery exists but is intentionally left inert:
-`src/adapters/claude-code/claude-code-adapter.ts` `canUseTool` (~L349) has a `resolveToolPermission`
-injection point — with **no resolver it denies all** (today's text-only default); with a resolver it
-honors the owner's decision and **fails closed** on any error/timeout. The transport already has
-`requestToolApproval` / `getToolApproval`. The missing wire is a bridge-side resolver that consults
-the owner's per-relationship tool policy, auto-allows a matched policy, otherwise pushes an
-approval to the owner and returns their decision — plus enabling the tool set.
+`src/adapters/claude-code/claude-code-adapter.ts` `canUseTool` denies all managed tools today, and
+both Claude and Codex are text-only. The transport still has `requestToolApproval` /
+`getToolApproval`, but there is no bridge-side resolver wired into runtime permissions. Re-enabling
+tools requires a fresh design that consults the owner's per-relationship policy, uses a real
+filesystem sandbox, and returns an owner-visible decision — plus enabling only the scoped tool set.
 
 Before wiring it, settle three things so it isn't done unsafely:
 1. **The reply is itself an exfiltration channel** — auto-allow only workspace-internal *safe reads*,

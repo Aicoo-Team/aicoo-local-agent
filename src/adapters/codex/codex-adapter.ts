@@ -31,6 +31,7 @@ type AdapterEvent = {
 interface ManagedSession {
   localHandle: string;
   providerThreadId?: string;
+  boundCommunicationSessionId?: string;
   label: string;
   state: "idle" | "busy" | "closed";
   activeTurn?: ActiveTurn;
@@ -83,6 +84,7 @@ export class CodexAdapter implements RuntimeAdapter {
       CREATE TABLE IF NOT EXISTS managed_sessions (
         local_handle TEXT PRIMARY KEY,
         provider_thread_id TEXT,
+        bound_comm_session_id TEXT,
         label TEXT NOT NULL,
         state TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -97,6 +99,11 @@ export class CodexAdapter implements RuntimeAdapter {
         PRIMARY KEY(local_handle, seq)
       );
     `);
+    try {
+      this.#db.exec("ALTER TABLE managed_sessions ADD COLUMN bound_comm_session_id TEXT;");
+    } catch (error) {
+      if (!/duplicate column/i.test(String(error))) throw error;
+    }
     this.loadOrCreateSessions(config.sessionCount ?? 1);
     this.#events.setMaxListeners(100);
   }
@@ -188,6 +195,20 @@ export class CodexAdapter implements RuntimeAdapter {
     if (mode === "steer") return { status: "steer_not_allowed" } as const;
     if (session.state === "busy" || session.activeTurn) return { status: "queued_busy" } as const;
     if (this.#closing || this.#closed) return { status: "runtime_unavailable" } as const;
+    const communicationSessionId = message.communicationSessionId;
+    if (!communicationSessionId) return { status: "permission_required" } as const;
+    if (
+      session.boundCommunicationSessionId
+      && session.boundCommunicationSessionId !== communicationSessionId
+    ) {
+      return { status: "permission_required" } as const;
+    }
+    if (!session.boundCommunicationSessionId) {
+      session.boundCommunicationSessionId = communicationSessionId;
+      this.#db.prepare(
+        "UPDATE managed_sessions SET bound_comm_session_id = ?, last_active_at = ? WHERE local_handle = ?",
+      ).run(communicationSessionId, nowIso(), session.localHandle);
+    }
 
     if (this.#config.relationshipPolicyFile) {
       try {
@@ -384,8 +405,8 @@ export class CodexAdapter implements RuntimeAdapter {
     if (existing.length === 0) {
       const now = nowIso();
       const insert = this.#db.prepare(
-        `INSERT INTO managed_sessions(local_handle, provider_thread_id, label, state, created_at, last_active_at)
-         VALUES (?, NULL, ?, 'idle', ?, ?)`,
+        `INSERT INTO managed_sessions(local_handle, provider_thread_id, bound_comm_session_id, label, state, created_at, last_active_at)
+         VALUES (?, NULL, NULL, ?, 'idle', ?, ?)`,
       );
       for (let index = 1; index <= count; index += 1) {
         insert.run(`codex-managed-${index}`, `Codex managed session ${index}`, now, now);
@@ -395,14 +416,17 @@ export class CodexAdapter implements RuntimeAdapter {
     for (const row of rows) {
       // No codex turn survives a restart, so a persisted 'busy' state is stale.
       const state = row.state === "busy" ? "idle" : row.state;
-      if (state !== row.state) {
+      const discardLegacyContext = Boolean(row.provider_thread_id) && !row.bound_comm_session_id;
+      const providerThreadId = discardLegacyContext ? null : row.provider_thread_id;
+      if (state !== row.state || discardLegacyContext) {
         this.#db.prepare(
-          "UPDATE managed_sessions SET state = ?, last_active_at = ? WHERE local_handle = ?",
-        ).run(state, nowIso(), row.local_handle);
+          "UPDATE managed_sessions SET provider_thread_id = ?, state = ?, last_active_at = ? WHERE local_handle = ?",
+        ).run(providerThreadId, state, nowIso(), row.local_handle);
       }
       this.#sessions.set(row.local_handle, {
         localHandle: row.local_handle,
-        ...(row.provider_thread_id ? { providerThreadId: row.provider_thread_id } : {}),
+        ...(providerThreadId ? { providerThreadId } : {}),
+        ...(row.bound_comm_session_id ? { boundCommunicationSessionId: row.bound_comm_session_id } : {}),
         label: row.label,
         state,
       });
@@ -439,6 +463,7 @@ export class CodexAdapter implements RuntimeAdapter {
 interface ManagedRow {
   local_handle: string;
   provider_thread_id: string | null;
+  bound_comm_session_id: string | null;
   label: string;
   state: ManagedSession["state"];
 }

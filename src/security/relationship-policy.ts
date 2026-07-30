@@ -40,13 +40,13 @@ interface CompiledRelationship {
   folders: readonly string[];
 }
 
-const PATH_INPUTS: Readonly<Record<string, readonly string[]>> = {
+const PATH_INPUTS = {
   Read: ["file_path"],
   Write: ["file_path"],
   Edit: ["file_path"],
-};
+} as const;
 
-const POLICY_SUPPORTED_TOOLS = ["Edit", "Read", "Write"] as const;
+const POLICY_SUPPORTED_TOOLS = Object.keys(PATH_INPUTS).sort();
 const POLICY_SUPPORTED_TOOL_SET = new Set<string>(POLICY_SUPPORTED_TOOLS);
 
 const PRESET_TOOLS: Readonly<Record<RelationshipAccessPreset, readonly string[]>> = {
@@ -79,6 +79,9 @@ export class RelationshipPolicy {
     }));
     for (const relationship of this.#relationships) {
       for (const folder of relationship.folders) {
+        if (folder === normalizeCase(parse(folder).root)) {
+          throw new Error("Filesystem root cannot be granted");
+        }
         if (isWithin(folder, this.#policyFile)) {
           throw new Error("Relationship policy must be stored outside every granted folder");
         }
@@ -124,8 +127,7 @@ export class RelationshipPolicy {
     }
     if (!relationship.tools.has(action.toolName)) return deny(`Tool ${action.toolName} is not allowed`);
 
-    const pathKeys = PATH_INPUTS[action.toolName];
-    if (!pathKeys) return deny(`Unsupported tool ${action.toolName}`);
+    const pathKeys = PATH_INPUTS[action.toolName as keyof typeof PATH_INPUTS];
     if (relationship.folders.length === 0) return deny(`Tool ${action.toolName} requires an allowed folder`);
 
     const paths = pathKeys.flatMap((key) => {
@@ -136,7 +138,12 @@ export class RelationshipPolicy {
 
     const updatedInput = { ...action.input };
     for (const path of paths) {
-      const candidate = canonicalPath(toLiteralAbsolute(this.#cwd, path.value));
+      let candidate: string;
+      try {
+        candidate = canonicalPath(toLiteralAbsolute(this.#cwd, path.value));
+      } catch {
+        return deny("Path could not be resolved safely");
+      }
       if (candidate === this.#policyFile) return deny("Relationship policy cannot be accessed by a remote tool");
       if (!relationship.folders.some((folder) => isWithin(folder, candidate))) {
         return deny(`Path is outside the folders allowed for this relationship`);
@@ -241,6 +248,7 @@ function isMissingPathError(error: unknown): boolean {
 }
 
 function isWithin(folder: string, candidate: string): boolean {
+  if (folder === normalizeCase(parse(folder).root)) return candidate.startsWith(folder);
   return candidate === folder || candidate.startsWith(`${folder}${sep}`);
 }
 

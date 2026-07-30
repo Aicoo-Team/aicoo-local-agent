@@ -173,6 +173,45 @@ describe("RelationshipPolicy", () => {
     },
   );
 
+  it.runIf(process.platform !== "win32")(
+    "denies symlink escapes created before and after policy load",
+    () => {
+      const directory = makeDirectory();
+      const project = join(directory, "project");
+      const secrets = join(directory, "secrets");
+      const config = join(directory, "config");
+      mkdirSync(project);
+      mkdirSync(secrets);
+      mkdirSync(config);
+      writeFileSync(join(secrets, "id_rsa"), "secret");
+      symlinkSync(join(secrets, "id_rsa"), join(project, "key-link"));
+      const policy = writePolicy(config, {
+        version: 1,
+        relationships: [{
+          principalId: "prn_a",
+          deviceId: "device-a1",
+          tools: ["Read", "Write"],
+          folders: [project],
+        }],
+      });
+      const permissions = RelationshipPolicy.fromFile(policy, project);
+      symlinkSync(secrets, join(project, "late-link"));
+
+      expect(permissions.authorize(
+        { toolName: "Read", input: { file_path: join(project, "key-link") } },
+        inbound(),
+      )).toMatchObject({ behavior: "deny", message: expect.stringContaining("outside") });
+      expect(permissions.authorize(
+        { toolName: "Read", input: { file_path: join(project, "late-link", "id_rsa") } },
+        inbound(),
+      )).toMatchObject({ behavior: "deny", message: expect.stringContaining("outside") });
+      expect(permissions.authorize(
+        { toolName: "Write", input: { file_path: join(project, "late-link", "new-secret.txt") } },
+        inbound(),
+      )).toMatchObject({ behavior: "deny", message: expect.stringContaining("outside") });
+    },
+  );
+
   it("refuses policy self-access and policies stored inside granted folders", () => {
     const directory = makeDirectory();
     const project = join(directory, "project");
@@ -246,6 +285,64 @@ describe("RelationshipPolicy", () => {
       folder: parse(directory).root,
     })).toThrow("Filesystem root cannot be granted");
   });
+
+  it("rejects filesystem root grants loaded from a policy file", () => {
+    const directory = makeDirectory();
+    const config = join(directory, "config");
+    mkdirSync(config);
+    const policy = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [parse(directory).root],
+      }],
+    });
+
+    expect(() => RelationshipPolicy.fromFile(policy, directory))
+      .toThrow("Filesystem root cannot be granted");
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "denies path canonicalization failures instead of throwing",
+    () => {
+      const directory = makeDirectory();
+      const project = join(directory, "project");
+      const config = join(directory, "config");
+      mkdirSync(project);
+      mkdirSync(config);
+      writeFileSync(join(project, "file.txt"), "not a directory");
+      writeFileSync(join(project, "safe.txt"), "safe");
+      symlinkSync("loop", join(project, "loop"));
+      const policy = writePolicy(config, {
+        version: 1,
+        relationships: [{
+          principalId: "prn_a",
+          deviceId: "device-a1",
+          tools: ["Read"],
+          folders: [project],
+        }],
+      });
+      const permissions = RelationshipPolicy.fromFile(policy, directory);
+
+      for (const file_path of [
+        join(project, "loop", "x"),
+        join(project, "file.txt", "child"),
+        `${project}\u0000`,
+        join(project, "x".repeat(10_000)),
+      ]) {
+        expect(() => permissions.authorize({ toolName: "Read", input: { file_path } }, inbound()))
+          .not.toThrow();
+        expect(permissions.authorize({ toolName: "Read", input: { file_path } }, inbound()))
+          .toMatchObject({ behavior: "deny", message: expect.stringContaining("resolved safely") });
+      }
+      expect(permissions.authorize(
+        { toolName: "Read", input: { file_path: join(project, "safe.txt") } },
+        inbound(),
+      )).toMatchObject({ behavior: "allow" });
+    },
+  );
 
   function makeDirectory(): string {
     const directory = mkdtempSync(join(tmpdir(), "ccd-policy-"));

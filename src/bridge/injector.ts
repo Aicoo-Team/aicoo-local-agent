@@ -4,6 +4,8 @@ import { nowIso } from "../shared/time.js";
 import type { HttpMessageTransport } from "../shared/http-client.js";
 import type { BridgeSpool, SpoolMessage } from "./spool.js";
 
+export const MAX_INJECTION_ATTEMPTS = 5;
+
 export interface InjectionHooks {
   beforeMessageInject(message: SpoolMessage["envelope"], targetSession: string): Promise<void>;
   beforeToolUse(
@@ -94,6 +96,10 @@ export class Injector {
   }
 
   private async inject(message: SpoolMessage): Promise<void> {
+    if (message.attemptCount >= MAX_INJECTION_ATTEMPTS) {
+      await this.reportFailure(message, "max_injection_attempts_exceeded", false);
+      return;
+    }
     let validation: { valid: true } | { valid: false; reason: string };
     try {
       validation = await this.transport.validateInjection({
@@ -182,7 +188,7 @@ export class Injector {
     await this.reportFailure(
       message,
       result.status,
-      result.status === "runtime_unavailable" || result.status === "permission_required",
+      result.status === "runtime_unavailable",
     );
   }
 

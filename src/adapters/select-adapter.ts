@@ -64,7 +64,11 @@ export async function selectRuntimeAdapter(
     if (relationshipPolicyFile) {
       // Validate the shared onboarding file at startup. Codex reloads it for
       // each message, while remaining text-only even if it contains tool access.
-      RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+      try {
+        RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+      } catch (error) {
+        options.log?.(`relationship policy could not be loaded; continuing text-only: ${String(error)}`);
+      }
     }
     const adapter = new CodexAdapter({
       stateFile: resolve(options.codexStateFile ?? `${options.spoolFile}.codex.db`),
@@ -92,11 +96,15 @@ export async function selectRuntimeAdapter(
     ? resolve(options.relationshipPolicyFile)
     : undefined;
   if (relationshipPolicyFile) {
-    const policy = RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
-    if (policy.enabledTools().length > 0) {
-      options.log?.(
-        "relationship tool access is disabled until per-relationship OS sandboxing is available; continuing text-only",
-      );
+    try {
+      const policy = RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+      if (policy.enabledTools().length > 0) {
+        options.log?.(
+          "relationship tool access is disabled until per-relationship OS sandboxing is available; continuing text-only",
+        );
+      }
+    } catch (error) {
+      options.log?.(`relationship policy could not be loaded; continuing text-only: ${String(error)}`);
     }
   }
   const adapter = new ClaudeCodeAdapter({

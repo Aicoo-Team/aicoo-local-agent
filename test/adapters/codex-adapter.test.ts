@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { CodexAdapter } from "../../src/adapters/codex/codex-adapter.js";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
@@ -133,6 +134,59 @@ describe("CodexAdapter managed sessions", () => {
     });
   });
 
+  it("binds a managed Codex thread to one communication session", async () => {
+    const driver = new FakeCodexDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const firstEvents = collectEvents(adapter, "codex-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "codex-managed-1",
+      inbound("msg_comm_1", { communicationSessionId: "comm_1" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await firstEvents;
+
+    expect(await adapter.deliverToSession(
+      "codex-managed-1",
+      inbound("msg_comm_2", { communicationSessionId: "comm_2" }),
+      "queue",
+    )).toEqual({ status: "permission_required" });
+    expect(driver.turns).toHaveLength(1);
+  });
+
+  it("discards an unbound legacy Codex thread instead of resuming it for a relationship", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-legacy-state-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const stateFile = join(directory, "sessions.db");
+    const firstDriver = new FakeCodexDriver();
+    const first = new CodexAdapter({ stateFile, cwd: directory, driver: firstDriver, turnAckTimeoutMs: 500 });
+    await first.initialize();
+    const firstEvents = collectEvents(first, "codex-managed-1", 2);
+    expect((await first.deliverToSession("codex-managed-1", inbound("msg_legacy_seed"), "queue")).status)
+      .toBe("runtime_acked");
+    await firstEvents;
+    const legacyThreadId = first.providerThreadId("codex-managed-1");
+    expect(legacyThreadId).toMatch(/^fake-codex-thread-/);
+    await first.close();
+
+    const db = new DatabaseSync(stateFile);
+    db.prepare("UPDATE managed_sessions SET bound_comm_session_id = NULL WHERE local_handle = ?")
+      .run("codex-managed-1");
+    db.close();
+
+    const secondDriver = new FakeCodexDriver();
+    const second = new CodexAdapter({ stateFile, cwd: directory, driver: secondDriver, turnAckTimeoutMs: 500 });
+    cleanups.push(() => second.close());
+    await second.initialize();
+    expect(second.providerThreadId("codex-managed-1")).toBeUndefined();
+    expect((await second.deliverToSession("codex-managed-1", inbound("msg_after_legacy"), "queue")).status)
+      .toBe("runtime_acked");
+    expect(secondDriver.turns[0]?.resumeThreadId).toBeUndefined();
+    expect(second.providerThreadId("codex-managed-1")).not.toBe(legacyThreadId);
+  });
+
   it("reports runtime_unavailable when codex fails before starting the turn", async () => {
     const driver = new FakeCodexDriver();
     driver.failBeforeTurnStart = true;
@@ -215,7 +269,7 @@ async function waitForIdle(adapter: CodexAdapter, sessionHandle: string, timeout
 
 function inbound(
   id: string,
-  overrides: Partial<Pick<InboundMessage, "replyTo" | "correlationId">> = {},
+  overrides: Partial<Pick<InboundMessage, "replyTo" | "correlationId" | "communicationSessionId">> = {},
 ): InboundMessage {
   return {
     id,
