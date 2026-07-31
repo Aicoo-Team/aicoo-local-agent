@@ -27,6 +27,40 @@ export class ApiError extends Error {
   }
 }
 
+export interface PairStatusResponse {
+  status: "request_pair" | "awaiting_their_accept" | "setup_bridge" | "ready";
+  message: string;
+}
+
+export interface ResolvedPersonResponse {
+  principalId: string;
+  handle?: string;
+  name?: string;
+  hasReachableRuntime?: boolean;
+}
+
+export interface StartDeviceCodeInput {
+  deviceId: string;
+  runtime: "claude-code" | "codex";
+  bridgeVersion: string;
+  adapterVersion: string;
+  capabilities: string[];
+  label?: string;
+}
+
+export interface StartDeviceCodeResponse {
+  userCode: string;
+  pollToken: string;
+  approvalUrl: string;
+  expiresAt: string;
+}
+
+export type PollDeviceCodeResponse =
+  | { status: "pending" }
+  | { status: "approved"; deviceToken: string; userId: string }
+  | { status: "denied" }
+  | { status: "expired" };
+
 export interface HttpTransportOptions {
   baseUrl: string;
   token: string;
@@ -38,6 +72,7 @@ export interface HttpTransportOptions {
    *  (POST /api/v1/local-agent/endpoints), which mints a device credential keyed
    *  to (principal, deviceId). Ignored by the standalone HttpMessageTransport. */
   deviceId?: string;
+  onTokenRefreshed?: (token: string) => void;
 }
 
 /**
@@ -232,6 +267,22 @@ export class HttpMessageTransport implements MessageTransport {
   async listAudit(commSessionId?: string): Promise<AuditRecord[]> {
     const query = commSessionId ? `?commSessionId=${encodeURIComponent(commSessionId)}` : "";
     return this.requestJson(`/api/v1/audit${query}`);
+  }
+
+  async getPairStatus(principalId: string): Promise<PairStatusResponse> {
+    return this.requestJson(`/api/v1/local-agent/pair-status?principalId=${encodeURIComponent(principalId)}`);
+  }
+
+  async resolvePerson(query: string): Promise<ResolvedPersonResponse> {
+    return this.requestJson(`/api/v1/local-agent/resolve-person?q=${encodeURIComponent(query)}`);
+  }
+
+  async startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse> {
+    return this.requestJson("/api/v1/local-agent/device-code/start", { method: "POST", body: input });
+  }
+
+  async pollDeviceCode(pollToken: string): Promise<PollDeviceCodeResponse> {
+    return this.requestJson("/api/v1/local-agent/device-code/poll", { method: "POST", body: { pollToken } });
   }
 
   async requestJson<T = unknown>(

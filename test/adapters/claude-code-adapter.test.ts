@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,7 +13,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   });
 
-  it("starts a tools-disabled managed stream and ACKs only the provider echo", async () => {
+  it("starts a policy-gated managed stream and ACKs only the provider echo", async () => {
     const driver = new FakeClaudeAgentDriver("P1_REPLY_OK");
     const adapter = makeAdapter(driver);
     cleanups.push(() => adapter.close());
@@ -26,7 +26,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       allowInbound: true,
     })]);
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual([]);
+    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(options.settingSources).toEqual([]);
     expect(options.mcpServers).toEqual({});
@@ -54,7 +54,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     ]);
   });
 
-  it("keeps tools denied during an active verified turn", async () => {
+  it("keeps tools denied during an active verified turn without a policy", async () => {
     const driver = new FakeClaudeAgentDriver();
     driver.resultDelayMs = 100;
     const adapter = new ClaudeCodeAdapter({
@@ -69,11 +69,68 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual([]);
+    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
       signal: new AbortController().signal,
       toolUseID: "read-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "deny" });
+  });
+
+  it("allows Claude file tools only for the verified relationship and granted folder", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-tools-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read", "Write"],
+        folders: [project],
+      }],
+    }));
+    writeFileSync(join(directory, "outside.txt"), "secret");
+
+    const driver = new FakeClaudeAgentDriver();
+    driver.resultDelayMs = 100;
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_tools"), "new_turn"))
+      .toMatchObject({ status: "runtime_acked" });
+    const options = driver.starts[0]!.options;
+
+    expect(await options.canUseTool?.("Read", { file_path: join(project, "README.md") }, {
+      signal: new AbortController().signal,
+      toolUseID: "read-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({
+      behavior: "allow",
+      updatedInput: { file_path: join(realpathSync.native(directory), "project", "README.md") },
+    });
+    expect(await options.canUseTool?.("Read", { file_path: join(directory, "outside.txt") }, {
+      signal: new AbortController().signal,
+      toolUseID: "outside-read",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "deny" });
+    expect(await options.canUseTool?.("Edit", { file_path: join(project, "README.md") }, {
+      signal: new AbortController().signal,
+      toolUseID: "edit-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "deny" });
+    expect(await options.canUseTool?.("Bash", { command: "cat README.md" }, {
+      signal: new AbortController().signal,
+      toolUseID: "bash-tool-call",
       requestId: "permission-request",
     })).toMatchObject({ behavior: "deny" });
   });

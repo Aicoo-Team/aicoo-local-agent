@@ -21,12 +21,70 @@ const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
 const PREVIEW_AICOO_SERVER_URL = "https://www.yourcoo.ai";
 const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
+const DEFAULT_CREDENTIALS_FILE = join(homedir(), ".aicoo", "credentials.json");
 
 const program = new Command()
   .name("ccd")
   .description("aicoo-local-agent realtime runtime-messaging CLI")
   .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? LOCAL_SERVER_URL)
   .option("--token <token>", "device bearer token", process.env.CCD_TOKEN);
+
+program.command("login")
+  .description("log in this machine via Aicoo device-code pairing flow")
+  .addOption(new Option("--runtime <adapter>", "runtime adapter").choices(["claude-code", "codex"]).default("codex"))
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .action(async (options) => {
+    const server = hostedServerUrl();
+    const deviceId = resolveDeviceId(undefined, options.spool);
+    const unauthClient = new AicooTransport({ baseUrl: server, token: "anonymous", deviceId });
+
+    console.log("Initiating device pairing with Aicoo...");
+    const start = await unauthClient.startDeviceCode({
+      deviceId,
+      runtime: options.runtime,
+      bridgeVersion: "0.1.0",
+      adapterVersion: "0.1.0",
+      capabilities: ["comm:c2c", "runtime:adapter"],
+      label: `${hostname()} (${options.runtime})`,
+    });
+
+    console.log("\n========================================================");
+    console.log("  To approve this device, open your browser and visit:");
+    console.log(`  ${start.approvalUrl}`);
+    console.log(`\n  User Code: ${start.userCode}`);
+    console.log("========================================================\n");
+    console.log("Waiting for approval in browser...");
+
+    const pollIntervalMs = 2000;
+    while (true) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      try {
+        const poll = await unauthClient.pollDeviceCode(start.pollToken);
+        if (poll.status === "approved") {
+          const userId = "userId" in poll ? (poll as { userId?: string }).userId : undefined;
+          saveSavedCredentials({ token: poll.deviceToken, userId, deviceId });
+          console.log(`\nSuccessfully authenticated device ${deviceId}!`);
+          console.log(`Credentials saved to ${DEFAULT_CREDENTIALS_FILE}`);
+          return;
+        }
+        if (poll.status === "denied") {
+          console.error("\nDevice login was denied by user.");
+          process.exitCode = 1;
+          return;
+        }
+        if (poll.status === "expired") {
+          console.error("\nDevice login code expired. Please run 'ccd login' again.");
+          process.exitCode = 1;
+          return;
+        }
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 400 && error.code === "pending") {
+          continue;
+        }
+        throw error;
+      }
+    }
+  });
 
 program.command("serve")
   .option("--port <number>", "listen port", process.env.CCD_PORT ?? "7790")
@@ -71,6 +129,7 @@ program.command("start")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
+  .option("--json", "output raw JSON status blob", false)
   .action(async (options) => {
     await startBridge({ ...options, hosted: true, server: hostedServerUrl() });
   });
@@ -118,7 +177,7 @@ offer.command("revoke").argument("<offerId>").action(async (offerId) => {
 
 const connect = program.command("connect");
 connect
-  .argument("[person]", "principal ID to connect to")
+  .argument("[person]", "principal ID or @handle to connect to")
   .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
   .option("--ttl <minutes>", "grant TTL", "30")
   .action(async (person, options) => {
@@ -126,9 +185,39 @@ connect
       connect.help();
       return;
     }
+    const client = makeHostedClient();
+    let targetPrincipalId = person;
+    if (person.startsWith("@") || !isUuid(person)) {
+      try {
+        const resolved = await client.resolvePerson(person);
+        targetPrincipalId = resolved.principalId;
+        console.log(`Resolved ${person} -> ${resolved.principalId} (${resolved.name ?? resolved.handle ?? "user"})`);
+      } catch (error) {
+        console.error(`Could not resolve person '${person}': ${errorMessage(error)}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    try {
+      const pairStatus = await client.getPairStatus(targetPrincipalId);
+      if (pairStatus.status !== "ready" && pairStatus.status !== "setup_bridge") {
+        console.error(`\nCannot connect: ${pairStatus.message}`);
+        if (pairStatus.status === "request_pair") {
+          console.error("Ask them to open your DM in Aicoo and click Collaborate to pair your accounts first.");
+        } else if (pairStatus.status === "awaiting_their_accept") {
+          console.error("Your pair request is waiting for the other person to accept in Aicoo.");
+        }
+        process.exitCode = 1;
+        return;
+      }
+    } catch {
+      /* non-fatal fallback if pair-status check fails */
+    }
+
     const route = await resolveRoute({ spool: options.spool });
-    const session = await requestConnection(person, route, Number.parseInt(options.ttl, 10));
-    console.log(`Connection request sent to ${person}. They can accept in Aicoo, or run: ccd accept`);
+    const session = await requestConnection(targetPrincipalId, route, Number.parseInt(options.ttl, 10));
+    console.log(`Connection request sent to ${person} (${targetPrincipalId}). They can accept in Aicoo, or run: ccd accept`);
     console.log(`requestId: ${session.id}`);
   });
 connect.command("request")
@@ -156,7 +245,8 @@ connect.command("list").action(async () => print(await makeClient().listCommunic
 connect.command("accept")
   .argument("<sessionId>")
   .addOption(new Option("--access <preset>", "relationship access preset")
-    .choices(["chat-only"]))
+    .choices(["chat-only", "read-project", "edit-project"]))
+  .option("--folder <dir>", "folder to grant for read-project/edit-project")
   .option(
     "--policy <file>",
     "local relationship policy file",
@@ -184,14 +274,16 @@ connect.command("accept")
       principalId: grant.requester.principalId,
       deviceId,
       preset: options.access as RelationshipAccessPreset,
+      folder: options.folder,
     });
     print({
       grant,
       accessPolicy: {
         status: "saved",
         preset: options.access,
+        ...(options.folder ? { folder: options.folder } : {}),
         policyFile: options.policy,
-        note: "Claude Code and Codex remain text-only until per-relationship OS sandboxing is available.",
+        note: "Claude Code enforces this policy per tool call. Codex remains text-only until it has an enforceable tool gate.",
       },
     });
   });
@@ -207,7 +299,8 @@ connect.command("revoke").argument("<sessionId>").action(async (sessionId) => {
 program.command("accept")
   .description("accept the latest pending c2c request")
   .argument("[sessionId]")
-  .addOption(new Option("--access <preset>", "relationship access preset").choices(["chat-only"]).default("chat-only"))
+  .addOption(new Option("--access <preset>", "relationship access preset").choices(["chat-only", "read-project", "edit-project"]).default("chat-only"))
+  .option("--folder <dir>", "folder to grant for read-project/edit-project")
   .option(
     "--policy <file>",
     "local relationship policy file",
@@ -215,7 +308,7 @@ program.command("accept")
   )
   .action(async (sessionId, options) => {
     const id = sessionId ?? (await latestPendingSessionId());
-    const result = await acceptConnection(id, options.access as RelationshipAccessPreset, options.policy);
+    const result = await acceptConnection(id, options.access as RelationshipAccessPreset, options.policy, options.folder);
     console.log(`Accepted connection ${result.grant.id} from ${result.grant.requester.principalId}.`);
     if (result.accessPolicy.status !== "saved") {
       console.log(result.accessPolicy.reason);
@@ -379,6 +472,7 @@ async function startBridge(options: {
   model?: string;
   hosted?: boolean;
   server?: string;
+  json?: boolean;
 }): Promise<void> {
   ensureParentDirectory(options.spool);
   const selected = await selectRuntimeAdapter({
@@ -406,13 +500,22 @@ async function startBridge(options: {
     log: console.log,
   });
   const started = await bridge.start();
-  console.log(JSON.stringify({
-    status: "ready",
-    mode: "text-only",
-    adapter: selected.label,
-    ...started,
-    next: "Share principalId with the other person, then they can run: ccd connect <principalId>",
-  }, null, 2));
+  if (options.json) {
+    console.log(JSON.stringify({
+      status: "ready",
+      mode: "text-only",
+      adapter: selected.label,
+      ...started,
+    }, null, 2));
+  } else {
+    console.log("\n========================================================");
+    console.log("  Aicoo Local Agent Bridge is running!");
+    console.log(`     Adapter:  ${selected.label}`);
+    console.log(`     Device:   ${deviceId}`);
+    console.log("     Status:   Ready for C2C collaboration");
+    console.log("========================================================\n");
+    console.log("Listening for incoming C2C session tasks... (Press Ctrl+C to stop)");
+  }
   const shutdown = async () => {
     await bridge.stop();
     spool.close();
@@ -422,14 +525,53 @@ async function startBridge(options: {
   process.on("SIGTERM", () => void shutdown());
 }
 
+function loadSavedToken(): string | undefined {
+  try {
+    if (existsSync(DEFAULT_CREDENTIALS_FILE)) {
+      const parsed = JSON.parse(readFileSync(DEFAULT_CREDENTIALS_FILE, "utf8"));
+      return (parsed.token ?? parsed.deviceToken) as string | undefined;
+    }
+  } catch {
+    /* unreadable credentials file */
+  }
+  return undefined;
+}
+
+function saveSavedCredentials(credentials: { token: string; userId?: string; deviceId?: string }): void {
+  ensureParentDirectory(DEFAULT_CREDENTIALS_FILE);
+  writeFileSync(DEFAULT_CREDENTIALS_FILE, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2));
+}
+
+function isHostedUrl(serverUrl: string): boolean {
+  try {
+    const url = new URL(serverUrl);
+    return url.hostname.includes("aicoo") || url.hostname.includes("yourcoo");
+  } catch {
+    return false;
+  }
+}
+
+function isUuid(str: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
+}
+
 function makeClient(options: { hosted?: boolean; server?: string; deviceId?: string } = {}): HttpMessageTransport {
   const programOptions = program.opts<{ server: string; token?: string }>();
   const server = options.server ?? programOptions.server;
-  const token = required(programOptions.token, "--token or CCD_TOKEN");
-  if (options.hosted || process.env.CCD_AICOO === "1") {
-    return new AicooTransport({ baseUrl: server, token, deviceId: options.deviceId });
+  const token = programOptions.token ?? process.env.CCD_TOKEN ?? loadSavedToken();
+  const validToken = required(token, "--token, CCD_TOKEN, or run 'ccd login'");
+  const isHosted = options.hosted || process.env.CCD_AICOO === "1" || isHostedUrl(server);
+  if (isHosted) {
+    return new AicooTransport({
+      baseUrl: server,
+      token: validToken,
+      deviceId: options.deviceId,
+      onTokenRefreshed: (newToken) => {
+        saveSavedCredentials({ token: newToken, deviceId: options.deviceId });
+      },
+    });
   }
-  return makeTransport({ baseUrl: server, token, deviceId: options.deviceId });
+  return makeTransport({ baseUrl: server, token: validToken, deviceId: options.deviceId });
 }
 
 function makeHostedClient(): HttpMessageTransport {
@@ -508,9 +650,10 @@ async function acceptConnection(
   sessionId: string,
   access: RelationshipAccessPreset,
   policyFile: string,
+  folder: string | undefined,
 ): Promise<{
   grant: CommunicationGrant;
-  accessPolicy: { status: "saved"; preset: RelationshipAccessPreset; policyFile: string } | { status: "not_applied"; reason: string };
+  accessPolicy: { status: "saved"; preset: RelationshipAccessPreset; policyFile: string; folder?: string } | { status: "not_applied"; reason: string };
 }> {
   const grant = await makeHostedClient().acceptCommunicationSession(sessionId);
   const deviceId = grant.requester.deviceId;
@@ -528,8 +671,9 @@ async function acceptConnection(
     principalId: grant.requester.principalId,
     deviceId,
     preset: access,
+    folder,
   });
-  return { grant, accessPolicy: { status: "saved", preset: access, policyFile } };
+  return { grant, accessPolicy: { status: "saved", preset: access, policyFile, ...(folder ? { folder } : {}) } };
 }
 
 async function activeSessionForPeer(peerPrincipalId: string): Promise<CommunicationSession> {

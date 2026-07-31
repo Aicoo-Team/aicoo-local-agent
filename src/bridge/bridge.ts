@@ -155,6 +155,12 @@ export class RuntimeBridge {
         }
       } catch (error) {
         if (!this.#controller.signal.aborted) {
+          if (error instanceof ApiError && error.status === 401) {
+            this.options.log?.("\n[bridge] Device token revoked or invalid (401 Unauthorized). Stopping bridge.");
+            this.options.log?.("Please run 'ccd login' to re-authenticate this machine.");
+            await this.stop();
+            return;
+          }
           this.options.log?.(`event stream reconnecting: ${String(error)}`);
           await delay(50, this.#controller.signal);
         }
@@ -221,6 +227,12 @@ export class RuntimeBridge {
       try {
         await this.options.transport.heartbeatEndpoint(this.requireEndpoint());
       } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          this.options.log?.("\n[bridge] Device token revoked or invalid (401 Unauthorized). Stopping bridge.");
+          this.options.log?.("Please run 'ccd login' to re-authenticate this machine.");
+          await this.stop();
+          return;
+        }
         this.options.log?.(`heartbeat failed: ${String(error)}`);
       }
       // Publish the default route from here, not start(): by the first heartbeat the

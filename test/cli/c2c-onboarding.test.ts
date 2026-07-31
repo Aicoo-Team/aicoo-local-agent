@@ -1,0 +1,108 @@
+import { describe, expect, it, vi } from "vitest";
+import { HttpMessageTransport } from "../../src/shared/http-client.js";
+import { AicooTransport } from "../../src/shared/aicoo-transport.js";
+
+describe("C2C Onboarding Client Integration", () => {
+  it("fetches pair status via AicooTransport", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: "request_pair",
+        message: "You are not paired yet.",
+      }),
+    });
+
+    const client = new AicooTransport({
+      baseUrl: "https://www.aicoo.io",
+      token: "test-token",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const res = await client.getPairStatus("target-principal-123");
+    expect(res.status).toBe("request_pair");
+    expect(res.message).toBe("You are not paired yet.");
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://www.aicoo.io/api/v1/local-agent/pair-status?principalId=target-principal-123",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          authorization: "Bearer test-token",
+        }),
+      }),
+    );
+  });
+
+  it("resolves person handles via AicooTransport", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        principalId: "p-999",
+        handle: "abhinav",
+        name: "Abhinav Jain",
+        hasReachableRuntime: true,
+      }),
+    });
+
+    const client = new AicooTransport({
+      baseUrl: "https://www.aicoo.io",
+      token: "test-token",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const res = await client.resolvePerson("@abhinav");
+    expect(res.principalId).toBe("p-999");
+    expect(res.handle).toBe("abhinav");
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://www.aicoo.io/api/v1/local-agent/resolve-person?q=%40abhinav",
+      expect.anything(),
+    );
+  });
+
+  it("starts and polls device code flow via AicooTransport", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({
+          userCode: "ABCD-1234",
+          pollToken: "secret-poll-token",
+          approvalUrl: "https://www.aicoo.io/local-agent/device-code?code=ABCD-1234",
+          expiresAt: "2026-07-31T16:00:00Z",
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: "approved",
+          deviceToken: "aicoo_sk_device_xyz",
+          userId: "user-123",
+        }),
+      });
+
+    const client = new AicooTransport({
+      baseUrl: "https://www.aicoo.io",
+      token: "anonymous",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const startRes = await client.startDeviceCode({
+      deviceId: "device-1",
+      runtime: "codex",
+      bridgeVersion: "0.1.0",
+      adapterVersion: "0.1.0",
+      capabilities: ["comm:c2c"],
+    });
+
+    expect(startRes.userCode).toBe("ABCD-1234");
+    expect(startRes.pollToken).toBe("secret-poll-token");
+
+    const pollRes = await client.pollDeviceCode("secret-poll-token");
+    expect(pollRes.status).toBe("approved");
+    if (pollRes.status === "approved") {
+      expect(pollRes.deviceToken).toBe("aicoo_sk_device_xyz");
+    }
+  });
+});

@@ -3,6 +3,11 @@ import {
   ApiError,
   normalizeBearerToken,
   type HttpTransportOptions,
+  type PairStatusResponse,
+  type ResolvedPersonResponse,
+  type StartDeviceCodeInput,
+  type StartDeviceCodeResponse,
+  type PollDeviceCodeResponse,
 } from "./http-client.js";
 import type {
   CommunicationGrant,
@@ -38,6 +43,7 @@ export class AicooTransport extends HttpMessageTransport {
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   readonly #deviceId: string;
+  readonly #onTokenRefreshed?: (token: string) => void;
   #deviceToken?: string;
   #endpoint?: string;
 
@@ -48,6 +54,7 @@ export class AicooTransport extends HttpMessageTransport {
     this.#timeoutMs = options.timeoutMs ?? 5_000;
     this.#fetch = options.fetchImpl ?? fetch;
     this.#deviceId = options.deviceId?.trim() ?? "";
+    this.#onTokenRefreshed = options.onTokenRefreshed;
   }
 
   #authToken(): string {
@@ -104,6 +111,9 @@ export class AicooTransport extends HttpMessageTransport {
     this.#deviceToken = normalizeBearerToken(deviceToken);
     this.#endpoint = endpoint.endpointId;
     this.setEndpointId(endpoint.endpointId);
+    if (this.#onTokenRefreshed) {
+      this.#onTokenRefreshed(deviceToken);
+    }
     return endpoint;
   }
 
@@ -254,6 +264,22 @@ export class AicooTransport extends HttpMessageTransport {
 
   async getToolApproval(approvalId: string): Promise<{ status: string; decision: "allow" | "deny" | null }> {
     return this.requestJson(`${LA}/tool-approvals/${encodeURIComponent(approvalId)}`);
+  }
+
+  override async getPairStatus(principalId: string): Promise<PairStatusResponse> {
+    return this.requestJson<PairStatusResponse>(`${LA}/pair-status?principalId=${encodeURIComponent(principalId)}`);
+  }
+
+  override async resolvePerson(query: string): Promise<ResolvedPersonResponse> {
+    return this.requestJson<ResolvedPersonResponse>(`${LA}/resolve-person?q=${encodeURIComponent(query)}`);
+  }
+
+  override async startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse> {
+    return this.requestJson<StartDeviceCodeResponse>(`${LA}/device-code/start`, { method: "POST", body: input });
+  }
+
+  override async pollDeviceCode(pollToken: string): Promise<PollDeviceCodeResponse> {
+    return this.requestJson<PollDeviceCodeResponse>(`${LA}/device-code/poll`, { method: "POST", body: { pollToken } });
   }
 }
 
