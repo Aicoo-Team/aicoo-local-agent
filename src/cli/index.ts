@@ -736,12 +736,17 @@ function print(value: unknown): void {
 }
 
 async function watchDelivery(client: HttpMessageTransport, messageId: string): Promise<void> {
+  let lastStatus = "";
   do {
     const status = await client.getMessageStatus(messageId);
-    console.log(formatDelivery(status));
+    const formatted = formatDelivery(status);
+    if (formatted !== lastStatus) {
+      console.log(formatted);
+      console.log("");
+      lastStatus = formatted;
+    }
     if (["runtime_acked", "inbox_persisted", "failed", "expired", "revoked", "rejected"].includes(status.status)) return;
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    console.log("");
+    await new Promise((resolve) => setTimeout(resolve, 500));
   } while (true);
 }
 
