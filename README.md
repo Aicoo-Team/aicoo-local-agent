@@ -148,9 +148,12 @@ Then connect and message:
 
 ```bash
 npm run ccd -- connect <other-principal-id>
-npm run ccd -- accept
 npm run ccd -- send-to <other-principal-id> "hello"
 ```
+
+The recipient accepts from Aicoo's UI. If the UI is unavailable during local testing, they can run
+`npm run ccd -- accept` as a CLI fallback. `send-to` waits for runtime acknowledgement by default;
+use `--no-watch` for fire-and-forget.
 
 The lower-level commands remain available for debugging and self-hosted control planes:
 `bridge`, `connect request`, `connect accept <comm-id>`, and `send --comm-session <comm-id>`.

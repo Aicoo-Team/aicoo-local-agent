@@ -127,7 +127,7 @@ connect
     }
     const route = await resolveRoute({ spool: options.spool });
     const session = await requestConnection(person, route, Number.parseInt(options.ttl, 10));
-    console.log(`Connection request sent to ${person}. Ask them to run: ccd accept`);
+    console.log(`Connection request sent to ${person}. They can accept in Aicoo, or run: ccd accept`);
     console.log(`requestId: ${session.id}`);
   });
 connect.command("request")
@@ -237,9 +237,11 @@ program.command("send-to")
   .argument("<person>", "peer principal ID")
   .argument("<message...>", "message text")
   .option("--client-id <id>")
+  .option("--no-watch", "do not wait for runtime acknowledgement")
   .action(async (person, messageParts, options) => {
     const session = await activeSessionForPeer(person);
-    const receipt = await makeHostedClient().sendMessage({
+    const client = makeHostedClient();
+    const receipt = await client.sendMessage({
       communicationSessionId: session.id,
       clientMessageId: options.clientId ?? randomUUID(),
       kind: "text",
@@ -247,6 +249,10 @@ program.command("send-to")
     });
     console.log(`Sent to ${person}.`);
     print(receipt);
+    if (options.watch) {
+      console.log("");
+      await watchDelivery(client, receipt.messageId);
+    }
   });
 
 program.command("send-inbox")
@@ -276,6 +282,13 @@ program.command("status")
       await new Promise((resolve) => setTimeout(resolve, 250));
       console.log("");
     } while (true);
+  });
+
+program.command("watch")
+  .description("watch hosted Aicoo delivery status for a message")
+  .argument("<messageId>")
+  .action(async (messageId) => {
+    await watchDelivery(makeHostedClient(), messageId);
   });
 
 program.command("inbox").action(async () => print(await makeClient().listInboxItems()));
@@ -547,6 +560,16 @@ function ensureParentDirectory(file: string): void {
 
 function print(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
+}
+
+async function watchDelivery(client: HttpMessageTransport, messageId: string): Promise<void> {
+  do {
+    const status = await client.getMessageStatus(messageId);
+    console.log(formatDelivery(status));
+    if (["runtime_acked", "inbox_persisted", "failed", "expired", "revoked", "rejected"].includes(status.status)) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    console.log("");
+  } while (true);
 }
 
 function errorMessage(error: unknown): string {
