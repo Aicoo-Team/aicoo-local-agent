@@ -54,6 +54,30 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     ]);
   });
 
+  it("keeps tools denied during an active verified turn", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    driver.resultDelayMs = 100;
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: process.cwd(),
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
+      .toMatchObject({ status: "runtime_acked" });
+    const options = driver.starts[0]!.options;
+    expect(options.tools).toEqual([]);
+    expect(options.allowedTools).toEqual([]);
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
+      signal: new AbortController().signal,
+      toolUseID: "read-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "deny" });
+  });
+
   it("injects a remote reply as context-only and does not create an automatic reply loop", async () => {
     const driver = new FakeClaudeAgentDriver();
     const adapter = makeAdapter(driver);
@@ -85,7 +109,29 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     });
   });
 
-  it("persists only the provider session id locally and resumes it after restart", async () => {
+  it("binds a managed Claude conversation to one communication session", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const firstEvents = collectEvents(adapter, "claude-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_comm_1", { communicationSessionId: "comm_1" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await firstEvents;
+
+    expect(await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_comm_2", { communicationSessionId: "comm_2" }),
+      "queue",
+    )).toEqual({ status: "permission_required" });
+    expect(driver.received).toHaveLength(1);
+  });
+
+  it("discards an initialized legacy conversation that was never bound to a relationship", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-state-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const stateFile = join(directory, "sessions.db");
@@ -99,9 +145,39 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     const second = new ClaudeCodeAdapter({ stateFile, cwd: directory, driver: secondDriver });
     cleanups.push(() => second.close());
     await second.initialize();
+    expect(second.providerSessionId("claude-managed-1")).not.toBe(providerSessionId);
+    expect(secondDriver.starts[0]?.options.resume).toBeUndefined();
+    expect(secondDriver.starts[0]?.options.sessionId).toBe(second.providerSessionId("claude-managed-1"));
+  });
+
+  it("resumes a provider conversation only for its persisted communication session", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-bound-state-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const stateFile = join(directory, "sessions.db");
+    const firstDriver = new FakeClaudeAgentDriver();
+    const first = new ClaudeCodeAdapter({ stateFile, cwd: directory, driver: firstDriver });
+    await first.initialize();
+    const events = collectEvents(first, "claude-managed-1", 2);
+    expect(await first.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_bound", { communicationSessionId: "comm_bound" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await events;
+    const providerSessionId = first.providerSessionId("claude-managed-1");
+    await first.close();
+
+    const secondDriver = new FakeClaudeAgentDriver();
+    const second = new ClaudeCodeAdapter({ stateFile, cwd: directory, driver: secondDriver });
+    cleanups.push(() => second.close());
+    await second.initialize();
     expect(second.providerSessionId("claude-managed-1")).toBe(providerSessionId);
     expect(secondDriver.starts[0]?.options.resume).toBe(providerSessionId);
-    expect(secondDriver.starts[0]?.options.sessionId).toBeUndefined();
+    expect(await second.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_wrong_grant", { communicationSessionId: "comm_other" }),
+      "queue",
+    )).toEqual({ status: "permission_required" });
   });
 });
 
@@ -120,13 +196,17 @@ async function collectEvents(adapter: ClaudeCodeAdapter, sessionHandle: string, 
 
 function inbound(
   id: string,
-  overrides: Partial<Pick<InboundMessage, "replyTo" | "correlationId">> = {},
+  overrides: Partial<Pick<
+    InboundMessage,
+    "replyTo" | "correlationId" | "communicationSessionId"
+  >> = {},
 ): InboundMessage {
   return {
     id,
     clientMessageId: `client_${id}`,
     communicationSessionId: "comm_1",
     senderPrincipalId: "prn_a",
+    senderDeviceId: "device-a1",
     target: {
       kind: "runtime_session",
       principalId: "prn_b",

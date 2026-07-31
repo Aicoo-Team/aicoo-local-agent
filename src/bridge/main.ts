@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
+import { DEFAULT_RELATIONSHIP_POLICY_FILE } from "../security/relationship-policy.js";
 import { makeTransport } from "../shared/aicoo-transport.js";
 import { RuntimeBridge } from "./bridge.js";
 import { BridgeSpool } from "./spool.js";
@@ -47,6 +48,11 @@ const program = new Command()
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option(
+    "--relationship-policy <file>",
+    "JSON allowlist of tools/folders for verified users and devices",
+    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+  )
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL);
 
 program.parse();
@@ -63,6 +69,7 @@ const options = program.opts<{
   claudePath?: string;
   codexState?: string;
   codexPath?: string;
+  relationshipPolicy?: string;
   model?: string;
 }>();
 const selected = await selectRuntimeAdapter({
@@ -75,6 +82,7 @@ const selected = await selectRuntimeAdapter({
   claudePath: options.claudePath,
   codexStateFile: options.codexState,
   codexPath: options.codexPath,
+  relationshipPolicyFile: options.relationshipPolicy,
   model: options.model,
   log: console.log,
 });

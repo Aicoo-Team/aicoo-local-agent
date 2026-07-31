@@ -18,6 +18,10 @@ describe("communication-session lifecycle", () => {
     const { commSessionId, b } = await activateDefaultGrant(app);
     const current = await api<CommunicationSession>(app, TOKENS.a, `/api/v1/comm-sessions/${commSessionId}`);
     expect(current.body.status).toBe("active");
+    expect(current.body.requester).toMatchObject({
+      principalId: "prn_a",
+      deviceId: "device-a1",
+    });
     expect(current.body.recipient.endpointId).toBe(b.endpoint.endpointId);
     expect(current.body.recipient.sessionHandle).toBe(b.session.sessionHandle);
     expect(new Date(current.body.grantExpiresAt as string).getTime() - new Date(current.body.activatedAt as string).getTime())

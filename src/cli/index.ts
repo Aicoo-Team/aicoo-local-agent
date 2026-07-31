@@ -6,6 +6,11 @@ import { BridgeSpool } from "../bridge/spool.js";
 import type { HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { makeTransport } from "../shared/aicoo-transport.js";
+import {
+  DEFAULT_RELATIONSHIP_POLICY_FILE,
+  upsertRelationshipPreset,
+  type RelationshipAccessPreset,
+} from "../security/relationship-policy.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 
@@ -39,6 +44,11 @@ program.command("bridge")
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option(
+    "--relationship-policy <file>",
+    "JSON allowlist of tools/folders for verified users and devices",
+    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+  )
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
   .action(async (options) => {
     const selected = await selectRuntimeAdapter({
@@ -51,6 +61,7 @@ program.command("bridge")
       claudePath: options.claudePath,
       codexStateFile: options.codexState,
       codexPath: options.codexPath,
+      relationshipPolicyFile: options.relationshipPolicy,
       model: options.model,
       log: console.log,
     });
@@ -138,9 +149,48 @@ connect.command("request")
     print(await makeClient().requestCommunicationSession(input));
   });
 connect.command("list").action(async () => print(await makeClient().listCommunicationSessions()));
-connect.command("accept").argument("<sessionId>").action(async (sessionId) => print(
-  await makeClient().acceptCommunicationSession(sessionId),
-));
+connect.command("accept")
+  .argument("<sessionId>")
+  .addOption(new Option("--access <preset>", "relationship access preset")
+    .choices(["chat-only"]))
+  .option(
+    "--policy <file>",
+    "local relationship policy file",
+    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+  )
+  .action(async (sessionId, options) => {
+    const grant = await makeClient().acceptCommunicationSession(sessionId);
+    if (!options.access) {
+      print(grant);
+      return;
+    }
+    const deviceId = grant.requester.deviceId;
+    if (!deviceId) {
+      print({
+        grant,
+        accessPolicy: {
+          status: "not_applied",
+          reason: "The server did not return the requester's verified device ID; access remains chat-only.",
+        },
+      });
+      return;
+    }
+    upsertRelationshipPreset({
+      file: options.policy,
+      principalId: grant.requester.principalId,
+      deviceId,
+      preset: options.access as RelationshipAccessPreset,
+    });
+    print({
+      grant,
+      accessPolicy: {
+        status: "saved",
+        preset: options.access,
+        policyFile: options.policy,
+        note: "Claude Code and Codex remain text-only until per-relationship OS sandboxing is available.",
+      },
+    });
+  });
 connect.command("decline").argument("<sessionId>").action(async (sessionId) => {
   await makeClient().declineCommunicationSession(sessionId);
   console.log("communication session declined");

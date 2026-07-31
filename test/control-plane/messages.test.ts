@@ -28,10 +28,16 @@ describe("message persistence, identity, idempotency, and ACKs", () => {
     expect(first.response.status).toBe(201);
     expect(duplicate.body.messageId).toBe(first.body.messageId);
     expect(duplicate.body.duplicate).toBe(true);
-    const row = db.prepare("SELECT sender_principal_id, target_endpoint_id FROM messages WHERE message_id = ?").get(
+    const row = db.prepare(
+      "SELECT sender_principal_id, sender_device_id, target_endpoint_id FROM messages WHERE message_id = ?",
+    ).get(
       first.body.messageId,
-    ) as { sender_principal_id: string; target_endpoint_id: string };
-    expect(row).toEqual({ sender_principal_id: "prn_a", target_endpoint_id: b.endpoint.endpointId });
+    ) as { sender_principal_id: string; sender_device_id: string; target_endpoint_id: string };
+    expect(row).toEqual({
+      sender_principal_id: "prn_a",
+      sender_device_id: "device-a1",
+      target_endpoint_id: b.endpoint.endpointId,
+    });
 
     const conflict = await api(app, TOKENS.a, "/api/v1/messages", "POST", { ...body, payload: { text: "changed" } });
     expect(conflict.response.status).toBe(409);

@@ -6,6 +6,7 @@ import { ClaudeCodeAdapter } from "./claude-code/claude-code-adapter.js";
 import { CodexAdapter } from "./codex/codex-adapter.js";
 import { FakeRuntimeAdapter } from "./fake/fake-adapter.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
+import { RelationshipPolicy } from "../security/relationship-policy.js";
 
 export type RuntimeAdapterKind = "fake" | "claude-code" | "codex";
 
@@ -19,6 +20,7 @@ export interface RuntimeAdapterSelectionOptions {
   claudePath?: string;
   codexStateFile?: string;
   codexPath?: string;
+  relationshipPolicyFile?: string;
   model?: string;
   log?: (line: string) => void;
 }
@@ -56,11 +58,24 @@ export async function selectRuntimeAdapter(
     if (!configuredPath) {
       throw new Error("codex executable not found on PATH; install codex or pass --codex-path");
     }
+    const relationshipPolicyFile = options.relationshipPolicyFile
+      ? resolve(options.relationshipPolicyFile)
+      : undefined;
+    if (relationshipPolicyFile) {
+      // Validate the shared onboarding file at startup. Codex reloads it for
+      // each message, while remaining text-only even if it contains tool access.
+      try {
+        RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+      } catch (error) {
+        options.log?.(`relationship policy could not be loaded; continuing text-only: ${String(error)}`);
+      }
+    }
     const adapter = new CodexAdapter({
       stateFile: resolve(options.codexStateFile ?? `${options.spoolFile}.codex.db`),
       cwd: resolve(options.workspace),
       sessionCount: options.sessions,
       codexPath: configuredPath,
+      ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
       ...(options.model ? { model: options.model } : {}),
       log: options.log,
     });
@@ -77,6 +92,21 @@ export async function selectRuntimeAdapter(
     throw new Error(`Claude Code executable is not executable: ${explicitPath}`);
   }
   const configuredPath = explicitPath ?? await findExecutableOnPath("claude");
+  const relationshipPolicyFile = options.relationshipPolicyFile
+    ? resolve(options.relationshipPolicyFile)
+    : undefined;
+  if (relationshipPolicyFile) {
+    try {
+      const policy = RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+      if (policy.enabledTools().length > 0) {
+        options.log?.(
+          "relationship tool access is disabled until per-relationship OS sandboxing is available; continuing text-only",
+        );
+      }
+    } catch (error) {
+      options.log?.(`relationship policy could not be loaded; continuing text-only: ${String(error)}`);
+    }
+  }
   const adapter = new ClaudeCodeAdapter({
     stateFile: resolve(options.claudeStateFile ?? `${options.spoolFile}.claude.db`),
     cwd: resolve(options.workspace),

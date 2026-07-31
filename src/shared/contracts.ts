@@ -55,6 +55,8 @@ export interface CommunicationSession {
   id: string;
   requester: {
     principalId: string;
+    /** Server-derived identity of the device that requested this relationship. */
+    deviceId?: string;
     replyEndpointId: string;
     replySessionHandle: string;
   };
@@ -93,6 +95,11 @@ export interface MessageEnvelope {
   communicationSessionId?: string;
   conversationId?: string;
   senderPrincipalId: string;
+  /**
+   * Device identity derived by the control plane from the authenticated sender.
+   * Clients must never be allowed to supply or override this value.
+   */
+  senderDeviceId?: string;
   target: MessageTarget;
   kind: MessageKind;
   payload: Record<string, unknown>;

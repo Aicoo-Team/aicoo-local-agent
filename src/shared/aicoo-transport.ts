@@ -242,6 +242,7 @@ export class AicooTransport extends HttpMessageTransport {
 interface CommRow {
   commSessionId: string;
   requesterPrincipalId: string;
+  requesterDeviceId?: string | null;
   requesterReplyEndpointId: string;
   requesterReplySessionHandle: string;
   recipientPrincipalId: string;
@@ -262,6 +263,7 @@ function mapCommSession(row: CommRow): CommunicationSession {
     id: row.commSessionId,
     requester: {
       principalId: row.requesterPrincipalId,
+      ...(row.requesterDeviceId ? { deviceId: row.requesterDeviceId } : {}),
       replyEndpointId: row.requesterReplyEndpointId,
       replySessionHandle: row.requesterReplySessionHandle,
     },
@@ -395,53 +397,4 @@ export interface ToolApprovalRequest {
   messageId?: string;
   toolName: string;
   toolInputSummary: string;
-}
-
-// AicooTransport tool-approval helpers (幕 4). Declared as a module augmentation
-// would need the class; instead expose via a thin wrapper factory below.
-export interface ToolApprovalClient {
-  requestToolApproval(
-    input: ToolApprovalRequest,
-  ): Promise<{ approvalId: string; status: string; decision: string | null }>;
-  getToolApproval(approvalId: string): Promise<{ status: string; decision: "allow" | "deny" | null }>;
-}
-
-/**
- * Build a resolveToolPermission callback (for ClaudeCodeAdapter) bound to one
- * grant + session. Auto-allowed by policy → allow; pending → poll until the owner
- * decides or the timeout elapses (fail-closed deny). The client is typically an
- * AicooTransport instance (it satisfies ToolApprovalClient once the methods below
- * are attached).
- */
-export function makeToolPermissionResolver(
-  client: ToolApprovalClient,
-  context: { communicationSessionId: string; sessionHandle: string; messageId?: string },
-  options: { timeoutMs?: number; pollMs?: number } = {},
-) {
-  const timeoutMs = options.timeoutMs ?? 120_000;
-  const pollMs = options.pollMs ?? 1_500;
-  return async (action: {
-    toolName: string;
-    input: Record<string, unknown>;
-  }): Promise<{ behavior: "allow" | "deny"; message?: string }> => {
-    const raw = JSON.stringify(action.input);
-    const summary = `${action.toolName}: ${raw.length > 500 ? `${raw.slice(0, 500)}…` : raw}`;
-    const res = await client.requestToolApproval({
-      communicationSessionId: context.communicationSessionId,
-      sessionHandle: context.sessionHandle,
-      messageId: context.messageId,
-      toolName: action.toolName,
-      toolInputSummary: summary,
-    });
-    if (res.status === "auto_allow" || res.decision === "allow") return { behavior: "allow" };
-    if (res.decision === "deny") return { behavior: "deny", message: "owner denied" };
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, pollMs));
-      const cur = await client.getToolApproval(res.approvalId);
-      if (cur.decision === "allow") return { behavior: "allow" };
-      if (cur.decision === "deny") return { behavior: "deny", message: "owner denied" };
-    }
-    return { behavior: "deny", message: "approval timed out" };
-  };
 }

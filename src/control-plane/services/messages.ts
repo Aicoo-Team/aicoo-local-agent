@@ -57,6 +57,7 @@ export class MessageService {
         clientMessageId: input.clientMessageId,
         requestHash,
         senderPrincipalId: auth.principalId,
+        senderDeviceId: auth.deviceId,
         targetKind: "human_inbox",
         targetPrincipalId: input.target.principalId,
         kind: input.kind,
@@ -130,6 +131,7 @@ export class MessageService {
       clientMessageId: input.clientMessageId,
       communicationSessionId: comm.id,
       senderPrincipalId: auth.principalId,
+      senderDeviceId: auth.deviceId,
       target: {
         kind: target.kind,
         principalId: target.principalId,
@@ -151,6 +153,7 @@ export class MessageService {
         requestHash,
         commSessionId: comm.id,
         senderPrincipalId: auth.principalId,
+        senderDeviceId: auth.deviceId,
         targetKind: target.kind,
         targetPrincipalId: target.principalId,
         targetEndpointId,
@@ -344,6 +347,7 @@ export class MessageService {
       clientMessageId: row.client_message_id,
       ...(row.comm_session_id ? { communicationSessionId: row.comm_session_id } : {}),
       senderPrincipalId: row.sender_principal_id,
+      ...(row.sender_device_id ? { senderDeviceId: row.sender_device_id } : {}),
       target: {
         kind: row.target_kind,
         principalId: row.target_principal_id,
@@ -363,15 +367,16 @@ export class MessageService {
   private insertMessage(input: InsertMessage): void {
     this.db.prepare(
       `INSERT INTO messages(message_id, client_message_id, request_hash, comm_session_id,
-       sender_principal_id, target_kind, target_principal_id, target_endpoint_id, target_session_handle,
+       sender_principal_id, sender_device_id, target_kind, target_principal_id, target_endpoint_id, target_session_handle,
        kind, payload_json, reply_to, correlation_id, sequence, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.messageId,
       input.clientMessageId,
       input.requestHash,
       input.commSessionId ?? null,
       input.senderPrincipalId,
+      input.senderDeviceId,
       input.targetKind,
       input.targetPrincipalId,
       input.targetEndpointId ?? null,
@@ -432,6 +437,7 @@ interface InsertMessage {
   requestHash: string;
   commSessionId?: string;
   senderPrincipalId: string;
+  senderDeviceId: string;
   targetKind: MessageEnvelope["target"]["kind"];
   targetPrincipalId: string;
   targetEndpointId?: string;
@@ -450,6 +456,7 @@ interface MessageRow {
   client_message_id: string;
   comm_session_id: string | null;
   sender_principal_id: string;
+  sender_device_id: string | null;
   target_kind: MessageEnvelope["target"]["kind"];
   target_principal_id: string;
   target_endpoint_id: string | null;
