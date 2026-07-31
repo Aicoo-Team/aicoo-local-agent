@@ -33,8 +33,9 @@ program.command("login")
   .description("log in this machine via Aicoo device-code pairing flow")
   .addOption(new Option("--runtime <adapter>", "runtime adapter").choices(["claude-code", "codex"]).default("codex"))
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
   .action(async (options) => {
-    const server = hostedServerUrl();
+    const server = hostedServerUrl(options.server);
     const deviceId = resolveDeviceId(undefined, options.spool);
     const unauthClient = new AicooTransport({ baseUrl: server, token: "anonymous", deviceId });
 
@@ -579,14 +580,14 @@ function makeClient(options: { hosted?: boolean; server?: string; deviceId?: str
   return makeTransport({ baseUrl: server, token: validToken, deviceId: options.deviceId });
 }
 
-function makeHostedClient(): HttpMessageTransport {
-  return makeClient({ hosted: true, server: hostedServerUrl() });
+function makeHostedClient(server?: string): HttpMessageTransport {
+  return makeClient({ hosted: true, server: hostedServerUrl(server) });
 }
 
-function hostedServerUrl(): string {
-  if (process.env.CCD_SERVER_URL) return normalizeHostedServerUrl(process.env.CCD_SERVER_URL);
-  const options = program.opts<{ server: string }>();
-  return options.server === LOCAL_SERVER_URL ? PRODUCT_AICOO_SERVER_URL : normalizeHostedServerUrl(options.server);
+function hostedServerUrl(explicitServer?: string): string {
+  const serverCandidate = explicitServer ?? process.env.CCD_SERVER_URL ?? program.opts<{ server?: string }>().server;
+  if (!serverCandidate || serverCandidate === LOCAL_SERVER_URL) return PRODUCT_AICOO_SERVER_URL;
+  return normalizeHostedServerUrl(serverCandidate);
 }
 
 function normalizeHostedServerUrl(server: string): string {
