@@ -334,20 +334,32 @@ program.command("send")
 
 program.command("send-to")
   .description("send a text message to an active c2c relationship")
-  .argument("<person>", "peer principal ID")
+  .argument("<person>", "peer principal ID or @handle")
   .argument("<message...>", "message text")
   .option("--client-id <id>")
   .option("--no-watch", "do not wait for runtime acknowledgement")
+  .option("--server <url>", "control-plane URL")
   .action(async (person, messageParts, options) => {
-    const session = await activeSessionForPeer(person);
-    const client = makeHostedClient();
+    const client = makeHostedClient(options.server);
+    let targetPrincipalId = person;
+    if (person.startsWith("@") || !isUuid(person)) {
+      try {
+        const resolved = await client.resolvePerson(person);
+        targetPrincipalId = resolved.principalId;
+      } catch (error) {
+        console.error(`Could not resolve person '${person}': ${errorMessage(error)}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
+    const session = await activeSessionForPeer(targetPrincipalId, options.server);
     const receipt = await client.sendMessage({
       communicationSessionId: session.id,
       clientMessageId: options.clientId ?? randomUUID(),
       kind: "text",
       payload: { text: messageParts.join(" ") },
     });
-    console.log(`Sent to ${person}.`);
+    console.log(`Sent to ${person} (${targetPrincipalId}).`);
     print(receipt);
     if (options.watch) {
       console.log("");
@@ -682,8 +694,8 @@ async function acceptConnection(
   return { grant, accessPolicy: { status: "saved", preset: access, policyFile, ...(folder ? { folder } : {}) } };
 }
 
-async function activeSessionForPeer(peerPrincipalId: string): Promise<CommunicationSession> {
-  const active = (await makeHostedClient().listCommunicationSessions())
+async function activeSessionForPeer(peerPrincipalId: string, server?: string): Promise<CommunicationSession> {
+  const active = (await makeHostedClient(server).listCommunicationSessions())
     .filter((session) =>
       session.status === "active"
       && (session.requester.principalId === peerPrincipalId || session.recipient.principalId === peerPrincipalId))
