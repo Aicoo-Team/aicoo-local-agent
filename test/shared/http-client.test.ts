@@ -38,3 +38,45 @@ describe("bearer token normalization", () => {
     expect(request?.headers).toMatchObject({ authorization: "Bearer aicoo_sk_example" });
   });
 });
+
+describe("hosted Aicoo transport", () => {
+  it("uses the local-agent identity endpoint for whoami", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      Response.json({ principalId: "user-1", deviceId: "device-1" }));
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_sk_example",
+      deviceId: "device-fallback",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.whoami()).resolves.toEqual({ principalId: "user-1", deviceId: "device-1" });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://example.test/api/v1/local-agent/whoami");
+  });
+
+  it("falls back to the configured device id when identity omits one", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      Response.json({ principalId: "user-1" }));
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_sk_example",
+      deviceId: "device-fallback",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.whoami()).resolves.toEqual({ principalId: "user-1", deviceId: "device-fallback" });
+  });
+
+  it("uses the local-agent grants endpoint when listing relationships", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => Response.json([]));
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_sk_example",
+      deviceId: "device-1",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.listCommunicationSessions()).resolves.toEqual([]);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://example.test/api/v1/local-agent/grants");
+  });
+});

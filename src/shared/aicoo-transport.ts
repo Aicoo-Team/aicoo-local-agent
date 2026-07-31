@@ -137,6 +137,19 @@ export class AicooTransport extends HttpMessageTransport {
     return this.requestJson(`${LA}/default-route`);
   }
 
+  override async whoami(): Promise<{ principalId: string; deviceId: string }> {
+    const response = await this.requestJson<{
+      principalId?: string;
+      userId?: string;
+      deviceId?: string | null;
+    }>(`${LA}/whoami`);
+    const principalId = response.principalId ?? response.userId;
+    if (!principalId) {
+      throw new ApiError(500, "invalid_response", response);
+    }
+    return { principalId, deviceId: response.deviceId ?? this.#deviceId };
+  }
+
   override async listReachableTargets(_personId: string): Promise<ReachableTarget[]> {
     // Targets endpoint is not part of the P1 scenario slice.
     return [];
@@ -147,6 +160,11 @@ export class AicooTransport extends HttpMessageTransport {
   ): Promise<CommunicationSession> {
     const row = await this.requestJson<CommRow>(`${LA}/grants`, { method: "POST", body: input });
     return mapCommSession(row);
+  }
+
+  override async listCommunicationSessions(): Promise<CommunicationSession[]> {
+    const rows = await this.requestJson<CommRow[]>(`${LA}/grants`);
+    return rows.map(mapCommSession);
   }
 
   override async acceptCommunicationSession(sessionId: string): Promise<CommunicationGrant> {

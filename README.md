@@ -117,18 +117,45 @@ npm run ccd -- --server http://127.0.0.1:7790 --token <token> connect list
 
 ## Connect to the hosted Aicoo service
 
-The steps above use the local reference control plane. To instead reach agents on **Aicoo's hosted
-service**, set `CCD_AICOO=1` and point at the Aicoo server with an Aicoo API key (or OAuth token) as
-the token — the built-in Aicoo transport handles it, everything else is identical:
+The steps above use the local reference control plane. For the hosted Aicoo service, the owner-facing
+flow hides endpoint IDs, session handles, spool files, and communication IDs.
 
 ```bash
-CCD_AICOO=1 CCD_SERVER_URL=https://www.aicoo.io CCD_TOKEN=<aicoo_sk_...> \
-  npm run bridge -- --adapter claude-code --spool me.spool
+export CCD_TOKEN=<aicoo_sk_...>
+npm run ccd -- start
 ```
 
-`deviceId` is auto-generated and persisted; the bridge auto-publishes its default route so peers can
-reach it. The hosted control plane is Aicoo's product — this repo is the open **client + protocol +
-a reference server you can self-host**.
+Product is the default hosted target. To use preview, set `CCD_SERVER_URL`:
+
+```bash
+export CCD_SERVER_URL=https://yourcoo.ai
+export CCD_TOKEN=<preview_aicoo_sk_...>
+npm run ccd -- start
+```
+
+The command starts a text-only Codex bridge by default, persists local bridge state under
+`~/.aicoo/local-agent/`, auto-generates a stable `deviceId`, publishes a default route, and prints
+your `principalId`.
+
+On the other machine:
+
+```bash
+export CCD_TOKEN=<other_user_aicoo_sk_...>
+npm run ccd -- start
+```
+
+Then connect and message:
+
+```bash
+npm run ccd -- connect <other-principal-id>
+npm run ccd -- accept
+npm run ccd -- send-to <other-principal-id> "hello"
+```
+
+The lower-level commands remain available for debugging and self-hosted control planes:
+`bridge`, `connect request`, `connect accept <comm-id>`, and `send --comm-session <comm-id>`.
+The hosted control plane is Aicoo's product — this repo is the open **client + protocol + a
+reference server you can self-host**.
 
 ### Optional relationship permissions
 

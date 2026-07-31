@@ -38,7 +38,13 @@ export class RuntimeBridge {
     return this.options.spool.listSessionMappings();
   }
 
-  async start(): Promise<{ endpointId: string; sessions: Array<{ nativeHandle: string; serverHandle: string }>; defaultRoute?: string }> {
+  async start(): Promise<{
+    endpointId: string;
+    principalId: string;
+    deviceId: string;
+    sessions: Array<{ nativeHandle: string; serverHandle: string }>;
+    defaultRoute?: string;
+  }> {
     await this.options.adapter.initialize?.();
     const adapterCapabilities = await this.options.adapter.capabilities();
     const endpoint = await this.options.transport.registerEndpoint({
@@ -114,6 +120,8 @@ export class RuntimeBridge {
 
     return {
       endpointId: endpoint.endpointId,
+      principalId: endpoint.principalId,
+      deviceId: endpoint.deviceId,
       sessions: mappings.map(({ nativeHandle, serverHandle }) => ({ nativeHandle, serverHandle })),
       defaultRoute: this.#pendingDefaultRoute,
     };

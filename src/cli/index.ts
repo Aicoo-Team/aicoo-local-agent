@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
 import { RuntimeBridge } from "../bridge/bridge.js";
 import { BridgeSpool } from "../bridge/spool.js";
-import type { HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
+import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
-import { makeTransport } from "../shared/aicoo-transport.js";
+import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
 import {
   DEFAULT_RELATIONSHIP_POLICY_FILE,
   upsertRelationshipPreset,
@@ -14,10 +17,14 @@ import {
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 
+const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
+const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
+const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
+
 const program = new Command()
   .name("ccd")
   .description("aicoo-local-agent realtime runtime-messaging CLI")
-  .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? "http://127.0.0.1:7790")
+  .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? LOCAL_SERVER_URL)
   .option("--token <token>", "device bearer token", process.env.CCD_TOKEN);
 
 program.command("serve")
@@ -51,44 +58,20 @@ program.command("bridge")
   )
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
   .action(async (options) => {
-    const selected = await selectRuntimeAdapter({
-      kind: options.adapter as RuntimeAdapterKind,
-      sessions: Number.parseInt(options.sessions, 10),
-      fakeBusy: options.fakeBusy,
-      spoolFile: options.spool,
-      workspace: options.workspace,
-      claudeStateFile: options.claudeState,
-      claudePath: options.claudePath,
-      codexStateFile: options.codexState,
-      codexPath: options.codexPath,
-      relationshipPolicyFile: options.relationshipPolicy,
-      model: options.model,
-      log: console.log,
-    });
-    const spool = new BridgeSpool(options.spool);
-    const bridge = new RuntimeBridge({
-      transport: makeClient(),
-      spool,
-      adapter: selected.adapter,
-      adapterVersion: selected.adapterVersion,
-      runtime: selected.runtime,
-      log: console.log,
-    });
-    const started = await bridge.start();
-    console.log(JSON.stringify({
-      status: "ready",
-      mode: "text-only",
-      adapter: selected.label,
-      ...started,
-      note: "Default route is published automatically; peers can request person_default_runtime once the heartbeat confirms it.",
-    }, null, 2));
-    const shutdown = async () => {
-      await bridge.stop();
-      spool.close();
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void shutdown());
-    process.on("SIGTERM", () => void shutdown());
+    await startBridge(options);
+  });
+
+program.command("start")
+  .description("start this machine's hosted Aicoo bridge with production-friendly defaults")
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .addOption(new Option("--adapter <adapter>", "runtime adapter").choices(["claude-code", "codex", "fake"]).default("codex"))
+  .option("--sessions <count>", "managed session count", "2")
+  .option("--workspace <dir>", "managed-session workspace", process.cwd())
+  .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
+  .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
+  .action(async (options) => {
+    await startBridge({ ...options, hosted: true, server: hostedServerUrl() });
   });
 
 program.command("whoami").action(async () => print(await makeClient().whoami()));
@@ -133,6 +116,20 @@ offer.command("revoke").argument("<offerId>").action(async (offerId) => {
 });
 
 const connect = program.command("connect");
+connect
+  .argument("[person]", "principal ID to connect to")
+  .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
+  .option("--ttl <minutes>", "grant TTL", "30")
+  .action(async (person, options) => {
+    if (!person) {
+      connect.help();
+      return;
+    }
+    const route = await resolveRoute({ spool: options.spool });
+    const session = await requestConnection(person, route, Number.parseInt(options.ttl, 10));
+    console.log(`Connection request sent to ${person}. Ask them to run: ccd accept`);
+    console.log(`requestId: ${session.id}`);
+  });
 connect.command("request")
   .requiredOption("--to <principalId>")
   .addOption(new Option("--kind <kind>").choices(["person_default_runtime", "runtime_session"]).default("person_default_runtime"))
@@ -206,6 +203,24 @@ connect.command("revoke").argument("<sessionId>").action(async (sessionId) => {
   console.log("communication session revoked");
 });
 
+program.command("accept")
+  .description("accept the latest pending c2c request")
+  .argument("[sessionId]")
+  .addOption(new Option("--access <preset>", "relationship access preset").choices(["chat-only"]).default("chat-only"))
+  .option(
+    "--policy <file>",
+    "local relationship policy file",
+    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+  )
+  .action(async (sessionId, options) => {
+    const id = sessionId ?? (await latestPendingSessionId());
+    const result = await acceptConnection(id, options.access as RelationshipAccessPreset, options.policy);
+    console.log(`Accepted connection ${result.grant.id} from ${result.grant.requester.principalId}.`);
+    if (result.accessPolicy.status !== "saved") {
+      console.log(result.accessPolicy.reason);
+    }
+  });
+
 program.command("send")
   .requiredOption("--comm-session <id>")
   .requiredOption("--text <message>")
@@ -216,6 +231,23 @@ program.command("send")
     kind: "text",
     payload: { text: options.text },
   })));
+
+program.command("send-to")
+  .description("send a text message to an active c2c relationship")
+  .argument("<person>", "peer principal ID")
+  .argument("<message...>", "message text")
+  .option("--client-id <id>")
+  .action(async (person, messageParts, options) => {
+    const session = await activeSessionForPeer(person);
+    const receipt = await makeHostedClient().sendMessage({
+      communicationSessionId: session.id,
+      clientMessageId: options.clientId ?? randomUUID(),
+      kind: "text",
+      payload: { text: messageParts.join(" ") },
+    });
+    console.log(`Sent to ${person}.`);
+    print(receipt);
+  });
 
 program.command("send-inbox")
   .requiredOption("--to <principalId>")
@@ -319,9 +351,81 @@ program.parseAsync().catch((error: unknown) => {
   process.exitCode = 1;
 });
 
-function makeClient(): HttpMessageTransport {
-  const options = program.opts<{ server: string; token?: string }>();
-  return makeTransport({ baseUrl: options.server, token: required(options.token, "--token or CCD_TOKEN") });
+async function startBridge(options: {
+  adapter: RuntimeAdapterKind;
+  sessions: string;
+  fakeBusy?: boolean;
+  spool: string;
+  workspace?: string;
+  claudeState?: string;
+  claudePath?: string;
+  codexState?: string;
+  codexPath?: string;
+  relationshipPolicy?: string;
+  model?: string;
+  hosted?: boolean;
+  server?: string;
+}): Promise<void> {
+  ensureParentDirectory(options.spool);
+  const selected = await selectRuntimeAdapter({
+    kind: options.adapter,
+    sessions: Number.parseInt(options.sessions, 10),
+    fakeBusy: options.fakeBusy ?? false,
+    spoolFile: options.spool,
+    workspace: options.workspace ?? process.cwd(),
+    claudeStateFile: options.claudeState,
+    claudePath: options.claudePath,
+    codexStateFile: options.codexState,
+    codexPath: options.codexPath,
+    relationshipPolicyFile: options.relationshipPolicy ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    model: options.model,
+    log: console.log,
+  });
+  const deviceId = resolveDeviceId(undefined, options.spool);
+  const spool = new BridgeSpool(options.spool);
+  const bridge = new RuntimeBridge({
+    transport: makeClient({ hosted: options.hosted, server: options.server, deviceId }),
+    spool,
+    adapter: selected.adapter,
+    adapterVersion: selected.adapterVersion,
+    runtime: selected.runtime,
+    log: console.log,
+  });
+  const started = await bridge.start();
+  console.log(JSON.stringify({
+    status: "ready",
+    mode: "text-only",
+    adapter: selected.label,
+    ...started,
+    next: "Share principalId with the other person, then they can run: ccd connect <principalId>",
+  }, null, 2));
+  const shutdown = async () => {
+    await bridge.stop();
+    spool.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+}
+
+function makeClient(options: { hosted?: boolean; server?: string; deviceId?: string } = {}): HttpMessageTransport {
+  const programOptions = program.opts<{ server: string; token?: string }>();
+  const server = options.server ?? programOptions.server;
+  const token = required(programOptions.token, "--token or CCD_TOKEN");
+  if (options.hosted || process.env.CCD_AICOO === "1") {
+    return new AicooTransport({ baseUrl: server, token, deviceId: options.deviceId });
+  }
+  return makeTransport({ baseUrl: server, token, deviceId: options.deviceId });
+}
+
+function makeHostedClient(): HttpMessageTransport {
+  return makeClient({ hosted: true, server: hostedServerUrl() });
+}
+
+function hostedServerUrl(): string {
+  if (process.env.CCD_SERVER_URL) return process.env.CCD_SERVER_URL;
+  const options = program.opts<{ server: string }>();
+  return options.server === LOCAL_SERVER_URL ? PRODUCT_AICOO_SERVER_URL : options.server;
 }
 
 async function resolveRoute(options: { endpoint?: string; session?: string; spool?: string }): Promise<{
@@ -352,6 +456,93 @@ async function resolveRoute(options: { endpoint?: string; session?: string; spoo
 function required<T>(value: T | undefined, name: string): T {
   if (value === undefined || value === "") throw new Error(`${name} is required`);
   return value;
+}
+
+async function requestConnection(
+  principalId: string,
+  route: { endpointId: string; sessionHandle: string },
+  ttlMinutes: number,
+): Promise<CommunicationSession> {
+  return makeHostedClient().requestCommunicationSession({
+    target: { kind: "person_default_runtime", principalId },
+    replyEndpointId: route.endpointId,
+    replySessionHandle: route.sessionHandle,
+    requestedTtlMinutes: ttlMinutes,
+  });
+}
+
+async function latestPendingSessionId(): Promise<string> {
+  const pending = (await makeHostedClient().listCommunicationSessions())
+    .filter((session) => session.status === "pending")
+    .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt));
+  const latest = pending[0];
+  if (!latest) throw new Error("No pending connection request found.");
+  return latest.id;
+}
+
+async function acceptConnection(
+  sessionId: string,
+  access: RelationshipAccessPreset,
+  policyFile: string,
+): Promise<{
+  grant: CommunicationGrant;
+  accessPolicy: { status: "saved"; preset: RelationshipAccessPreset; policyFile: string } | { status: "not_applied"; reason: string };
+}> {
+  const grant = await makeHostedClient().acceptCommunicationSession(sessionId);
+  const deviceId = grant.requester.deviceId;
+  if (!deviceId) {
+    return {
+      grant,
+      accessPolicy: {
+        status: "not_applied",
+        reason: "The server did not return the requester's verified device ID; access remains chat-only.",
+      },
+    };
+  }
+  upsertRelationshipPreset({
+    file: policyFile,
+    principalId: grant.requester.principalId,
+    deviceId,
+    preset: access,
+  });
+  return { grant, accessPolicy: { status: "saved", preset: access, policyFile } };
+}
+
+async function activeSessionForPeer(peerPrincipalId: string): Promise<CommunicationSession> {
+  const active = (await makeHostedClient().listCommunicationSessions())
+    .filter((session) =>
+      session.status === "active"
+      && (session.requester.principalId === peerPrincipalId || session.recipient.principalId === peerPrincipalId))
+    .sort((a, b) => Date.parse(b.activatedAt ?? b.requestedAt) - Date.parse(a.activatedAt ?? a.requestedAt));
+  const session = active[0];
+  if (!session) throw new Error(`No active connection found for ${peerPrincipalId}. Run ccd connect ${peerPrincipalId} first.`);
+  return session;
+}
+
+function resolveDeviceId(explicit: string | undefined, spoolFile: string): string {
+  const trimmed = explicit?.trim();
+  if (trimmed) return trimmed;
+  const idFile = `${spoolFile}.device-id`;
+  try {
+    if (existsSync(idFile)) {
+      const saved = readFileSync(idFile, "utf8").trim();
+      if (saved) return saved;
+    }
+  } catch {
+    /* unreadable — fall through and regenerate */
+  }
+  const generated = `${hostname()}-${randomUUID()}`;
+  ensureParentDirectory(idFile);
+  try {
+    writeFileSync(idFile, generated);
+  } catch {
+    /* non-fatal: id is still used for this run */
+  }
+  return generated;
+}
+
+function ensureParentDirectory(file: string): void {
+  mkdirSync(dirname(file), { recursive: true });
 }
 
 function print(value: unknown): void {
