@@ -137,12 +137,19 @@ The command starts a text-only Codex bridge by default, persists local bridge st
 `~/.aicoo/local-agent/`, auto-generates a stable `deviceId`, publishes a default route, and prints
 your `principalId`.
 
+Before `ccd connect`, the two Aicoo accounts must already be paired in the app: open the DM between
+the accounts, click **Collaborate**, and have the other person accept. Without that app-level pairing,
+the hosted service returns `403 permission_required`.
+
 On the other machine:
 
 ```bash
 export CCD_TOKEN=<other_user_aicoo_sk_...>
 npm run ccd -- start
 ```
+
+Compare the `principalId` printed by both machines before continuing. They must be different; two
+API keys from the same Aicoo account can register two endpoints but still share one `principalId`.
 
 Then connect and message:
 
@@ -154,6 +161,13 @@ npm run ccd -- send-to <other-principal-id> "hello"
 The recipient accepts from Aicoo's UI. If the UI is unavailable during local testing, they can run
 `npm run ccd -- accept` as a CLI fallback. `send-to` waits for runtime acknowledgement by default;
 use `--no-watch` for fire-and-forget.
+
+For the first cross-machine production check, run `npm run ccd -- start --adapter claude-code` on the
+receiver first, then test the default Codex adapter separately. Make sure `codex` is installed on both
+machines before testing the Codex path.
+
+If you start with a custom spool path, `ccd start --spool <file>` remembers it for `ccd connect`.
+You can still pass `--spool <file>` explicitly when you need to inspect or drive a specific bridge.
 
 The lower-level commands remain available for debugging and self-hosted control planes:
 `bridge`, `connect request`, `connect accept <comm-id>`, and `send --comm-session <comm-id>`.

@@ -6,7 +6,7 @@ import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
 import { RuntimeBridge } from "../bridge/bridge.js";
 import { BridgeSpool } from "../bridge/spool.js";
-import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
+import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, MessageDelivery, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
 import {
@@ -21,6 +21,7 @@ const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
 const PREVIEW_AICOO_SERVER_URL = "https://www.yourcoo.ai";
 const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
+const LAST_SPOOL_FILE = join(homedir(), ".aicoo", "local-agent", "last-spool");
 
 const program = new Command()
   .name("ccd")
@@ -75,7 +76,7 @@ program.command("start")
     await startBridge({ ...options, hosted: true, server: hostedServerUrl() });
   });
 
-program.command("whoami").action(async () => print(await makeClient().whoami()));
+program.command("whoami").action(async () => print(await withHostedFallback((client) => client.whoami())));
 
 program.command("targets")
   .requiredOption("--person <principalId>")
@@ -119,15 +120,15 @@ offer.command("revoke").argument("<offerId>").action(async (offerId) => {
 const connect = program.command("connect");
 connect
   .argument("[person]", "principal ID to connect to")
-  .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
+  .option("--spool <file>", "bridge spool")
   .option("--ttl <minutes>", "grant TTL", "30")
   .action(async (person, options) => {
     if (!person) {
       connect.help();
       return;
     }
-    const route = await resolveRoute({ spool: options.spool });
-    const session = await requestConnection(person, route, Number.parseInt(options.ttl, 10));
+    const route = await resolveRoute({ spool: routeSpool(options.spool) });
+    const session = await requestConnectionWithPairingHint(person, route, Number.parseInt(options.ttl, 10));
     console.log(`Connection request sent to ${person}. They can accept in Aicoo, or run: ccd accept`);
     console.log(`requestId: ${session.id}`);
   });
@@ -275,9 +276,14 @@ program.command("status")
   .argument("<messageId>")
   .option("--watch", "poll until a terminal/runtime state", false)
   .action(async (messageId, options) => {
-    const client = makeClient();
+    let firstStatus: MessageDelivery | undefined;
+    const client = await withHostedFallback(async (candidate) => {
+      firstStatus = await candidate.getMessageStatus(messageId);
+      return candidate;
+    });
     do {
-      const status = await client.getMessageStatus(messageId);
+      const status = firstStatus ?? await client.getMessageStatus(messageId);
+      firstStatus = undefined;
       console.log(formatDelivery(status));
       if (!options.watch || ["runtime_acked", "inbox_persisted", "failed", "expired", "revoked", "rejected"].includes(status.status)) return;
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -381,6 +387,7 @@ async function startBridge(options: {
   server?: string;
 }): Promise<void> {
   ensureParentDirectory(options.spool);
+  rememberSpool(options.spool);
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
     sessions: Number.parseInt(options.sessions, 10),
@@ -426,14 +433,30 @@ function makeClient(options: { hosted?: boolean; server?: string; deviceId?: str
   const programOptions = program.opts<{ server: string; token?: string }>();
   const server = options.server ?? programOptions.server;
   const token = required(programOptions.token, "--token or CCD_TOKEN");
-  if (options.hosted || process.env.CCD_AICOO === "1") {
-    return new AicooTransport({ baseUrl: server, token, deviceId: options.deviceId });
+  if (options.hosted || process.env.CCD_AICOO === "1" || isHostedAicooServer(server)) {
+    return new AicooTransport({ baseUrl: normalizeHostedServerUrl(server), token, deviceId: options.deviceId });
   }
   return makeTransport({ baseUrl: server, token, deviceId: options.deviceId });
 }
 
 function makeHostedClient(): HttpMessageTransport {
   return makeClient({ hosted: true, server: hostedServerUrl() });
+}
+
+async function withHostedFallback<T>(run: (client: HttpMessageTransport) => Promise<T>): Promise<T> {
+  try {
+    return await run(makeClient());
+  } catch (error) {
+    if (!shouldFallbackToHosted()) throw error;
+    return run(makeHostedClient());
+  }
+}
+
+function shouldFallbackToHosted(): boolean {
+  const options = program.opts<{ server: string }>();
+  return process.env.CCD_AICOO !== "1"
+    && process.env.CCD_SERVER_URL === undefined
+    && options.server === LOCAL_SERVER_URL;
 }
 
 function hostedServerUrl(): string {
@@ -445,11 +468,24 @@ function hostedServerUrl(): string {
 function normalizeHostedServerUrl(server: string): string {
   try {
     const url = new URL(server);
+    if (url.hostname === "aicoo.io") return PRODUCT_AICOO_SERVER_URL;
     if (url.hostname === "yourcoo.ai") return PREVIEW_AICOO_SERVER_URL;
   } catch {
     return server;
   }
   return server;
+}
+
+function isHostedAicooServer(server: string): boolean {
+  try {
+    const hostname = new URL(server).hostname;
+    return hostname === "aicoo.io"
+      || hostname === "www.aicoo.io"
+      || hostname === "yourcoo.ai"
+      || hostname === "www.yourcoo.ai";
+  } catch {
+    return false;
+  }
 }
 
 async function resolveRoute(options: { endpoint?: string; session?: string; spool?: string }): Promise<{
@@ -477,6 +513,28 @@ async function resolveRoute(options: { endpoint?: string; session?: string; spoo
   }
 }
 
+function routeSpool(explicit: string | undefined): string {
+  return explicit ?? rememberedSpool() ?? DEFAULT_SPOOL;
+}
+
+function rememberSpool(file: string): void {
+  try {
+    ensureParentDirectory(LAST_SPOOL_FILE);
+    writeFileSync(LAST_SPOOL_FILE, file);
+  } catch {
+    /* non-fatal: follow-up commands can still use --spool */
+  }
+}
+
+function rememberedSpool(): string | undefined {
+  try {
+    const saved = readFileSync(LAST_SPOOL_FILE, "utf8").trim();
+    return saved || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function required<T>(value: T | undefined, name: string): T {
   if (value === undefined || value === "") throw new Error(`${name} is required`);
   return value;
@@ -493,6 +551,27 @@ async function requestConnection(
     replySessionHandle: route.sessionHandle,
     requestedTtlMinutes: ttlMinutes,
   });
+}
+
+async function requestConnectionWithPairingHint(
+  principalId: string,
+  route: { endpointId: string; sessionHandle: string },
+  ttlMinutes: number,
+): Promise<CommunicationSession> {
+  try {
+    return await requestConnection(principalId, route, ttlMinutes);
+  } catch (error) {
+    if (isPermissionRequired(error)) {
+      throw new Error(
+        `permission_required: pair with ${principalId} in Aicoo first. Open the DM, click Collaborate, and have the other person accept.`,
+      );
+    }
+    throw error;
+  }
+}
+
+function isPermissionRequired(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403 && error.code === "permission_required";
 }
 
 async function latestPendingSessionId(): Promise<string> {
