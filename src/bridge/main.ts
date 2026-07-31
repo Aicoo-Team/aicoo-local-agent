@@ -98,7 +98,13 @@ const bridge = new RuntimeBridge({
   log: console.log,
 });
 const started = await bridge.start();
-console.log(JSON.stringify({ ...started, adapter: selected.label }, null, 2));
+console.log(JSON.stringify({
+  status: "ready",
+  mode: "text-only",
+  adapter: selected.label,
+  ...started,
+  note: "Default route is published automatically; peers can request person_default_runtime once the heartbeat confirms it.",
+}, null, 2));
 
 async function shutdown() {
   await bridge.stop();

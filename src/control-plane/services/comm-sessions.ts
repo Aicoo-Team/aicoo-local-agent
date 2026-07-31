@@ -209,6 +209,8 @@ export class CommunicationSessionService {
         for (const endpoint of this.endpoints.listForPrincipal(principalId)) {
           this.events.append(endpoint.endpointId, "comm.revoked", {
             communicationSessionId: sessionId,
+            endpointId: current.value.recipient.endpointId,
+            sessionHandle: current.value.recipient.sessionHandle,
             revokedAt,
           });
           wake.push(endpoint.endpointId);
@@ -261,7 +263,8 @@ export class CommunicationSessionService {
 
   expireIfNeeded(sessionId: string): void {
     const row = this.db.prepare(
-      "SELECT status, request_expires_at, grant_expires_at, requester_principal_id, recipient_principal_id FROM comm_sessions WHERE comm_session_id = ?",
+      `SELECT status, request_expires_at, grant_expires_at, requester_principal_id, recipient_principal_id,
+       frozen_endpoint_id, frozen_session_handle FROM comm_sessions WHERE comm_session_id = ?`,
     ).get(sessionId) as
       | {
           status: string;
@@ -269,6 +272,8 @@ export class CommunicationSessionService {
           grant_expires_at: string | null;
           requester_principal_id: string;
           recipient_principal_id: string;
+          frozen_endpoint_id: string | null;
+          frozen_session_handle: string | null;
         }
       | undefined;
     if (!row) return;
@@ -276,6 +281,8 @@ export class CommunicationSessionService {
     const expired = (row.status === "pending" && row.request_expires_at <= now)
       || (row.status === "active" && row.grant_expires_at !== null && row.grant_expires_at <= now);
     if (!expired) return;
+    const participants = [row.requester_principal_id, row.recipient_principal_id];
+    const wake: string[] = [];
     transaction(this.db, () => {
       const result = this.db.prepare(
         "UPDATE comm_sessions SET status = 'expired' WHERE comm_session_id = ? AND status = ?",
@@ -286,6 +293,17 @@ export class CommunicationSessionService {
          WHERE message_id IN (SELECT message_id FROM messages WHERE comm_session_id = ?)
          AND status IN ('queued', 'dispatched', 'device_acked', 'runtime_pending')`,
       ).run(now, sessionId);
+      for (const principalId of participants) {
+        for (const endpoint of this.endpoints.listForPrincipal(principalId)) {
+          this.events.append(endpoint.endpointId, "comm.expired", {
+            communicationSessionId: sessionId,
+            endpointId: row.frozen_endpoint_id ?? undefined,
+            sessionHandle: row.frozen_session_handle ?? undefined,
+            expiredAt: now,
+          });
+          wake.push(endpoint.endpointId);
+        }
+      }
       audit(this.db, {
         actorPrincipalId: "system",
         action: "comm.expired",
@@ -297,6 +315,7 @@ export class CommunicationSessionService {
         },
       });
     });
+    this.events.wake(wake);
   }
 }
 

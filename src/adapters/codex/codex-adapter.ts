@@ -262,6 +262,16 @@ export class CodexAdapter implements RuntimeAdapter {
     return this.#sessions.get(localHandle)?.providerThreadId;
   }
 
+  async releaseCommunicationSession(communicationSessionId: string): Promise<void> {
+    const resets: Promise<void>[] = [];
+    for (const session of this.#sessions.values()) {
+      if (session.boundCommunicationSessionId === communicationSessionId) {
+        resets.push(this.resetSession(session));
+      }
+    }
+    await Promise.all(resets);
+  }
+
   private async consumeTurn(session: ManagedSession, active: ActiveTurn): Promise<void> {
     let turnCompleted = false;
     let replyText: string | undefined;
@@ -397,6 +407,24 @@ export class CodexAdapter implements RuntimeAdapter {
     session.state = "idle";
     this.#db.prepare(
       "UPDATE managed_sessions SET state = 'idle', last_active_at = ? WHERE local_handle = ?",
+    ).run(nowIso(), session.localHandle);
+  }
+
+  private async resetSession(session: ManagedSession): Promise<void> {
+    const active = session.activeTurn;
+    if (active) {
+      this.rejectPendingAck(active, new Error("communication session ended before input acceptance"));
+      active.turn.close();
+      await active.done.catch(() => undefined);
+      if (session.activeTurn === active) session.activeTurn = undefined;
+    }
+    session.providerThreadId = undefined;
+    session.boundCommunicationSessionId = undefined;
+    session.state = "idle";
+    this.#db.prepare(
+      `UPDATE managed_sessions
+       SET provider_thread_id = NULL, bound_comm_session_id = NULL, state = 'idle', last_active_at = ?
+       WHERE local_handle = ?`,
     ).run(nowIso(), session.localHandle);
   }
 

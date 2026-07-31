@@ -44,6 +44,7 @@ interface ManagedSession {
   query?: ClaudeDriverQuery;
   consumer?: Promise<void>;
   accepting: boolean;
+  resetting: boolean;
   boundCommunicationSessionId?: string;
   acceptedTurns: AcceptedTurn[];
   pendingAcks: Map<string, PendingAck>;
@@ -278,6 +279,16 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     return this.#sessions.get(localHandle)?.providerSessionId;
   }
 
+  async releaseCommunicationSession(communicationSessionId: string): Promise<void> {
+    const resets: Promise<void>[] = [];
+    for (const session of this.#sessions.values()) {
+      if (session.boundCommunicationSessionId === communicationSessionId) {
+        resets.push(this.resetSession(session));
+      }
+    }
+    await Promise.all(resets);
+  }
+
   private loadOrCreateSessions(count: number): void {
     const existing = this.#db.prepare("SELECT * FROM managed_sessions ORDER BY local_handle").all() as unknown as ManagedRow[];
     if (existing.length === 0) {
@@ -312,6 +323,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         abortController: new AbortController(),
         queue: new AsyncMessageQueue<SDKUserMessage>(),
         accepting: false,
+        resetting: false,
         ...(row.bound_comm_session_id ? { boundCommunicationSessionId: row.bound_comm_session_id } : {}),
         acceptedTurns: [],
         pendingAcks: new Map(),
@@ -334,11 +346,45 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       session.providerSessionId = randomUUID();
       session.initialized = false;
       session.state = "idle";
+      session.boundCommunicationSessionId = undefined;
       this.#db.prepare(
-        "UPDATE managed_sessions SET provider_session_id = ?, initialized = 0, state = 'idle' WHERE local_handle = ?",
+        `UPDATE managed_sessions
+         SET provider_session_id = ?, initialized = 0, state = 'idle', bound_comm_session_id = NULL
+         WHERE local_handle = ?`,
       ).run(session.providerSessionId, session.localHandle);
       await this.launchSession(session);
     }
+  }
+
+  private async resetSession(session: ManagedSession): Promise<void> {
+    session.resetting = true;
+    for (const pending of session.pendingAcks.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("communication session ended before input acceptance"));
+    }
+    session.pendingAcks.clear();
+    session.acceptedTurns = [];
+    session.accepting = false;
+    session.abortController.abort();
+    session.queue.close();
+    session.query?.close();
+    await session.consumer?.catch(() => undefined);
+
+    session.abortController = new AbortController();
+    session.queue = new AsyncMessageQueue<SDKUserMessage>();
+    session.query = undefined;
+    session.consumer = undefined;
+    session.providerSessionId = randomUUID();
+    session.initialized = false;
+    session.boundCommunicationSessionId = undefined;
+    session.state = "idle";
+    this.#db.prepare(
+      `UPDATE managed_sessions
+       SET provider_session_id = ?, initialized = 0, bound_comm_session_id = NULL, state = 'idle', last_active_at = ?
+       WHERE local_handle = ?`,
+    ).run(session.providerSessionId, nowIso(), session.localHandle);
+    session.resetting = false;
+    if (this.#initialized && !this.#closing && !this.#closed) await this.startSession(session);
   }
 
   private async launchSession(session: ManagedSession): Promise<void> {
@@ -395,6 +441,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     try {
       if (!session.query) return;
       for await (const event of session.query) this.handleSdkEvent(session, event);
+      if (session.resetting) return;
       if (!this.#closing) {
         session.state = "closed";
         this.#db.prepare(

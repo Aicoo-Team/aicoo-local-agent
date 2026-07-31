@@ -26,11 +26,9 @@ The central rule: **a message conveys intent and context, not authority.**
 - **Receiver isolation.** By default the receiving session is a **tools-disabled, text-only**
   responder: it may read the message and answer in plain text, but it cannot run commands,
   touch the filesystem, browse, or exfiltrate data. Tool access is off unless the owner opts in.
-- **Per-tool owner approval (permissioned mode).** When the owner opts in (`resolveToolPermission`),
-  tools are enabled but **every single tool call is routed through an owner-approval gate**
-  (`canUseTool`). The owner allows or denies each call by policy. This gate is **fail-closed**:
-  any error or timeout while resolving a decision *denies* the tool. One approval is never a
-  license for the next.
+- **Tool access is currently disabled.** Relationship policies can record verified user/device
+  identity for future presets, but Claude Code and Codex adapters run text-only today. File/tool
+  access stays off until OS-level sandboxing, audit, and revocation semantics are in place.
 - **Grant-scoped, revocable delivery.** A sender can only message a recipient through an active,
   time-boxed **communication grant** that the recipient (or an offer they published) authorized.
   Every injection is **re-validated against the control plane at delivery time**, so a revoked or
@@ -73,28 +71,46 @@ npm install
 npm run serve
 ```
 
-**2. Run a bridge** against it, managing one live session. Start with the `fake` adapter, or use
-`--adapter claude-code` / `--adapter codex` to bridge a real local coding agent:
+**2. Run a bridge** against it, managing one or more text-only live sessions. Start with the `fake`
+adapter, or use `--adapter claude-code` / `--adapter codex` to bridge a real local coding agent:
 
 ```bash
-npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter fake
+npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter fake --spool me.spool --sessions 2
 # real agent, tools-disabled text-only receiver (default, safest):
-npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter claude-code
+npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter claude-code --spool me.spool --sessions 2
 ```
 
-**3. Drive it from the CLI** — publish an offer, request a grant, send a message, watch delivery:
+The bridge registers its endpoint/sessions, persists local state in the spool, and publishes a
+default route automatically from the heartbeat loop.
+
+**3. Check readiness**:
 
 ```bash
-# who am I / what can I reach
 npm run ccd -- --server http://127.0.0.1:7790 --token <token> whoami
-npm run ccd -- --server http://127.0.0.1:7790 --token <token> targets --person <principalId>
+npm run ccd -- --server http://127.0.0.1:7790 --token <token> doctor --spool me.spool
+```
 
-# request a communication session (grant) and send a message once active
-npm run ccd -- --token <token> connect request --to <principalId>
-npm run ccd -- --token <token> send --comm-session <id> --text "hello from another agent"
+**4. Drive the two-user flow** — request a grant, accept it, send a message, watch delivery:
+
+```bash
+# user A requests user B's default runtime; A's reply route is discovered automatically
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-a> connect request --to <principalId-b>
+
+# user B accepts; tools remain text-only unless future sandboxed presets are enabled
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-b> connect accept <comm-id> --access chat-only
+
+# user A sends a message over the active communication session
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-a> send --comm-session <comm-id> --text "hello from another agent"
 
 # follow the delivery state machine to a terminal / runtime state
-npm run ccd -- --token <token> status <messageId> --watch
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-a> status <messageId> --watch
+```
+
+Useful discovery commands:
+
+```bash
+npm run ccd -- --server http://127.0.0.1:7790 --token <token> targets --person <principalId>
+npm run ccd -- --server http://127.0.0.1:7790 --token <token> connect list
 ```
 
 `serve` bundles into the CLI too: `npm run ccd -- serve` starts the same mock control plane.

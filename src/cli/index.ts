@@ -75,7 +75,13 @@ program.command("bridge")
       log: console.log,
     });
     const started = await bridge.start();
-    console.log(JSON.stringify({ ...started, adapter: selected.label }, null, 2));
+    console.log(JSON.stringify({
+      status: "ready",
+      mode: "text-only",
+      adapter: selected.label,
+      ...started,
+      note: "Default route is published automatically; peers can request person_default_runtime once the heartbeat confirms it.",
+    }, null, 2));
     const shutdown = async () => {
       await bridge.stop();
       spool.close();
@@ -97,7 +103,7 @@ defaultRoute.command("set")
   .option("--session <handle>")
   .option("--spool <file>")
   .action(async (options) => {
-    const route = resolveRoute(options);
+    const route = await resolveRoute(options);
     print(await makeClient().setDefaultRoute(route.endpointId, route.sessionHandle));
   });
 defaultRoute.command("get").action(async () => print(await makeClient().getDefaultRoute()));
@@ -114,7 +120,7 @@ offer.command("create")
   .option("--spool <file>")
   .option("--ttl <seconds>", "offer TTL", "600")
   .action(async (options) => {
-    const route = resolveRoute(options);
+    const route = await resolveRoute(options);
     print(await makeClient().createOffer({
       ...route,
       audiencePrincipalId: options.audience,
@@ -136,7 +142,7 @@ connect.command("request")
   .option("--spool <file>")
   .option("--ttl <minutes>", "grant TTL", "30")
   .action(async (options) => {
-    const route = resolveRoute({ endpoint: options.replyEndpoint, session: options.replySession, spool: options.spool });
+    const route = await resolveRoute({ endpoint: options.replyEndpoint, session: options.replySession, spool: options.spool });
     const target = options.kind === "runtime_session"
       ? { kind: "runtime_session" as const, principalId: options.to, targetOfferId: required(options.offer, "--offer") }
       : { kind: "person_default_runtime" as const, principalId: options.to };
@@ -245,6 +251,62 @@ program.command("audit")
   .option("--comm-session <id>")
   .action(async (options) => print(await makeClient().listAudit(options.commSession)));
 
+program.command("doctor")
+  .description("check whether this machine is ready for text-only c2c")
+  .option("--spool <file>", "bridge spool to inspect")
+  .action(async (options) => {
+    const client = makeClient();
+    const checks: Array<{ name: string; ok: boolean; detail?: unknown; next?: string }> = [];
+
+    try {
+      checks.push({ name: "identity", ok: true, detail: await client.whoami() });
+    } catch (error) {
+      checks.push({
+        name: "identity",
+        ok: false,
+        detail: errorMessage(error),
+        next: "Check --server and --token / CCD_TOKEN.",
+      });
+    }
+
+    try {
+      checks.push({ name: "defaultRoute", ok: true, detail: await client.getDefaultRoute() });
+    } catch (error) {
+      checks.push({
+        name: "defaultRoute",
+        ok: false,
+        detail: errorMessage(error),
+        next: "Start the bridge and wait for the '[bridge] default route -> ...' log.",
+      });
+    }
+
+    if (options.spool) {
+      try {
+        const spool = new BridgeSpool(options.spool);
+        try {
+          const endpointId = spool.getIdentity("endpointId");
+          const sessions = spool.listSessionMappings();
+          checks.push({
+            name: "localSpool",
+            ok: Boolean(endpointId && sessions.length > 0),
+            detail: { endpointId, sessions },
+            ...(endpointId && sessions.length > 0 ? {} : { next: "Start the bridge with this spool file." }),
+          });
+        } finally {
+          spool.close();
+        }
+      } catch (error) {
+        checks.push({ name: "localSpool", ok: false, detail: errorMessage(error) });
+      }
+    }
+
+    print({
+      ok: checks.every((check) => check.ok),
+      mode: "text-only",
+      checks,
+    });
+  });
+
 program.showHelpAfterError();
 program.parseAsync().catch((error: unknown) => {
   if (error instanceof ApiError) {
@@ -262,12 +324,20 @@ function makeClient(): HttpMessageTransport {
   return makeTransport({ baseUrl: options.server, token: required(options.token, "--token or CCD_TOKEN") });
 }
 
-function resolveRoute(options: { endpoint?: string; session?: string; spool?: string }): {
+async function resolveRoute(options: { endpoint?: string; session?: string; spool?: string }): Promise<{
   endpointId: string;
   sessionHandle: string;
-} {
+}> {
   if (options.endpoint && options.session) return { endpointId: options.endpoint, sessionHandle: options.session };
-  if (!options.spool) throw new Error("provide --endpoint and --session, or --spool");
+  if (!options.spool) {
+    try {
+      return await makeClient().getDefaultRoute();
+    } catch (error) {
+      throw new Error(
+        `No local route found. Start the bridge first, pass --spool, or pass --reply-endpoint and --reply-session. ${errorMessage(error)}`,
+      );
+    }
+  }
   const spool = new BridgeSpool(options.spool);
   try {
     const endpointId = spool.getIdentity("endpointId");
@@ -286,4 +356,9 @@ function required<T>(value: T | undefined, name: string): T {
 
 function print(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof ApiError) return `${error.status} ${error.code}`;
+  return error instanceof Error ? error.message : String(error);
 }

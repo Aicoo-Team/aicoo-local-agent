@@ -26,6 +26,7 @@ export class RuntimeBridge {
   #loops: Promise<void>[] = [];
   #injector?: Injector;
   #pendingDefaultRoute?: string;
+  #publishedDefaultRoute?: string;
 
   constructor(private readonly options: BridgeOptions) {}
 
@@ -179,7 +180,20 @@ export class RuntimeBridge {
       }
     } else if (event.type === "comm.revoked") {
       const commSessionId = String(event.data.communicationSessionId ?? "");
-      if (commSessionId) this.options.spool.blockCommunicationSession(commSessionId, "communication_session_revoked");
+      if (commSessionId) {
+        this.options.spool.blockCommunicationSession(commSessionId, "communication_session_revoked", "revoked");
+        await this.options.adapter.releaseCommunicationSession?.(commSessionId);
+        const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
+        if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.#pendingDefaultRoute = sessionHandle;
+      }
+    } else if (event.type === "comm.expired") {
+      const commSessionId = String(event.data.communicationSessionId ?? "");
+      if (commSessionId) {
+        this.options.spool.blockCommunicationSession(commSessionId, "communication_session_expired", "expired");
+        await this.options.adapter.releaseCommunicationSession?.(commSessionId);
+        const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
+        if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.#pendingDefaultRoute = sessionHandle;
+      }
     } else if (event.type === "comm.activated") {
       const commSessionId = String(event.data.communicationSessionId ?? "");
       if (commSessionId) this.options.spool.setGrant(
@@ -187,6 +201,8 @@ export class RuntimeBridge {
         "active",
         typeof event.data.grantExpiresAt === "string" ? event.data.grantExpiresAt : undefined,
       );
+      const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
+      if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.rotateDefaultRouteAfterActivation(sessionHandle);
     }
   }
 
@@ -206,6 +222,7 @@ export class RuntimeBridge {
         const handle = this.#pendingDefaultRoute;
         try {
           await this.options.transport.setDefaultRoute(this.requireEndpoint(), handle);
+          this.#publishedDefaultRoute = handle;
           this.#pendingDefaultRoute = undefined;
           this.options.log?.(`[bridge] default route -> ${handle}`);
         } catch (error) {
@@ -306,6 +323,15 @@ export class RuntimeBridge {
   private requireEndpoint(): string {
     if (!this.#endpointId) throw new Error("Bridge is not started");
     return this.#endpointId;
+  }
+
+  private rotateDefaultRouteAfterActivation(activatedServerHandle: string): void {
+    const currentDefault = this.#pendingDefaultRoute ?? this.#publishedDefaultRoute;
+    if (currentDefault && currentDefault !== activatedServerHandle) return;
+    const replacement = this.options.spool.listSessionMappings()
+      .map((mapping) => mapping.serverHandle)
+      .find((serverHandle) => serverHandle !== activatedServerHandle);
+    if (replacement) this.#pendingDefaultRoute = replacement;
   }
 }
 

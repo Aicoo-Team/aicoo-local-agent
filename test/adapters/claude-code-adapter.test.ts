@@ -131,6 +131,35 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(driver.received).toHaveLength(1);
   });
 
+  it("releases a bound Claude conversation when the communication session ends", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const firstEvents = collectEvents(adapter, "claude-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_comm_1", { communicationSessionId: "comm_1" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await firstEvents;
+    const firstProviderSessionId = adapter.providerSessionId("claude-managed-1");
+
+    await adapter.releaseCommunicationSession("comm_1");
+
+    expect(adapter.providerSessionId("claude-managed-1")).not.toBe(firstProviderSessionId);
+    const secondEvents = collectEvents(adapter, "claude-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_comm_2", { communicationSessionId: "comm_2" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await secondEvents;
+    expect(driver.starts.at(-1)?.options.resume).toBeUndefined();
+    expect(driver.starts.at(-1)?.options.sessionId).toBe(adapter.providerSessionId("claude-managed-1"));
+  });
+
   it("discards an initialized legacy conversation that was never bound to a relationship", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-state-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));

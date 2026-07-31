@@ -156,6 +156,35 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns).toHaveLength(1);
   });
 
+  it("releases a bound Codex thread when the communication session ends", async () => {
+    const driver = new FakeCodexDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const firstEvents = collectEvents(adapter, "codex-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "codex-managed-1",
+      inbound("msg_comm_1", { communicationSessionId: "comm_1" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await firstEvents;
+    const firstProviderThreadId = adapter.providerThreadId("codex-managed-1");
+
+    await adapter.releaseCommunicationSession("comm_1");
+
+    expect(adapter.providerThreadId("codex-managed-1")).toBeUndefined();
+    const secondEvents = collectEvents(adapter, "codex-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "codex-managed-1",
+      inbound("msg_comm_2", { communicationSessionId: "comm_2" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await secondEvents;
+    expect(driver.turns.at(-1)?.resumeThreadId).toBeUndefined();
+    expect(adapter.providerThreadId("codex-managed-1")).not.toBe(firstProviderThreadId);
+  });
+
   it("discards an unbound legacy Codex thread instead of resuming it for a relationship", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-legacy-state-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));

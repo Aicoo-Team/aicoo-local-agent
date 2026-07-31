@@ -40,7 +40,7 @@ replies are unchanged.
 adapter activates policy tools. They must remain disabled until the runtime
 provides:
 
-- one runtime conversation per communication session;
+- multiple simultaneous relationship-isolated runtime sessions;
 - an OS-enforced filesystem sandbox for the granted folder;
 - grant expiry/revocation binding and an owner-visible audit trail.
 
@@ -79,8 +79,9 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
   accessed by a remote tool.
 - Filesystem-root grants are rejected.
 - Missing identity, missing policy, missing path, and policy errors deny access.
-- Each Claude managed conversation binds to one communication session and
-  rejects messages from a different relationship.
+- Each Claude conversation and Codex thread binds to one communication session,
+  rejects messages from a different relationship, and is released when that
+  communication session is revoked or expired.
 - Live Claude and Codex adapters expose no relationship-policy tools.
 
 The hosted control plane must include `senderDeviceId` in dispatch envelopes,

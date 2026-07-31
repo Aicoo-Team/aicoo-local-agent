@@ -145,7 +145,7 @@ export interface MessageReceipt {
 
 export interface RuntimeEvent<T = Record<string, unknown>> {
   cursor: string;
-  type: "message.dispatch" | "comm.request" | "comm.activated" | "comm.declined" | "comm.revoked";
+  type: "message.dispatch" | "comm.request" | "comm.activated" | "comm.declined" | "comm.revoked" | "comm.expired";
   endpointId: string;
   createdAt: string;
   data: T;

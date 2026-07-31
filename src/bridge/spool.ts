@@ -252,12 +252,12 @@ export class BridgeSpool {
     return rows.map(mapSpool);
   }
 
-  blockCommunicationSession(commSessionId: string, reason: string): void {
+  blockCommunicationSession(commSessionId: string, reason: string, grantStatus = "revoked"): void {
     this.db.prepare(
       `UPDATE spool_messages SET status = 'blocked', last_result_code = ?
        WHERE comm_session_id = ? AND status NOT IN ('injected', 'failed', 'blocked')`,
     ).run(reason, commSessionId);
-    this.setGrant(commSessionId, "revoked");
+    this.setGrant(commSessionId, grantStatus);
   }
 
   setGrant(commSessionId: string, status: string, expiresAt?: string): void {
