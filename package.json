@@ -5,6 +5,10 @@
   "description": "Open agent-to-agent messaging protocol, local runtime bridge, and reference control plane for reaching a live local coding agent (Claude Code / Codex) safely.",
   "license": "Apache-2.0",
   "repository": "https://github.com/Aicoo-Team/aicoo-local-agent",
+  "bin": {
+    "ccd": "./bin/ccd.js",
+    "aicoo-local-agent": "./bin/ccd.js"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
