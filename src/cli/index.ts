@@ -48,9 +48,14 @@ program.command("login")
       label: `${hostname()} (${options.runtime})`,
     });
 
+    const rawUrl = start.approvalUrl ?? "";
+    const approvalUrl = rawUrl.startsWith("undefined") || rawUrl.startsWith("null") || !rawUrl.startsWith("http")
+      ? `${server}/local-agent/device-code?code=${encodeURIComponent(start.userCode)}`
+      : rawUrl;
+
     console.log("\n========================================================");
     console.log("  To approve this device, open your browser and visit:");
-    console.log(`  ${start.approvalUrl}`);
+    console.log(`  ${approvalUrl}`);
     console.log(`\n  User Code: ${start.userCode}`);
     console.log("========================================================\n");
     console.log("Waiting for approval in browser...");
