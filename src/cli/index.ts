@@ -49,9 +49,9 @@ program.command("login")
     });
 
     const rawUrl = start.approvalUrl ?? "";
-    const approvalUrl = rawUrl.startsWith("undefined") || rawUrl.startsWith("null") || !rawUrl.startsWith("http")
-      ? `${server}/local-agent/device-code?code=${encodeURIComponent(start.userCode)}`
-      : rawUrl;
+    const approvalUrl = (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) && !rawUrl.includes("undefined")
+      ? rawUrl
+      : `${server}/local-agent/device-code?code=${encodeURIComponent(start.userCode)}`;
 
     console.log("\n========================================================");
     console.log("  To approve this device, open your browser and visit:");
