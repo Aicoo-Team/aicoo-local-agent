@@ -128,7 +128,7 @@ npm run ccd -- start
 Product is the default hosted target. To use preview, set `CCD_SERVER_URL`:
 
 ```bash
-export CCD_SERVER_URL=https://yourcoo.ai
+export CCD_SERVER_URL=https://www.yourcoo.ai
 export CCD_TOKEN=<preview_aicoo_sk_...>
 npm run ccd -- start
 ```

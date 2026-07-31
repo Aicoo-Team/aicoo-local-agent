@@ -19,6 +19,7 @@ import { formatDelivery } from "./format.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
+const PREVIEW_AICOO_SERVER_URL = "https://www.yourcoo.ai";
 const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
 
 const program = new Command()
@@ -436,9 +437,19 @@ function makeHostedClient(): HttpMessageTransport {
 }
 
 function hostedServerUrl(): string {
-  if (process.env.CCD_SERVER_URL) return process.env.CCD_SERVER_URL;
+  if (process.env.CCD_SERVER_URL) return normalizeHostedServerUrl(process.env.CCD_SERVER_URL);
   const options = program.opts<{ server: string }>();
-  return options.server === LOCAL_SERVER_URL ? PRODUCT_AICOO_SERVER_URL : options.server;
+  return options.server === LOCAL_SERVER_URL ? PRODUCT_AICOO_SERVER_URL : normalizeHostedServerUrl(options.server);
+}
+
+function normalizeHostedServerUrl(server: string): string {
+  try {
+    const url = new URL(server);
+    if (url.hostname === "yourcoo.ai") return PREVIEW_AICOO_SERVER_URL;
+  } catch {
+    return server;
+  }
+  return server;
 }
 
 async function resolveRoute(options: { endpoint?: string; session?: string; spool?: string }): Promise<{
