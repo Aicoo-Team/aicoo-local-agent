@@ -68,9 +68,10 @@ program.command("login")
         const poll = await unauthClient.pollDeviceCode(start.pollToken);
         if (poll.status === "approved") {
           const userId = "userId" in poll ? (poll as { userId?: string }).userId : undefined;
-          saveSavedCredentials({ token: poll.deviceToken, userId, deviceId });
+          saveSavedCredentials({ token: poll.deviceToken, userId, deviceId }, options.spool);
+          const credentialsFile = getCredentialsFile(options.spool);
           console.log(`\nSuccessfully authenticated device ${deviceId}!`);
-          console.log(`Credentials saved to ${DEFAULT_CREDENTIALS_FILE}`);
+          console.log(`Credentials saved to ${credentialsFile}`);
           return;
         }
         if (poll.status === "denied") {
@@ -186,12 +187,13 @@ connect
   .argument("[person]", "principal ID or @handle to connect to")
   .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
   .option("--ttl <minutes>", "grant TTL", "30")
+  .option("--server <url>", "control-plane URL")
   .action(async (person, options) => {
     if (!person) {
       connect.help();
       return;
     }
-    const client = makeHostedClient();
+    const client = makeHostedClient(options.server, options.spool);
     let targetPrincipalId = person;
     if (person.startsWith("@") || !isUuid(person)) {
       try {
@@ -222,7 +224,7 @@ connect
     }
 
     const route = await resolveRoute({ spool: options.spool });
-    const session = await requestConnection(targetPrincipalId, route, Number.parseInt(options.ttl, 10));
+    const session = await requestConnection(targetPrincipalId, route, Number.parseInt(options.ttl, 10), options.server, options.spool);
     console.log(`Connection request sent to ${person} (${targetPrincipalId}). They can accept in Aicoo, or run: ccd accept`);
     console.log(`requestId: ${session.id}`);
   });
@@ -312,9 +314,11 @@ program.command("accept")
     "local relationship policy file",
     process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
   )
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
   .action(async (sessionId, options) => {
-    const id = sessionId ?? (await latestPendingSessionId());
-    const result = await acceptConnection(id, options.access as RelationshipAccessPreset, options.policy, options.folder);
+    const id = sessionId ?? (await latestPendingSessionId(options.server, options.spool));
+    const result = await acceptConnection(id, options.access as RelationshipAccessPreset, options.policy, options.folder, options.server, options.spool);
     console.log(`Accepted connection ${result.grant.id} from ${result.grant.requester.principalId}.`);
     if (result.accessPolicy.status !== "saved") {
       console.log(result.accessPolicy.reason);
@@ -336,11 +340,12 @@ program.command("send-to")
   .description("send a text message to an active c2c relationship")
   .argument("<person>", "peer principal ID or @handle")
   .argument("<message...>", "message text")
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--client-id <id>")
   .option("--no-watch", "do not wait for runtime acknowledgement")
   .option("--server <url>", "control-plane URL")
   .action(async (person, messageParts, options) => {
-    const client = makeHostedClient(options.server);
+    const client = makeHostedClient(options.server, options.spool);
     let targetPrincipalId = person;
     if (person.startsWith("@") || !isUuid(person)) {
       try {
@@ -510,7 +515,7 @@ async function startBridge(options: {
   const deviceId = resolveDeviceId(undefined, options.spool);
   const spool = new BridgeSpool(options.spool);
   const bridge = new RuntimeBridge({
-    transport: makeClient({ hosted: options.hosted, server: options.server, deviceId }),
+    transport: makeClient({ hosted: options.hosted, server: options.server, deviceId, spool: options.spool }),
     spool,
     adapter: selected.adapter,
     adapterVersion: selected.adapterVersion,
@@ -543,10 +548,16 @@ async function startBridge(options: {
   process.on("SIGTERM", () => void shutdown());
 }
 
-function loadSavedToken(): string | undefined {
+function getCredentialsFile(spoolFile?: string): string {
+  if (!spoolFile || spoolFile === DEFAULT_SPOOL) return DEFAULT_CREDENTIALS_FILE;
+  return `${spoolFile}.credentials.json`;
+}
+
+function loadSavedToken(spoolFile?: string): string | undefined {
+  const file = getCredentialsFile(spoolFile);
   try {
-    if (existsSync(DEFAULT_CREDENTIALS_FILE)) {
-      const parsed = JSON.parse(readFileSync(DEFAULT_CREDENTIALS_FILE, "utf8"));
+    if (existsSync(file)) {
+      const parsed = JSON.parse(readFileSync(file, "utf8"));
       return (parsed.token ?? parsed.deviceToken) as string | undefined;
     }
   } catch {
@@ -555,9 +566,10 @@ function loadSavedToken(): string | undefined {
   return undefined;
 }
 
-function saveSavedCredentials(credentials: { token: string; userId?: string; deviceId?: string }): void {
-  ensureParentDirectory(DEFAULT_CREDENTIALS_FILE);
-  writeFileSync(DEFAULT_CREDENTIALS_FILE, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2));
+function saveSavedCredentials(credentials: { token: string; userId?: string; deviceId?: string }, spoolFile?: string): void {
+  const file = getCredentialsFile(spoolFile);
+  ensureParentDirectory(file);
+  writeFileSync(file, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2));
 }
 
 function isHostedUrl(serverUrl: string): boolean {
@@ -573,10 +585,11 @@ function isUuid(str: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
 }
 
-function makeClient(options: { hosted?: boolean; server?: string; deviceId?: string } = {}): HttpMessageTransport {
-  const programOptions = program.opts<{ server: string; token?: string }>();
+function makeClient(options: { hosted?: boolean; server?: string; deviceId?: string; spool?: string } = {}): HttpMessageTransport {
+  const programOptions = program.opts<{ server: string; token?: string; spool?: string }>();
   const server = options.server ?? programOptions.server;
-  const token = programOptions.token ?? process.env.CCD_TOKEN ?? loadSavedToken();
+  const spoolFile = options.spool ?? programOptions.spool;
+  const token = programOptions.token ?? process.env.CCD_TOKEN ?? loadSavedToken(spoolFile);
   const validToken = required(token, "--token, CCD_TOKEN, or run 'ccd login'");
   const isHosted = options.hosted || process.env.CCD_AICOO === "1" || isHostedUrl(server);
   if (isHosted) {
@@ -585,15 +598,15 @@ function makeClient(options: { hosted?: boolean; server?: string; deviceId?: str
       token: validToken,
       deviceId: options.deviceId,
       onTokenRefreshed: (newToken) => {
-        saveSavedCredentials({ token: newToken, deviceId: options.deviceId });
+        saveSavedCredentials({ token: newToken, deviceId: options.deviceId }, spoolFile);
       },
     });
   }
   return makeTransport({ baseUrl: server, token: validToken, deviceId: options.deviceId });
 }
 
-function makeHostedClient(server?: string): HttpMessageTransport {
-  return makeClient({ hosted: true, server: hostedServerUrl(server) });
+function makeHostedClient(server?: string, spool?: string): HttpMessageTransport {
+  return makeClient({ hosted: true, server: hostedServerUrl(server), spool });
 }
 
 function hostedServerUrl(explicitServer?: string): string {
@@ -646,8 +659,10 @@ async function requestConnection(
   principalId: string,
   route: { endpointId: string; sessionHandle: string },
   ttlMinutes: number,
+  server?: string,
+  spool?: string,
 ): Promise<CommunicationSession> {
-  return makeHostedClient().requestCommunicationSession({
+  return makeHostedClient(server, spool).requestCommunicationSession({
     target: { kind: "person_default_runtime", principalId },
     replyEndpointId: route.endpointId,
     replySessionHandle: route.sessionHandle,
@@ -655,12 +670,14 @@ async function requestConnection(
   });
 }
 
-async function latestPendingSessionId(): Promise<string> {
-  const pending = (await makeHostedClient().listCommunicationSessions())
-    .filter((session) => session.status === "pending")
+async function latestPendingSessionId(server?: string, spool?: string): Promise<string> {
+  const client = makeHostedClient(server, spool);
+  const me = await client.whoami();
+  const pending = (await client.listCommunicationSessions())
+    .filter((session) => session.status === "pending" && session.recipient.principalId === me.principalId)
     .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt));
   const latest = pending[0];
-  if (!latest) throw new Error("No pending connection request found.");
+  if (!latest) throw new Error("No pending incoming connection request found.");
   return latest.id;
 }
 
@@ -669,11 +686,13 @@ async function acceptConnection(
   access: RelationshipAccessPreset,
   policyFile: string,
   folder: string | undefined,
+  server?: string,
+  spool?: string,
 ): Promise<{
   grant: CommunicationGrant;
   accessPolicy: { status: "saved"; preset: RelationshipAccessPreset; policyFile: string; folder?: string } | { status: "not_applied"; reason: string };
 }> {
-  const grant = await makeHostedClient().acceptCommunicationSession(sessionId);
+  const grant = await makeHostedClient(server, spool).acceptCommunicationSession(sessionId);
   const deviceId = grant.requester.deviceId;
   if (!deviceId) {
     return {
