@@ -272,6 +272,11 @@ export class CodexAdapter implements RuntimeAdapter {
     await Promise.all(resets);
   }
 
+  async releaseRuntimeSession(sessionHandle: string): Promise<void> {
+    const session = this.#sessions.get(sessionHandle);
+    if (session) await this.resetSession(session);
+  }
+
   private async consumeTurn(session: ManagedSession, active: ActiveTurn): Promise<void> {
     let turnCompleted = false;
     let replyText: string | undefined;

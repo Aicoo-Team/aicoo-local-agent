@@ -38,9 +38,26 @@ describe("RuntimeBridge communication session release", () => {
     expect(adapter.releaseCommunicationSession).toHaveBeenCalledWith("comm_ended");
   });
 
-  function setup(): { bridge: RuntimeBridge; spool: BridgeSpool; adapter: RuntimeAdapter & {
-    releaseCommunicationSession: ReturnType<typeof vi.fn>;
-  } } {
+  it("releases the mapped runtime session when a new grant activates", async () => {
+    const { bridge, adapter } = setup({
+      sessions: [{ sessionHandle: "native-session", label: "Native session", state: "idle", allowInbound: true }],
+    });
+    cleanups.push(() => void bridge.stop());
+
+    await bridge.start();
+    await callHandleEvent(bridge, event("comm.activated", "comm_new", "server-session"));
+
+    expect(adapter.releaseRuntimeSession).toHaveBeenCalledWith("native-session");
+  });
+
+  function setup(options?: { sessions?: Awaited<ReturnType<RuntimeAdapter["listSessions"]>> }): {
+    bridge: RuntimeBridge;
+    spool: BridgeSpool;
+    adapter: RuntimeAdapter & {
+      releaseCommunicationSession: ReturnType<typeof vi.fn>;
+      releaseRuntimeSession: ReturnType<typeof vi.fn>;
+    };
+  } {
     const spool = new BridgeSpool(":memory:");
     cleanups.push(() => spool.close());
     const adapter = {
@@ -52,13 +69,17 @@ describe("RuntimeBridge communication session release", () => {
         midTurnSteer: false,
         replyEvents: true,
       })),
-      listSessions: vi.fn(async () => []),
+      listSessions: vi.fn(async () => options?.sessions ?? []),
       subscribeSessionEvents: vi.fn(async function* () {}),
       deliverToSession: vi.fn(),
       releaseCommunicationSession: vi.fn(async () => undefined),
-    } as unknown as RuntimeAdapter & { releaseCommunicationSession: ReturnType<typeof vi.fn> };
+      releaseRuntimeSession: vi.fn(async () => undefined),
+    } as unknown as RuntimeAdapter & {
+      releaseCommunicationSession: ReturnType<typeof vi.fn>;
+      releaseRuntimeSession: ReturnType<typeof vi.fn>;
+    };
     const bridge = new RuntimeBridge({
-      transport: {} as HttpMessageTransport,
+      transport: transport(),
       spool,
       adapter,
     });
@@ -70,14 +91,29 @@ async function callHandleEvent(bridge: RuntimeBridge, runtimeEvent: RuntimeEvent
   await (bridge as unknown as { handleEvent(event: RuntimeEvent): Promise<void> }).handleEvent(runtimeEvent);
 }
 
-function event(type: "comm.revoked" | "comm.expired", communicationSessionId: string): RuntimeEvent {
+function event(
+  type: "comm.revoked" | "comm.expired" | "comm.activated",
+  communicationSessionId: string,
+  sessionHandle?: string,
+): RuntimeEvent {
   return {
     cursor: "1",
     type,
     endpointId: "ep_b",
     createdAt: new Date().toISOString(),
-    data: { communicationSessionId },
+    data: { communicationSessionId, ...(sessionHandle ? { sessionHandle } : {}) },
   };
+}
+
+function transport(): HttpMessageTransport {
+  return {
+    registerEndpoint: vi.fn(async () => ({ endpointId: "ep_b", principalId: "prn_b", deviceId: "device_b" })),
+    registerRuntimeSession: vi.fn(async () => ({ sessionHandle: "server-session" })),
+    updateRuntimeSession: vi.fn(async () => undefined),
+    heartbeatEndpoint: vi.fn(async () => undefined),
+    setDefaultRoute: vi.fn(async () => undefined),
+    subscribeEvents: vi.fn(async function* () {}),
+  } as unknown as HttpMessageTransport;
 }
 
 function storeDeviceAckedMessage(spool: BridgeSpool, communicationSessionId: string): void {

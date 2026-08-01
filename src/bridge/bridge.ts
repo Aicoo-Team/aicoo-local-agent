@@ -216,7 +216,11 @@ export class RuntimeBridge {
         typeof event.data.grantExpiresAt === "string" ? event.data.grantExpiresAt : undefined,
       );
       const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
-      if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.rotateDefaultRouteAfterActivation(sessionHandle);
+      if (sessionHandle && this.#serverToNative.has(sessionHandle)) {
+        const nativeHandle = this.#serverToNative.get(sessionHandle);
+        if (nativeHandle) await this.options.adapter.releaseRuntimeSession?.(nativeHandle);
+        this.rotateDefaultRouteAfterActivation(sessionHandle);
+      }
     }
   }
 

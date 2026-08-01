@@ -292,6 +292,11 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     await Promise.all(resets);
   }
 
+  async releaseRuntimeSession(sessionHandle: string): Promise<void> {
+    const session = this.#sessions.get(sessionHandle);
+    if (session) await this.resetSession(session);
+  }
+
   private loadOrCreateSessions(count: number): void {
     const existing = this.#db.prepare("SELECT * FROM managed_sessions ORDER BY local_handle").all() as unknown as ManagedRow[];
     if (existing.length === 0) {
