@@ -10,6 +10,7 @@ describe("RuntimeBridge communication session release", () => {
 
   afterEach(() => {
     for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+    vi.useRealTimers();
   });
 
   it("blocks local pending work and releases adapter context on revoke", async () => {
@@ -38,7 +39,7 @@ describe("RuntimeBridge communication session release", () => {
     expect(adapter.releaseCommunicationSession).toHaveBeenCalledWith("comm_ended");
   });
 
-  it("releases the mapped runtime session when a new grant activates", async () => {
+  it("prepares the mapped runtime session when a new grant activates", async () => {
     const { bridge, adapter } = setup({
       sessions: [{ sessionHandle: "native-session", label: "Native session", state: "idle", allowInbound: true }],
     });
@@ -47,15 +48,46 @@ describe("RuntimeBridge communication session release", () => {
     await bridge.start();
     await callHandleEvent(bridge, event("comm.activated", "comm_new", "server-session"));
 
-    expect(adapter.releaseRuntimeSession).toHaveBeenCalledWith("native-session");
+    expect(adapter.prepareCommunicationSession).toHaveBeenCalledWith("native-session", "comm_new");
   });
 
-  function setup(options?: { sessions?: Awaited<ReturnType<RuntimeAdapter["listSessions"]>> }): {
+  it("backs off event stream reconnect failures", async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    const { bridge } = setup({
+      transport: transport({
+        subscribeEvents: vi.fn(async function* () {
+          attempts += 1;
+          throw new Error("stream failed fast");
+        }),
+      }),
+    });
+    cleanups.push(() => void bridge.stop());
+
+    await bridge.start();
+    await vi.advanceTimersByTimeAsync(49);
+    expect(attempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(attempts).toBe(2);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(attempts).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(attempts).toBe(3);
+    await vi.advanceTimersByTimeAsync(199);
+    expect(attempts).toBe(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(attempts).toBe(4);
+  });
+
+  function setup(options?: {
+    sessions?: Awaited<ReturnType<RuntimeAdapter["listSessions"]>>;
+    transport?: HttpMessageTransport;
+  }): {
     bridge: RuntimeBridge;
     spool: BridgeSpool;
     adapter: RuntimeAdapter & {
       releaseCommunicationSession: ReturnType<typeof vi.fn>;
-      releaseRuntimeSession: ReturnType<typeof vi.fn>;
+      prepareCommunicationSession: ReturnType<typeof vi.fn>;
     };
   } {
     const spool = new BridgeSpool(":memory:");
@@ -73,15 +105,17 @@ describe("RuntimeBridge communication session release", () => {
       subscribeSessionEvents: vi.fn(async function* () {}),
       deliverToSession: vi.fn(),
       releaseCommunicationSession: vi.fn(async () => undefined),
-      releaseRuntimeSession: vi.fn(async () => undefined),
+      prepareCommunicationSession: vi.fn(async () => undefined),
     } as unknown as RuntimeAdapter & {
       releaseCommunicationSession: ReturnType<typeof vi.fn>;
-      releaseRuntimeSession: ReturnType<typeof vi.fn>;
+      prepareCommunicationSession: ReturnType<typeof vi.fn>;
     };
     const bridge = new RuntimeBridge({
-      transport: transport(),
+      transport: options?.transport ?? transport(),
       spool,
       adapter,
+      heartbeatMs: 60_000,
+      injectorMs: 60_000,
     });
     return { bridge, spool, adapter };
   }
@@ -105,7 +139,7 @@ function event(
   };
 }
 
-function transport(): HttpMessageTransport {
+function transport(overrides: Partial<HttpMessageTransport> = {}): HttpMessageTransport {
   return {
     registerEndpoint: vi.fn(async () => ({ endpointId: "ep_b", principalId: "prn_b", deviceId: "device_b" })),
     registerRuntimeSession: vi.fn(async () => ({ sessionHandle: "server-session" })),
@@ -113,6 +147,7 @@ function transport(): HttpMessageTransport {
     heartbeatEndpoint: vi.fn(async () => undefined),
     setDefaultRoute: vi.fn(async () => undefined),
     subscribeEvents: vi.fn(async function* () {}),
+    ...overrides,
   } as unknown as HttpMessageTransport;
 }
 

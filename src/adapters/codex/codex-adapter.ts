@@ -272,9 +272,17 @@ export class CodexAdapter implements RuntimeAdapter {
     await Promise.all(resets);
   }
 
-  async releaseRuntimeSession(sessionHandle: string): Promise<void> {
+  async prepareCommunicationSession(sessionHandle: string, communicationSessionId: string): Promise<void> {
     const session = this.#sessions.get(sessionHandle);
-    if (session) await this.resetSession(session);
+    if (
+      session
+      && session.boundCommunicationSessionId
+      && session.boundCommunicationSessionId !== communicationSessionId
+      && session.state !== "busy"
+      && !session.activeTurn
+    ) {
+      await this.resetSession(session);
+    }
   }
 
   private async consumeTurn(session: ManagedSession, active: ActiveTurn): Promise<void> {

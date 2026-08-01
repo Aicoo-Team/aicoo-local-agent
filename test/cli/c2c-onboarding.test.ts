@@ -7,9 +7,9 @@ describe("C2C Onboarding Client Integration", () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => ({
-        status: "request_pair",
-        message: "You are not paired yet.",
+        json: async () => ({
+        status: "accept_incoming",
+        message: "They already asked to collaborate.",
       }),
     });
 
@@ -20,8 +20,8 @@ describe("C2C Onboarding Client Integration", () => {
     });
 
     const res = await client.getPairStatus("target-principal-123");
-    expect(res.status).toBe("request_pair");
-    expect(res.message).toBe("You are not paired yet.");
+    expect(res.status).toBe("accept_incoming");
+    expect(res.message).toBe("They already asked to collaborate.");
     expect(mockFetch).toHaveBeenCalledWith(
       "https://www.aicoo.io/api/v1/local-agent/pair-status?principalId=target-principal-123",
       expect.objectContaining({
@@ -39,8 +39,7 @@ describe("C2C Onboarding Client Integration", () => {
       json: async () => ({
         principalId: "p-999",
         handle: "abhinav",
-        name: "Abhinav Jain",
-        hasReachableRuntime: true,
+        displayName: "Abhinav Jain",
       }),
     });
 
@@ -52,7 +51,7 @@ describe("C2C Onboarding Client Integration", () => {
 
     const res = await client.resolvePerson("@abhinav");
     expect(res.principalId).toBe("p-999");
-    expect(res.handle).toBe("abhinav");
+    expect(res.displayName).toBe("Abhinav Jain");
     expect(mockFetch).toHaveBeenCalledWith(
       "https://www.aicoo.io/api/v1/local-agent/resolve-person?q=%40abhinav",
       expect.anything(),

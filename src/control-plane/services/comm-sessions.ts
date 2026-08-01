@@ -116,6 +116,20 @@ export class CommunicationSessionService {
     }
     if (targetSession.state === "closed") return failure("session_closed", 409);
     if (!targetSession.allowInbound) return failure("inbound_disabled", 409);
+    this.expireActiveGrantsForRoute(auth.principalId, endpointId, sessionHandle);
+    const existingGrant = this.db.prepare(
+      `SELECT comm_session_id FROM comm_sessions
+       WHERE recipient_principal_id = ?
+       AND frozen_endpoint_id = ?
+       AND frozen_session_handle = ?
+       AND status = 'active'
+       AND (grant_expires_at IS NULL OR grant_expires_at > ?)
+       AND comm_session_id <> ?
+       LIMIT 1`,
+    ).get(auth.principalId, endpointId, sessionHandle, nowIso(), sessionId) as
+      | { comm_session_id: string }
+      | undefined;
+    if (existingGrant) return failure("runtime_session_already_granted", 409);
 
     const activatedAt = nowIso();
     const grantExpiresAt = addMinutes(activatedAt, Math.min(rowFor(this.db, sessionId).requested_ttl_minutes, 30));
@@ -314,6 +328,61 @@ export class CommunicationSessionService {
           recipientPrincipalId: row.recipient_principal_id,
         },
       });
+    });
+    this.events.wake(wake);
+  }
+
+  private expireActiveGrantsForRoute(principalId: string, endpointId: string, sessionHandle: string): void {
+    const now = nowIso();
+    const rows = this.db.prepare(
+      `SELECT comm_session_id, requester_principal_id, recipient_principal_id
+       FROM comm_sessions
+       WHERE recipient_principal_id = ?
+       AND frozen_endpoint_id = ?
+       AND frozen_session_handle = ?
+       AND status = 'active'
+       AND grant_expires_at IS NOT NULL
+       AND grant_expires_at <= ?`,
+    ).all(principalId, endpointId, sessionHandle, now) as Array<{
+      comm_session_id: string;
+      requester_principal_id: string;
+      recipient_principal_id: string;
+    }>;
+    if (rows.length === 0) return;
+    const wake: string[] = [];
+    transaction(this.db, () => {
+      for (const row of rows) {
+        const result = this.db.prepare(
+          "UPDATE comm_sessions SET status = 'expired' WHERE comm_session_id = ? AND status = 'active'",
+        ).run(row.comm_session_id);
+        if (Number(result.changes) === 0) continue;
+        this.db.prepare(
+          `UPDATE deliveries SET status = 'expired', terminal_at = ?, result_code = 'communication_session_expired'
+           WHERE message_id IN (SELECT message_id FROM messages WHERE comm_session_id = ?)
+           AND status IN ('queued', 'dispatched', 'device_acked', 'runtime_pending')`,
+        ).run(now, row.comm_session_id);
+        for (const participantId of [row.requester_principal_id, row.recipient_principal_id]) {
+          for (const endpoint of this.endpoints.listForPrincipal(participantId)) {
+            this.events.append(endpoint.endpointId, "comm.expired", {
+              communicationSessionId: row.comm_session_id,
+              endpointId,
+              sessionHandle,
+              expiredAt: now,
+            });
+            wake.push(endpoint.endpointId);
+          }
+        }
+        audit(this.db, {
+          actorPrincipalId: "system",
+          action: "comm.expired",
+          entityType: "communication_session",
+          entityId: row.comm_session_id,
+          metadata: {
+            requesterPrincipalId: row.requester_principal_id,
+            recipientPrincipalId: row.recipient_principal_id,
+          },
+        });
+      }
     });
     this.events.wake(wake);
   }

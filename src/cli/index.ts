@@ -84,6 +84,11 @@ program.command("login")
           process.exitCode = 1;
           return;
         }
+        if (poll.status === "consumed") {
+          console.error("\nDevice login code was already used. Please run 'ccd login' again.");
+          process.exitCode = 1;
+          return;
+        }
       } catch (error) {
         if (error instanceof ApiError && error.status === 400 && error.code === "pending") {
           continue;
@@ -199,7 +204,7 @@ connect
       try {
         const resolved = await client.resolvePerson(person);
         targetPrincipalId = resolved.principalId;
-        console.log(`Resolved ${person} -> ${resolved.principalId} (${resolved.name ?? resolved.handle ?? "user"})`);
+        console.log(`Resolved ${person} -> ${resolved.principalId} (${resolved.name ?? resolved.displayName ?? resolved.handle ?? "user"})`);
       } catch (error) {
         console.error(`Could not resolve person '${person}': ${errorMessage(error)}`);
         process.exitCode = 1;
@@ -209,12 +214,19 @@ connect
 
     try {
       const pairStatus = await client.getPairStatus(targetPrincipalId);
-      if (pairStatus.status !== "ready" && pairStatus.status !== "setup_bridge") {
+      if (
+        (pairStatus.status === "ready" && pairStatus.targetReachable === false)
+        || (pairStatus.status !== "ready" && pairStatus.status !== "setup_bridge")
+      ) {
         console.error(`\nCannot connect: ${pairStatus.message}`);
         if (pairStatus.status === "request_pair") {
           console.error("Ask them to open your DM in Aicoo and click Collaborate to pair your accounts first.");
         } else if (pairStatus.status === "awaiting_their_accept") {
           console.error("Your pair request is waiting for the other person to accept in Aicoo.");
+        } else if (pairStatus.status === "accept_incoming") {
+          console.error("Open Aicoo and accept their Collaborate request first.");
+        } else if (pairStatus.status === "ready" && pairStatus.targetReachable === false) {
+          console.error("Ask them to start their local agent bridge, then retry.");
         }
         process.exitCode = 1;
         return;

@@ -28,14 +28,16 @@ export class ApiError extends Error {
 }
 
 export interface PairStatusResponse {
-  status: "request_pair" | "awaiting_their_accept" | "setup_bridge" | "ready";
+  status: "request_pair" | "awaiting_their_accept" | "accept_incoming" | "setup_bridge" | "ready";
   message: string;
+  targetReachable?: boolean;
 }
 
 export interface ResolvedPersonResponse {
   principalId: string;
   handle?: string;
   name?: string;
+  displayName?: string;
   hasReachableRuntime?: boolean;
 }
 
@@ -51,7 +53,7 @@ export interface StartDeviceCodeInput {
 export interface StartDeviceCodeResponse {
   userCode: string;
   pollToken: string;
-  approvalUrl: string;
+  approvalUrl?: string;
   expiresAt: string;
 }
 
@@ -59,7 +61,8 @@ export type PollDeviceCodeResponse =
   | { status: "pending" }
   | { status: "approved"; deviceToken: string; userId: string }
   | { status: "denied" }
-  | { status: "expired" };
+  | { status: "expired" }
+  | { status: "consumed" };
 
 export interface HttpTransportOptions {
   baseUrl: string;

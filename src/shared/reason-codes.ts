@@ -29,6 +29,7 @@ export const REASON_CODES = [
   "ack_not_applicable",
   "queued_busy",
   "runtime_unavailable",
+  "runtime_session_already_granted",
   "unsupported",
   "permission_required",
   "steer_not_allowed",

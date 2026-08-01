@@ -140,10 +140,14 @@ export class RuntimeBridge {
   private async runEvents(): Promise<void> {
     const endpointId = this.requireEndpoint();
     const serverKey = this.options.spool.getIdentity("serverKey") ?? endpointId;
+    let reconnectDelayMs = 50;
+    let reconnectFailures = 0;
     while (!this.#controller.signal.aborted) {
       const cursor = this.options.spool.cursor(serverKey);
       try {
         for await (const event of this.options.transport.subscribeEvents(cursor, this.#controller.signal)) {
+          reconnectDelayMs = 50;
+          reconnectFailures = 0;
           try {
             await this.handleEvent(event);
           } catch (error) {
@@ -161,8 +165,14 @@ export class RuntimeBridge {
             await this.stop();
             return;
           }
-          this.options.log?.(`event stream reconnecting: ${String(error)}`);
-          await delay(50, this.#controller.signal);
+          reconnectFailures += 1;
+          if (shouldLogReconnect(reconnectFailures)) {
+            this.options.log?.(
+              `event stream reconnecting after ${reconnectFailures} failed attempt(s); retrying in ${reconnectDelayMs}ms: ${String(error)}`,
+            );
+          }
+          await delay(reconnectDelayMs, this.#controller.signal);
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5_000);
         }
       }
     }
@@ -218,7 +228,9 @@ export class RuntimeBridge {
       const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
       if (sessionHandle && this.#serverToNative.has(sessionHandle)) {
         const nativeHandle = this.#serverToNative.get(sessionHandle);
-        if (nativeHandle) await this.options.adapter.releaseRuntimeSession?.(nativeHandle);
+        if (nativeHandle && commSessionId) {
+          await this.options.adapter.prepareCommunicationSession?.(nativeHandle, commSessionId);
+        }
         this.rotateDefaultRouteAfterActivation(sessionHandle);
       }
     }
@@ -368,4 +380,8 @@ function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
       resolve();
     }, { once: true });
   });
+}
+
+function shouldLogReconnect(failures: number): boolean {
+  return failures <= 3 || (failures & (failures - 1)) === 0;
 }
