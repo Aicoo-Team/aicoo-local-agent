@@ -222,7 +222,9 @@ async function main() {
         }
         for (const message of fresh) {
           const preview = String(message.content).slice(0, 120).replace(/\s+/g, " ");
-          log(`inbound #${message.id} (conv ${conv.conversationId}, ${conv.type}): ${preview}`);
+          // Spell out that the sender is a person: the bare conversation type reads as
+          // "an agent sent this", and only senderType === 'human' rows get this far.
+          log(`inbound #${message.id} (from a human, conv ${conv.conversationId}, type=${conv.type}): ${preview}`);
           const inbound = {
             text: String(message.content),
             from: message.senderLabel ?? `@${peer}`,
