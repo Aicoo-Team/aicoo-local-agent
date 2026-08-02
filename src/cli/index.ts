@@ -21,7 +21,6 @@ import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
-const PREVIEW_AICOO_SERVER_URL = "https://www.yourcoo.ai";
 const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
 const DEFAULT_CREDENTIALS_FILE = join(homedir(), ".aicoo", "credentials.json");
 
@@ -717,7 +716,7 @@ function saveSavedCredentials(credentials: { token: string; userId?: string; dev
 function isHostedUrl(serverUrl: string): boolean {
   try {
     const url = new URL(serverUrl);
-    return url.hostname.includes("aicoo") || url.hostname.includes("yourcoo");
+    return url.protocol === "https:" || !["127.0.0.1", "localhost", "::1"].includes(url.hostname);
   } catch {
     return false;
   }
@@ -754,17 +753,7 @@ function makeHostedClient(server?: string, spool?: string): HttpMessageTransport
 function hostedServerUrl(explicitServer?: string): string {
   const serverCandidate = explicitServer ?? process.env.CCD_SERVER_URL ?? program.opts<{ server?: string }>().server;
   if (!serverCandidate || serverCandidate === LOCAL_SERVER_URL) return PRODUCT_AICOO_SERVER_URL;
-  return normalizeHostedServerUrl(serverCandidate);
-}
-
-function normalizeHostedServerUrl(server: string): string {
-  try {
-    const url = new URL(server);
-    if (url.hostname === "yourcoo.ai") return PREVIEW_AICOO_SERVER_URL;
-  } catch {
-    return server;
-  }
-  return server;
+  return serverCandidate;
 }
 
 async function resolveRoute(options: { endpoint?: string; session?: string; spool?: string }): Promise<{

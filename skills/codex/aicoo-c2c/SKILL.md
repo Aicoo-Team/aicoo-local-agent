@@ -25,12 +25,21 @@ relationship permissions its owner approved.
 
 ## How To Delegate
 
-When the user asks to reach a peer local agent, run `ccd delegate` from the
-current shell:
+When the user asks to reach a peer local agent, run the repo-local CLI if the
+current working directory is this `aicoo-local-agent` checkout:
+
+```bash
+CCD_SERVER_URL=<same-server-as-bridge> npm run ccd -- delegate --spool <same-spool-as-bridge> @username "task for the peer local agent"
+```
+
+Otherwise run `ccd delegate` from the current shell:
 
 ```bash
 ccd delegate @username "task for the peer local agent"
 ```
+
+Use the same `CCD_SERVER_URL` and `--spool` file as the running bridge, so the
+local route and pending task are written to the same bridge spool.
 
 Use the exact peer handle/name the user gave when possible. Keep the task text
 faithful to the user's request. If the request names files or folders, include

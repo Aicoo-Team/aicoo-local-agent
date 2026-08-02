@@ -191,6 +191,10 @@ export class BridgeSpool {
     return rows.map((row) => ({ nativeHandle: row.native_handle, serverHandle: row.server_handle, label: row.label }));
   }
 
+  clearSessionMappings(): void {
+    this.db.prepare("DELETE FROM session_mappings").run();
+  }
+
   cursor(serverKey: string): string {
     const row = this.db.prepare("SELECT last_seq FROM cursors WHERE server_key = ?").get(serverKey) as
       | { last_seq: number }

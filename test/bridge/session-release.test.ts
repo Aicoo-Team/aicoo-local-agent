@@ -54,6 +54,70 @@ describe("RuntimeBridge communication session release", () => {
     expect(adapter.prepareCommunicationSession).toHaveBeenCalledWith("native-session", "comm_new");
   });
 
+  it("drops stale server session mappings when a re-login creates a new endpoint", async () => {
+    const registerRuntimeSession = vi.fn(async () => ({
+      sessionHandle: "server-session-new",
+      endpointId: "ep_new",
+      principalId: "prn_b",
+      label: "Native session",
+      state: "idle" as const,
+      deliveryMode: "managed_stream" as const,
+      capabilities: { liveInject: true, midTurnSteer: false, replyEvents: true },
+      allowInbound: true,
+      allowMidTurnSteer: false,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    }));
+    const updateRuntimeSession = vi.fn(async () => ({
+      sessionHandle: "server-session-old",
+      endpointId: "ep_new",
+      principalId: "prn_b",
+      label: "Native session",
+      state: "idle" as const,
+      deliveryMode: "managed_stream" as const,
+      capabilities: { liveInject: true, midTurnSteer: false, replyEvents: true },
+      allowInbound: true,
+      allowMidTurnSteer: false,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    }));
+    const { bridge, spool } = setup({
+      sessions: [{ sessionHandle: "native-session", label: "Native session", state: "idle", allowInbound: true }],
+      transport: transport({
+        registerEndpoint: vi.fn(async () => ({
+          endpointId: "ep_new",
+          principalId: "prn_b",
+          deviceId: "device_b",
+          runtime: "claude-code" as const,
+          bridgeVersion: "test",
+          adapterVersion: "test",
+          capabilities: [],
+          presence: "online" as const,
+          lastSeenAt: new Date().toISOString(),
+        })),
+        registerRuntimeSession,
+        updateRuntimeSession,
+      }),
+    });
+    cleanups.push(() => void bridge.stop());
+    spool.setIdentity("endpointId", "ep_old");
+    spool.saveSessionMapping("native-session", "server-session-old", "Native session");
+
+    await bridge.start();
+
+    expect(updateRuntimeSession).not.toHaveBeenCalledWith(
+      "ep_new",
+      "server-session-old",
+      expect.anything(),
+    );
+    expect(registerRuntimeSession).toHaveBeenCalledTimes(1);
+    expect(spool.listSessionMappings()).toEqual([{
+      nativeHandle: "native-session",
+      serverHandle: "server-session-new",
+      label: "Native session",
+    }]);
+  });
+
   it("retries a parked local delegation when the peer approves the grant", async () => {
     const delegateLocalAgentTask = vi.fn(async () => ({
       status: "delegated" as const,

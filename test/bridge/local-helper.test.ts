@@ -7,11 +7,11 @@ describe("local folder/file picker helper", () => {
 
     const response = await app.request("/local-agent/choose-folder", {
       method: "POST",
-      headers: { origin: "https://www.yourcoo.ai" },
+      headers: { origin: "https://www.aicoo.io" },
     });
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("access-control-allow-origin")).toBe("https://www.yourcoo.ai");
+    expect(response.headers.get("access-control-allow-origin")).toBe("https://www.aicoo.io");
     const body = await response.json();
     expect(body).toEqual({ folderPath: "/tmp/aicoo-demo" });
     expect(JSON.stringify(body)).not.toMatch(/token|device|endpoint|session/i);
@@ -74,6 +74,20 @@ describe("local folder/file picker helper", () => {
     expect(allowed.headers.get("access-control-allow-origin")).toBe("http://localhost:3000");
     expect(rejected.status).toBe(403);
     expect(rejected.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("allows configured extra web origins for CORS", async () => {
+    process.env.CCD_LOCAL_HELPER_ORIGINS = "https://preview.example";
+    const app = createLocalHelperApp(picker({ ok: true, path: "/tmp/aicoo-demo" }));
+
+    const allowed = await app.request("/local-agent/choose-folder", {
+      method: "OPTIONS",
+      headers: { origin: "https://preview.example" },
+    });
+
+    expect(allowed.status).toBe(204);
+    expect(allowed.headers.get("access-control-allow-origin")).toBe("https://preview.example");
+    delete process.env.CCD_LOCAL_HELPER_ORIGINS;
   });
 
   it("rejects non-localhost binding", () => {

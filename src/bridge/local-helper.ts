@@ -7,15 +7,25 @@ import { Hono } from "hono";
 
 const execFileAsync = promisify(execFile);
 
-const ALLOWED_ORIGINS = new Set([
+const DEFAULT_ALLOWED_ORIGINS = [
   "https://www.aicoo.io",
-  "https://www.yourcoo.ai",
   "http://localhost:3000",
-]);
+];
 
 export type PickerResult =
   | { ok: true; path: string }
   | { ok: false; error: "cancelled" | "picker_unavailable"; message: string };
+
+function configuredOrigins(): string[] {
+  return (process.env.CCD_LOCAL_HELPER_ORIGINS ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+function allowedOrigins(): Set<string> {
+  return new Set([...DEFAULT_ALLOWED_ORIGINS, ...configuredOrigins()]);
+}
 
 export interface NativePicker {
   chooseFolder(): Promise<PickerResult>;
@@ -34,7 +44,7 @@ export function createLocalHelperApp(picker: NativePicker = new DefaultNativePic
 
   app.use("*", async (c, next) => {
     const origin = c.req.header("origin");
-    if (origin && ALLOWED_ORIGINS.has(origin)) {
+    if (origin && allowedOrigins().has(origin)) {
       c.header("Access-Control-Allow-Origin", origin);
       c.header("Vary", "Origin");
       c.header("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -42,7 +52,7 @@ export function createLocalHelperApp(picker: NativePicker = new DefaultNativePic
       c.header("Access-Control-Max-Age", "600");
     }
     if (c.req.method === "OPTIONS") {
-      return c.body(null, origin && ALLOWED_ORIGINS.has(origin) ? 204 : 403);
+      return c.body(null, origin && allowedOrigins().has(origin) ? 204 : 403);
     }
     await next();
   });

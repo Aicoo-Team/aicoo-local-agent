@@ -57,6 +57,11 @@ export class RuntimeBridge {
       capabilities: Object.entries(adapterCapabilities).filter(([, value]) => value).map(([key]) => key),
     });
     this.#endpointId = endpoint.endpointId;
+    const previousEndpointId = this.options.spool.getIdentity("endpointId");
+    if (previousEndpointId && previousEndpointId !== endpoint.endpointId) {
+      this.options.spool.clearSessionMappings();
+      this.options.log?.(`[bridge] endpoint changed; cleared stale session mappings from ${previousEndpointId}`);
+    }
     this.options.spool.setIdentity("endpointId", endpoint.endpointId);
     this.options.spool.setIdentity("principalId", endpoint.principalId);
     this.options.spool.setIdentity("serverKey", endpoint.endpointId);
