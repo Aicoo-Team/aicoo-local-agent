@@ -7,62 +7,71 @@
 ## The shape
 
 The point is not two agents chatting. It is that two agents hold **different permissions,
-tools, memory, and capabilities** — and can now collaborate without either side handing over
-the underlying data. Each runs on its owner's machine. Only the *result* crosses.
+tools, memory, and capabilities** — and can collaborate without either side handing over the
+underlying data. Each runs on its owner's machine. Only the *result* crosses.
 
-Of the five axes that make up that thesis — permission, tools, memory, delegation, network
-— this demo shows **memory**, because it is the one that is fully real today and the one
-that cannot be reduced to file transfer.
+This demo uses the one file that proves all of it at once: **`.env`**.
+
+---
+
+## Why `.env` and not anything else
+
+Every other scenario dies to one of three objections. This one survives all of them.
+
+| Objection | Why it fails here |
+| --- | --- |
+| *"Just look on GitHub."* | `.env` is in `.gitignore` by definition. It has never been pushed anywhere |
+| *"Just sync it to the cloud agent."* | It is secrets. Uploading it **is** the incident |
+| *"Just send me the file."* | Sending `.env` **is** the leak. For the first time this sentence is not merely unhelpful — it is the thing you must not do |
+
+And the approval beat needs no explanation at all: everyone watching already knows what it
+means to let someone's agent open your `.env`.
 
 ---
 
 ## The one sentence the demo must land
 
-> I asked my teammate's agent what it knows about a project. It read its own memory, on his
-> laptop, with his approval — and sent me a conclusion. Not the file. Not the database. The
-> conclusion.
+> His agent read his `.env`. It told me which variable I was missing — and never said a
+> single value out loud.
 
----
-
-## Why this beats every file-reading demo
-
-A file demo always invites: *"why not just send me the file?"*
-
-Here there is no file to send. The answer is a **synthesis** of several private memory
-entries — the asker never sees the rest, and the owner never hands anything over. What
-crosses the wire is a sentence that did not exist until the question was asked.
-
-That is also the only honest way to show the thesis on camera: **data stays local,
-conclusions travel.**
+That one line carries both halves of the thesis: **data stays local, conclusions travel** —
+and *why it has to be local at all*.
 
 ---
 
 ## The task
 
-Point the agent's workspace at the owner's **agent memory directory**, not a repo:
+**"我调你们那个服务一直 401,你本地是怎么配的?我不要你的 key,就想知道我少了什么。"**
 
-```bash
---workspace ~/.claude/projects/<project>/memory
-```
+The last clause matters — say it, and type it. It sets up the payoff before the payoff
+happens: the asker is explicitly *not* asking for secrets, and the answer still arrives.
 
-Then ask something that requires reading several entries and forming a judgement:
+A good answer looks like: *"You're missing `API_KEY_PEPPER`, and your BASE_URL points at the
+apex — mine is www. The apex 307 strips the Authorization header."*
 
-| Task | What it proves |
-| --- | --- |
-| **"你的 agent 对 Pulse 这个项目积累了什么?给我一段摘要"** ⭐ | The answer is a synthesis of several private notes. There is no single file that is the answer |
-| "John 是谁?我们跟他之前聊到哪一步了" | Relationship memory — the thing people keep in their head and never write down anywhere shareable |
-| "你那边关于这个 bug 的结论是什么" | A conclusion, not a log |
+Use a **real** misconfiguration you actually hit. A staged one reads as staged.
 
-Two rules:
+### ⚠️ Use a demo `.env` with fake values
 
-- **Never a repo.** Anything committed is already on GitHub, where the asker can read it
-  without interrupting anyone. Demo that and the approval reads as friction, not safety.
-- **Never staged.** Real memory, real answer. If a viewer suspects a planted file,
-  everything after that lands as theatre.
+The agent is instructed never to reveal credentials, and it does refuse — but that guarantee
+today comes from the model, not from a mechanism. **The reply is itself an exfiltration
+channel**, and outbound sanitising is not built yet. Record with fake values. This is also
+the honest answer if someone asks how far the guarantee goes.
+
+### Runner-up, if you want a second take
+
+**"你 dev server 现在报的错完整是什么?"** — reading a log as it is being written. Also
+local-only: what a cloud agent holds is a snapshot, never *now*. Less visceral than `.env`.
 
 ### One test for any scenario you invent later
 
-**Could the answer have been sent as a file?** If yes, the demo argues against itself.
+Three questions, all of which must be **no**:
+
+1. Could it be in a repo?
+2. Could it be synced to a cloud agent?
+3. Could the answer have been sent as a file?
+
+`.env` is the only common file that answers no to all three.
 
 ---
 
@@ -88,22 +97,22 @@ rm -f ~/.aicoo-dm-agent/www.aicoo.io/admin--waterdoog/state.json
 Run it in a **visible** terminal — the approval prompt is the demo:
 
 ```bash
-AICOO_TOKEN=<their_key> node src/cli.js start --peer <you> --workspace ~/.claude/projects/<project>/memory
+AICOO_TOKEN=<their_key> node src/cli.js start --peer <you> --workspace ./demo-workspace
 ```
 
-- [ ] Fresh session — a resumed one already knows the answer and **skips the approval**
-- [ ] The memory directory has real entries the answer must be assembled from
-- [ ] Terminal font 18pt+
+- [ ] `demo-workspace/.env` exists, with **fake values** and a real-looking shape
+- [ ] Fresh session — a resumed one already read the file and **skips the approval**
+- [ ] Terminal font 18pt+, and `.env` legible in the approval line
 - [ ] One dry run before recording
 
 ---
 
 ## The three beats
 
-### Beat 1 — ask his agent, not him (0:00–0:20)
+### Beat 1 — the ask, with the constraint stated (0:00–0:20)
 
-Type the question. Say: *"I'm not asking him. I'm asking his agent — the one that has been
-working alongside him all month and remembers things he never wrote down for me."*
+Type the question, including *"我不要你的 key"*. Say: *"I'm not asking him — he's heads-down.
+I'm asking his agent. And I'm not asking for his secrets; I want to know what I'm missing."*
 
 ### Beat 2 — his machine asks him (0:20–1:00) — **the hero shot**
 
@@ -112,22 +121,24 @@ The terminal wakes up and stops:
 ```
 == OWNER APPROVAL REQUIRED ==
    tool: Read
-   Read({"file_path":".../memory/pulse-hotword-pipeline.md"})
+   Read({"file_path":".../demo-workspace/.env"})
    allow? [y/N]
 ```
 
+Nobody needs this explained. Everyone watching knows what `.env` is.
+
 **Hold three seconds before typing `y`.** This frame goes in the deck.
 
-*"His agent wants to open one memory entry. He decides — right now, for this question. Not
-a checkbox at install time."*
+*"His agent wants to open his `.env`. He decides — right now, for this one question. Not a
+checkbox at install time."*
 
-Approve. It reads a second, then a third — **each one asked for separately** — and answers
-in the chat, tagged **Local Agent** so it is never confused with the cloud agent's reply.
+Approve. The answer arrives in the chat, tagged **Local Agent** so it is never confused with
+the cloud agent's reply: the missing variable, and the wrong host.
 
-Then say the line the whole demo exists for:
+Then say the line the whole demo exists for — and **point at the reply while you say it**:
 
-> *"He never sent me a file. I can't see his memory. What came back is a conclusion that
-> didn't exist until I asked."*
+> *"His agent read his `.env`. It told me which variable I was missing — and never said a
+> single value out loud."*
 
 ### Beat 3 — the refusal (1:00–1:30)
 
