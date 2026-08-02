@@ -48,6 +48,29 @@ const PATH_INPUTS = {
 
 const POLICY_SUPPORTED_TOOLS = Object.keys(PATH_INPUTS).sort();
 const POLICY_SUPPORTED_TOOL_SET = new Set<string>(POLICY_SUPPORTED_TOOLS);
+const CREDENTIAL_PATH_SEGMENTS = new Set([
+  ".aws",
+  ".azure",
+  ".config/gcloud",
+  ".docker",
+  ".gnupg",
+  ".kube",
+  ".ssh",
+]);
+const CREDENTIAL_FILE_NAMES = new Set([
+  ".env",
+  ".env.local",
+  ".env.production",
+  ".npmrc",
+  ".netrc",
+  "credentials",
+]);
+const EXECUTION_ON_NEXT_USE_PATHS = new Set([
+  ".git/hooks",
+  ".vscode/tasks.json",
+  "Makefile",
+  "package.json",
+]);
 
 const PRESET_TOOLS: Readonly<Record<RelationshipAccessPreset, readonly string[]>> = {
   "chat-only": [],
@@ -79,10 +102,7 @@ export class RelationshipPolicy {
     }));
     for (const relationship of this.#relationships) {
       for (const folder of relationship.folders) {
-        if (folder === normalizeCase(parse(folder).root)) {
-          throw new Error("Filesystem root cannot be granted");
-        }
-        if (isWithin(folder, this.#policyFile)) {
+        if (folder !== normalizeCase(parse(folder).root) && isWithin(folder, this.#policyFile)) {
           throw new Error("Relationship policy must be stored outside every granted folder");
         }
       }
@@ -101,6 +121,25 @@ export class RelationshipPolicy {
     return [...new Set(this.#relationships.flatMap((relationship) => [...relationship.tools]))]
       .filter((tool) => POLICY_SUPPORTED_TOOL_SET.has(tool))
       .sort();
+  }
+
+  grantedFolders(): string[] {
+    return [...new Set(this.#relationships.flatMap((relationship) => relationship.folders))].sort();
+  }
+
+  writableFolders(): string[] {
+    return [...new Set(this.#relationships
+      .filter((relationship) => relationship.tools.has("Write") || relationship.tools.has("Edit"))
+      .flatMap((relationship) => relationship.folders))]
+      .sort();
+  }
+
+  sandboxDenyReadPaths(): string[] {
+    return dangerousSandboxPaths(this.grantedFolders(), "read");
+  }
+
+  sandboxDenyWritePaths(): string[] {
+    return dangerousSandboxPaths(this.grantedFolders(), "write");
   }
 
   hasToolAccess(message: InboundMessage | undefined): boolean {
@@ -140,11 +179,13 @@ export class RelationshipPolicy {
     for (const path of paths) {
       let candidate: string;
       try {
-        candidate = canonicalPath(toLiteralAbsolute(this.#cwd, path.value));
+        candidate = resolveRelationshipPath(this.#cwd, relationship.folders, path.value);
       } catch {
         return deny("Path could not be resolved safely");
       }
       if (candidate === this.#policyFile) return deny("Relationship policy cannot be accessed by a remote tool");
+      const dangerous = dangerousPathDecision(action.toolName, candidate);
+      if (dangerous) return deny(dangerous);
       if (!relationship.folders.some((folder) => isWithin(folder, candidate))) {
         return deny(`Path is outside the folders allowed for this relationship`);
       }
@@ -168,10 +209,11 @@ export function upsertRelationshipPreset(input: {
 
   const existing = readPolicyDocument(input.file);
   const canonicalFolder = folder ? canonicalPath(folder) : undefined;
-  if (canonicalFolder && canonicalFolder === normalizeCase(parse(canonicalFolder).root)) {
-    throw new Error("Filesystem root cannot be granted");
-  }
-  if (canonicalFolder && isWithin(canonicalFolder, canonicalPath(input.file))) {
+  if (
+    canonicalFolder
+    && canonicalFolder !== normalizeCase(parse(canonicalFolder).root)
+    && isWithin(canonicalFolder, canonicalPath(input.file))
+  ) {
     throw new Error("Relationship policy must be stored outside the granted folder");
   }
   const nextRelationship: RelationshipPolicyDocument["relationships"][number] = {
@@ -243,6 +285,17 @@ function toLiteralAbsolute(cwd: string, input: string): string {
   return isAbsolute(input) ? input : `${cwd}${sep}${input}`;
 }
 
+function resolveRelationshipPath(cwd: string, folders: readonly string[], input: string): string {
+  const cwdCandidate = canonicalPath(toLiteralAbsolute(cwd, input));
+  if (folders.some((folder) => isWithin(folder, cwdCandidate))) return cwdCandidate;
+  if (isAbsolute(input)) return cwdCandidate;
+  for (const folder of folders) {
+    const folderCandidate = canonicalPath(toLiteralAbsolute(folder, input));
+    if (isWithin(folder, folderCandidate)) return folderCandidate;
+  }
+  return cwdCandidate;
+}
+
 function isMissingPathError(error: unknown): boolean {
   return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -254,4 +307,52 @@ function isWithin(folder: string, candidate: string): boolean {
 
 function normalizeCase(path: string): string {
   return process.platform === "win32" ? path.toLowerCase() : path;
+}
+
+function dangerousPathDecision(toolName: string, candidate: string): string | undefined {
+  const normalized = normalizeCase(candidate);
+  const segments = normalized.split(sep).filter(Boolean);
+  for (const credential of CREDENTIAL_PATH_SEGMENTS) {
+    const credentialParts = credential.split("/");
+    for (let index = 0; index <= segments.length - credentialParts.length; index += 1) {
+      if (credentialParts.every((part, offset) => segments[index + offset] === part)) {
+        return "Credential paths cannot be accessed by a remote relationship";
+      }
+    }
+  }
+  for (let index = 0; index < segments.length; index += 1) {
+    const suffix = segments.slice(index).join("/");
+    if (CREDENTIAL_PATH_SEGMENTS.has(suffix)) {
+      return "Credential paths cannot be accessed by a remote relationship";
+    }
+  }
+  const fileName = basename(normalized);
+  if (CREDENTIAL_FILE_NAMES.has(fileName) || fileName.startsWith(".env.")) {
+    return "Credential files cannot be accessed by a remote relationship";
+  }
+  if ((toolName === "Write" || toolName === "Edit") && isExecutionOnNextUsePath(normalized)) {
+    return "Execution-on-next-use files cannot be modified by a remote relationship";
+  }
+  return undefined;
+}
+
+function isExecutionOnNextUsePath(normalized: string): boolean {
+  const portable = normalized.split(sep).join("/");
+  return [...EXECUTION_ON_NEXT_USE_PATHS].some((dangerous) =>
+    portable.endsWith(`/${dangerous}`) || portable === dangerous);
+}
+
+function dangerousSandboxPaths(folders: readonly string[], mode: "read" | "write"): string[] {
+  const paths = new Set<string>();
+  for (const folder of folders) {
+    for (const credential of CREDENTIAL_PATH_SEGMENTS) paths.add(join(folder, ...credential.split("/")));
+    for (const credential of CREDENTIAL_FILE_NAMES) paths.add(join(folder, credential));
+    if (mode === "write") {
+      for (const dangerous of EXECUTION_ON_NEXT_USE_PATHS) paths.add(join(folder, ...dangerous.split("/")));
+    }
+  }
+  const home = canonicalPath(homedir());
+  for (const credential of CREDENTIAL_PATH_SEGMENTS) paths.add(join(home, ...credential.split("/")));
+  for (const credential of CREDENTIAL_FILE_NAMES) paths.add(join(home, credential));
+  return [...paths].sort();
 }

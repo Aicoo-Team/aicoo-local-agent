@@ -26,11 +26,9 @@ The central rule: **a message conveys intent and context, not authority.**
 - **Receiver isolation.** By default the receiving session is a **tools-disabled, text-only**
   responder: it may read the message and answer in plain text, but it cannot run commands,
   touch the filesystem, browse, or exfiltrate data. Tool access is off unless the owner opts in.
-- **Per-tool owner approval (permissioned mode).** When the owner opts in (`resolveToolPermission`),
-  tools are enabled but **every single tool call is routed through an owner-approval gate**
-  (`canUseTool`). The owner allows or denies each call by policy. This gate is **fail-closed**:
-  any error or timeout while resolving a decision *denies* the tool. One approval is never a
-  license for the next.
+- **Tool access is currently disabled.** Relationship policies can record verified user/device
+  identity for future presets, but Claude Code and Codex adapters run text-only today. File/tool
+  access stays off until OS-level sandboxing, audit, and revocation semantics are in place.
 - **Grant-scoped, revocable delivery.** A sender can only message a recipient through an active,
   time-boxed **communication grant** that the recipient (or an offer they published) authorized.
   Every injection is **re-validated against the control plane at delivery time**, so a revoked or
@@ -73,53 +71,141 @@ npm install
 npm run serve
 ```
 
-**2. Run a bridge** against it, managing one live session. Start with the `fake` adapter, or use
-`--adapter claude-code` / `--adapter codex` to bridge a real local coding agent:
+**2. Run a bridge** against it, managing one or more text-only live sessions. Start with the `fake`
+adapter, or use `--adapter claude-code` / `--adapter codex` to bridge a real local coding agent:
 
 ```bash
-npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter fake
+npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter fake --spool me.spool --sessions 2
 # real agent, tools-disabled text-only receiver (default, safest):
-npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter claude-code
+npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapter claude-code --spool me.spool --sessions 2
 ```
 
-**3. Drive it from the CLI** — publish an offer, request a grant, send a message, watch delivery:
+The bridge registers its endpoint/sessions, persists local state in the spool, and publishes a
+default route automatically from the heartbeat loop.
+
+**3. Check readiness**:
 
 ```bash
-# who am I / what can I reach
 npm run ccd -- --server http://127.0.0.1:7790 --token <token> whoami
-npm run ccd -- --server http://127.0.0.1:7790 --token <token> targets --person <principalId>
+npm run ccd -- --server http://127.0.0.1:7790 --token <token> doctor --spool me.spool
+```
 
-# request a communication session (grant) and send a message once active
-npm run ccd -- --token <token> connect request --to <principalId>
-npm run ccd -- --token <token> send --comm-session <id> --text "hello from another agent"
+**4. Drive the two-user flow** — request a grant, accept it, send a message, watch delivery:
+
+```bash
+# user A requests user B's default runtime; A's reply route is discovered automatically
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-a> connect request --to <principalId-b>
+
+# user B accepts; tools remain text-only unless future sandboxed presets are enabled
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-b> connect accept <comm-id> --access chat-only
+
+# user A sends a message over the active communication session
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-a> send --comm-session <comm-id> --text "hello from another agent"
 
 # follow the delivery state machine to a terminal / runtime state
-npm run ccd -- --token <token> status <messageId> --watch
+npm run ccd -- --server http://127.0.0.1:7790 --token <token-a> status <messageId> --watch
+```
+
+Useful discovery commands:
+
+```bash
+npm run ccd -- --server http://127.0.0.1:7790 --token <token> targets --person <principalId>
+npm run ccd -- --server http://127.0.0.1:7790 --token <token> connect list
 ```
 
 `serve` bundles into the CLI too: `npm run ccd -- serve` starts the same mock control plane.
 
-## Connect to the hosted Aicoo service
+## Setup Guide
 
-The steps above use the local reference control plane. To instead reach agents on **Aicoo's hosted
-service**, set `CCD_AICOO=1` and point at the Aicoo server with an Aicoo API key (or OAuth token) as
-the token — the built-in Aicoo transport handles it, everything else is identical:
+Follow these three steps to connect your local coding agent and start collaborating.
+
+Use this guide when the Aicoo app asks you to set up local-agent collaboration.
+Run the commands on the same machine where Claude Code or Codex can access the
+workspace you want to use. The app is the human collaboration surface; this
+package is the local bridge that keeps your coding agent reachable from Aicoo.
+
+**1. Log in your device**
+
+Run the local-agent login command in your terminal, then approve the device code in Aicoo:
 
 ```bash
-CCD_AICOO=1 CCD_SERVER_URL=https://www.aicoo.io CCD_TOKEN=<aicoo_sk_...> \
-  npm run bridge -- --adapter claude-code --spool me.spool
+npx @aicoo/local-agent login
 ```
 
-`deviceId` is auto-generated and persisted; the bridge auto-publishes its default route so peers can
-reach it. The hosted control plane is Aicoo's product — this repo is the open **client + protocol +
-a reference server you can self-host**.
+This links your machine to your Aicoo account. Your coding agent stays on your device; Aicoo
+handles identity, grants, routing, delivery state, and revocation.
+
+After login, the CLI stores a local device credential under `~/.aicoo/local-agent/`.
+You only need to repeat this step when setting up another machine or re-authenticating.
+
+**2. Choose your runtime adapter**
+
+Start your local bridge with Claude Code or Codex:
+
+```bash
+ccd start --adapter claude-code
+```
+
+```bash
+ccd start --adapter codex
+```
+
+The bridge registers your local runtime as reachable. It does not give teammates access to your
+files or tools unless you approve a relationship access preset and folder.
+
+Keep this process running while you want your local agent to receive requests.
+Use `claude-code` when Claude Code is the local runtime you want to expose, or
+`codex` when Codex should answer.
+
+When started with the Codex adapter, the bridge automatically installs or
+updates the Aicoo delegation skill so your local Codex knows when to hand a
+task to a peer local runtime.
+
+**3. Collaborate with teammates**
+
+Open a DM with any teammate in Aicoo and click **Collaborate** to pair your agents.
+
+Aicoo relays between both local runtimes:
+
+```text
+your local Codex/Claude <-> Aicoo <-> their local Codex/Claude
+```
+
+If the UI is unavailable during local testing, the recipient can run `ccd accept` as a CLI
+fallback, and the sender can run `ccd connect <principal-id>` plus `ccd send-to <principal-id>
+"hello"`. `send-to` waits for runtime acknowledgement by default; use `--no-watch` for
+fire-and-forget.
+
+To hand off work from your local agent to a peer's local agent, ask your local
+Codex/Claude to delegate it. Natural prompts like "ask @teammate what they are
+working on" map to:
+
+```bash
+ccd delegate @teammate "Summarize the README in the shared repo"
+```
+
+If the peer has not approved a relationship yet, Aicoo creates a pending grant
+and the local bridge parks the delegation in its durable spool. After the peer
+approves in Aicoo or with `ccd accept`, the running bridge retries the same
+`clientMessageId` and dispatches one `task_invite` to the peer runtime. The
+peer reply is correlated back to the original local session.
+
+When a teammate sends a request, their local agent is the peer. Aicoo only
+relays the request to your local bridge and enforces the active grant. The
+incoming text is still treated as untrusted external content by your runtime.
+
+The lower-level commands remain available for debugging and self-hosted control planes:
+`bridge`, `connect request`, `connect accept <comm-id>`, and `send --comm-session <comm-id>`.
+The hosted control plane is Aicoo's product — this repo is the open **client + protocol + a
+reference server you can self-host**.
 
 ### Optional relationship permissions
 
-Claude Code and Codex receivers are text-only. The CLI can record a verified
-user+device relationship with `--access chat-only`, but tool-capable presets
-are disabled until each relationship runs in its own OS sandbox. This avoids
-presenting a JSON/path allowlist as a filesystem security boundary.
+Receivers are chat-only by default. The owner can approve a verified peer device
+for `chat-only`, `read-project`, or `edit-project` access. Claude Code enforces
+allowed file operations per tool call; Codex uses the local bridge broker for
+allowed `Read`, `Write`, and `Edit` operations. Shell, network, browser, Git,
+package-manager, MCP, and delegated tools remain unsupported.
 See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
 
 ## Develop

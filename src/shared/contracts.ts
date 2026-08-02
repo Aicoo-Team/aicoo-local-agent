@@ -145,7 +145,14 @@ export interface MessageReceipt {
 
 export interface RuntimeEvent<T = Record<string, unknown>> {
   cursor: string;
-  type: "message.dispatch" | "comm.request" | "comm.activated" | "comm.declined" | "comm.revoked";
+  type:
+    | "message.dispatch"
+    | "comm.request"
+    | "comm.activated"
+    | "comm.declined"
+    | "comm.revoked"
+    | "comm.expired"
+    | "relationship.policy_update";
   endpointId: string;
   createdAt: string;
   data: T;
@@ -186,6 +193,32 @@ export interface RequestCommunicationSessionInput {
   replySessionHandle: string;
   requestedTtlMinutes?: number;
 }
+
+export interface LocalAgentDelegationInput {
+  target: RequestCommunicationSessionInput["target"];
+  task: string | Record<string, unknown>;
+  sessionHandle: string;
+  clientMessageId: string;
+  correlationId?: string;
+  requestedTtlMinutes?: number;
+}
+
+export type LocalAgentDelegationResponse =
+  | {
+      status: "grant_requested";
+      communicationSession: CommunicationSession;
+      clientMessageId: string;
+      correlationId?: string;
+      duplicate: boolean;
+    }
+  | {
+      status: "delegated";
+      communicationSession: CommunicationSession;
+      receipt: MessageReceipt;
+      clientMessageId: string;
+      correlationId?: string;
+      duplicate: boolean;
+    };
 
 export interface GrantScopedSendMessageInput {
   communicationSessionId: string;

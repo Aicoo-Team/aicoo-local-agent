@@ -99,9 +99,7 @@ export async function selectRuntimeAdapter(
     try {
       const policy = RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
       if (policy.enabledTools().length > 0) {
-        options.log?.(
-          "relationship tool access is disabled until per-relationship OS sandboxing is available; continuing text-only",
-        );
+        options.log?.(`relationship tool access enabled for Claude Code tools: ${policy.enabledTools().join(", ")}`);
       }
     } catch (error) {
       options.log?.(`relationship policy could not be loaded; continuing text-only: ${String(error)}`);
@@ -112,6 +110,7 @@ export async function selectRuntimeAdapter(
     cwd: resolve(options.workspace),
     sessionCount: options.sessions,
     ...(configuredPath ? { pathToClaudeCodeExecutable: configuredPath } : {}),
+    ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
     ...(options.model ? { model: options.model } : {}),
     log: options.log,
   });

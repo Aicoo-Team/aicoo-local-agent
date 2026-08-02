@@ -33,6 +33,8 @@ export interface RuntimeAdapter {
     correlationId?: string;
     payload?: Record<string, unknown>;
   }>;
+  releaseCommunicationSession?(communicationSessionId: string): Promise<void>;
+  prepareCommunicationSession?(sessionHandle: string, communicationSessionId: string): Promise<void>;
   deliverToSession(
     sessionHandle: string,
     message: InboundMessage,

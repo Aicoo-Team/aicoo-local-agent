@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,7 +13,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   });
 
-  it("starts a tools-disabled managed stream and ACKs only the provider echo", async () => {
+  it("starts a policy-gated managed stream and ACKs only the provider echo", async () => {
     const driver = new FakeClaudeAgentDriver("P1_REPLY_OK");
     const adapter = makeAdapter(driver);
     cleanups.push(() => adapter.close());
@@ -26,7 +26,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       allowInbound: true,
     })]);
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual([]);
+    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(options.settingSources).toEqual([]);
     expect(options.mcpServers).toEqual({});
@@ -54,7 +54,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     ]);
   });
 
-  it("keeps tools denied during an active verified turn", async () => {
+  it("keeps tools denied during an active verified turn without a policy", async () => {
     const driver = new FakeClaudeAgentDriver();
     driver.resultDelayMs = 100;
     const adapter = new ClaudeCodeAdapter({
@@ -69,11 +69,80 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual([]);
+    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
       signal: new AbortController().signal,
       toolUseID: "read-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "deny" });
+  });
+
+  it("allows Claude file tools only for the verified relationship and granted folder", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-tools-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const policyFile = join(directory, "relationships.json");
+    mkdirSync(project);
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read", "Write"],
+        folders: [project],
+      }],
+    }));
+    writeFileSync(join(directory, "outside.txt"), "secret");
+
+    const driver = new FakeClaudeAgentDriver();
+    driver.resultDelayMs = 100;
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_tools"), "new_turn"))
+      .toMatchObject({ status: "runtime_acked" });
+    const options = driver.starts[0]!.options;
+    expect(options.additionalDirectories).toEqual([realpathSync.native(project)]);
+    expect(options.sandbox).toMatchObject({
+      enabled: true,
+      failIfUnavailable: true,
+      autoAllowBashIfSandboxed: false,
+      allowUnsandboxedCommands: false,
+      filesystem: {
+        denyRead: expect.arrayContaining([join(realpathSync.native(project), ".env")]),
+        denyWrite: expect.arrayContaining([join(realpathSync.native(project), "package.json")]),
+      },
+    });
+
+    expect(await options.canUseTool?.("Read", { file_path: join(project, "README.md") }, {
+      signal: new AbortController().signal,
+      toolUseID: "read-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({
+      behavior: "allow",
+      updatedInput: { file_path: join(realpathSync.native(directory), "project", "README.md") },
+    });
+    expect(await options.canUseTool?.("Read", { file_path: join(directory, "outside.txt") }, {
+      signal: new AbortController().signal,
+      toolUseID: "outside-read",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "deny" });
+    expect(await options.canUseTool?.("Edit", { file_path: join(project, "README.md") }, {
+      signal: new AbortController().signal,
+      toolUseID: "edit-tool-call",
+      requestId: "permission-request",
+    })).toMatchObject({ behavior: "deny" });
+    expect(await options.canUseTool?.("Bash", { command: "cat README.md" }, {
+      signal: new AbortController().signal,
+      toolUseID: "bash-tool-call",
       requestId: "permission-request",
     })).toMatchObject({ behavior: "deny" });
   });
@@ -129,6 +198,35 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       "queue",
     )).toEqual({ status: "permission_required" });
     expect(driver.received).toHaveLength(1);
+  });
+
+  it("releases a bound Claude conversation when the communication session ends", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const firstEvents = collectEvents(adapter, "claude-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_comm_1", { communicationSessionId: "comm_1" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await firstEvents;
+    const firstProviderSessionId = adapter.providerSessionId("claude-managed-1");
+
+    await adapter.releaseCommunicationSession("comm_1");
+
+    expect(adapter.providerSessionId("claude-managed-1")).not.toBe(firstProviderSessionId);
+    const secondEvents = collectEvents(adapter, "claude-managed-1", 2);
+    expect(await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_comm_2", { communicationSessionId: "comm_2" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await secondEvents;
+    expect(driver.starts.at(-1)?.options.resume).toBeUndefined();
+    expect(driver.starts.at(-1)?.options.sessionId).toBe(adapter.providerSessionId("claude-managed-1"));
   });
 
   it("discards an initialized legacy conversation that was never bound to a relationship", async () => {

@@ -3,12 +3,19 @@ import {
   ApiError,
   normalizeBearerToken,
   type HttpTransportOptions,
+  type PairStatusResponse,
+  type ResolvedPersonResponse,
+  type StartDeviceCodeInput,
+  type StartDeviceCodeResponse,
+  type PollDeviceCodeResponse,
 } from "./http-client.js";
 import type {
   CommunicationGrant,
   CommunicationSession,
   DeliveryAckInput,
   Endpoint,
+  LocalAgentDelegationInput,
+  LocalAgentDelegationResponse,
   MessageDelivery,
   MessageReceipt,
   ReachableTarget,
@@ -38,6 +45,7 @@ export class AicooTransport extends HttpMessageTransport {
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
   readonly #deviceId: string;
+  readonly #onTokenRefreshed?: (token: string) => void;
   #deviceToken?: string;
   #endpoint?: string;
 
@@ -48,6 +56,7 @@ export class AicooTransport extends HttpMessageTransport {
     this.#timeoutMs = options.timeoutMs ?? 5_000;
     this.#fetch = options.fetchImpl ?? fetch;
     this.#deviceId = options.deviceId?.trim() ?? "";
+    this.#onTokenRefreshed = options.onTokenRefreshed;
   }
 
   #authToken(): string {
@@ -104,6 +113,9 @@ export class AicooTransport extends HttpMessageTransport {
     this.#deviceToken = normalizeBearerToken(deviceToken);
     this.#endpoint = endpoint.endpointId;
     this.setEndpointId(endpoint.endpointId);
+    if (this.#onTokenRefreshed) {
+      this.#onTokenRefreshed(deviceToken);
+    }
     return endpoint;
   }
 
@@ -137,6 +149,19 @@ export class AicooTransport extends HttpMessageTransport {
     return this.requestJson(`${LA}/default-route`);
   }
 
+  override async whoami(): Promise<{ principalId: string; deviceId: string }> {
+    const response = await this.requestJson<{
+      principalId?: string;
+      userId?: string;
+      deviceId?: string | null;
+    }>(`${LA}/whoami`);
+    const principalId = response.principalId ?? response.userId;
+    if (!principalId) {
+      throw new ApiError(500, "invalid_response", response);
+    }
+    return { principalId, deviceId: response.deviceId ?? this.#deviceId };
+  }
+
   override async listReachableTargets(_personId: string): Promise<ReachableTarget[]> {
     // Targets endpoint is not part of the P1 scenario slice.
     return [];
@@ -147,6 +172,11 @@ export class AicooTransport extends HttpMessageTransport {
   ): Promise<CommunicationSession> {
     const row = await this.requestJson<CommRow>(`${LA}/grants`, { method: "POST", body: input });
     return mapCommSession(row);
+  }
+
+  override async listCommunicationSessions(): Promise<CommunicationSession[]> {
+    const rows = await this.requestJson<CommRow[]>(`${LA}/grants`);
+    return rows.map(mapCommSession);
   }
 
   override async acceptCommunicationSession(sessionId: string): Promise<CommunicationGrant> {
@@ -169,6 +199,10 @@ export class AicooTransport extends HttpMessageTransport {
       throw new ApiError(400, "unsupported", "human_inbox send is not supported by AicooTransport");
     }
     return this.requestJson(`${LA}/messages`, { method: "POST", body: input });
+  }
+
+  override async delegateLocalAgentTask(input: LocalAgentDelegationInput): Promise<LocalAgentDelegationResponse> {
+    return this.requestJson(`${LA}/delegations`, { method: "POST", body: input });
   }
 
   override async acknowledgeDelivery(input: DeliveryAckInput): Promise<void> {
@@ -236,6 +270,22 @@ export class AicooTransport extends HttpMessageTransport {
 
   async getToolApproval(approvalId: string): Promise<{ status: string; decision: "allow" | "deny" | null }> {
     return this.requestJson(`${LA}/tool-approvals/${encodeURIComponent(approvalId)}`);
+  }
+
+  override async getPairStatus(principalId: string): Promise<PairStatusResponse> {
+    return this.requestJson<PairStatusResponse>(`${LA}/pair-status?principalId=${encodeURIComponent(principalId)}`);
+  }
+
+  override async resolvePerson(query: string): Promise<ResolvedPersonResponse> {
+    return this.requestJson<ResolvedPersonResponse>(`${LA}/resolve-person?q=${encodeURIComponent(query)}`);
+  }
+
+  override async startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse> {
+    return this.requestJson<StartDeviceCodeResponse>(`${LA}/device-code/start`, { method: "POST", body: input });
+  }
+
+  override async pollDeviceCode(pollToken: string): Promise<PollDeviceCodeResponse> {
+    return this.requestJson<PollDeviceCodeResponse>(`${LA}/device-code/poll`, { method: "POST", body: { pollToken } });
   }
 }
 
@@ -338,6 +388,7 @@ const EVENT_TYPE_MAP: Record<string, RuntimeEvent["type"]> = {
   "grant.declined": "comm.declined",
   "grant.revoked": "comm.revoked",
   "message.dispatch": "message.dispatch",
+  "relationship.policy_update": "relationship.policy_update",
 };
 
 async function* parseSse(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<RuntimeEvent> {

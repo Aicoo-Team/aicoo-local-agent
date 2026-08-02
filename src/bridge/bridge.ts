@@ -1,6 +1,7 @@
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
 import { FakeRuntimeAdapter } from "../adapters/fake/fake-adapter.js";
-import type { RuntimeEvent } from "../shared/contracts.js";
+import { upsertRelationshipPreset, type RelationshipAccessPreset } from "../security/relationship-policy.js";
+import type { LocalAgentDelegationInput, LocalAgentDelegationResponse, RuntimeEvent } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
@@ -15,6 +16,7 @@ export interface BridgeOptions {
   adapterVersion?: string;
   heartbeatMs?: number;
   injectorMs?: number;
+  relationshipPolicyFile?: string;
   hooks?: InjectionHooks;
   log?: (line: string) => void;
 }
@@ -26,6 +28,7 @@ export class RuntimeBridge {
   #loops: Promise<void>[] = [];
   #injector?: Injector;
   #pendingDefaultRoute?: string;
+  #publishedDefaultRoute?: string;
 
   constructor(private readonly options: BridgeOptions) {}
 
@@ -37,7 +40,13 @@ export class RuntimeBridge {
     return this.options.spool.listSessionMappings();
   }
 
-  async start(): Promise<{ endpointId: string; sessions: Array<{ nativeHandle: string; serverHandle: string }>; defaultRoute?: string }> {
+  async start(): Promise<{
+    endpointId: string;
+    principalId: string;
+    deviceId: string;
+    sessions: Array<{ nativeHandle: string; serverHandle: string }>;
+    defaultRoute?: string;
+  }> {
     await this.options.adapter.initialize?.();
     const adapterCapabilities = await this.options.adapter.capabilities();
     const endpoint = await this.options.transport.registerEndpoint({
@@ -97,6 +106,7 @@ export class RuntimeBridge {
       this.runEvents(),
       this.runHeartbeat(),
       this.runInjector(),
+      this.runPendingDelegations(),
       this.runOutboundReplies(),
       ...this.options.spool.listSessionMappings().map(({ nativeHandle, serverHandle }) =>
         this.runAdapterEvents(nativeHandle, serverHandle)),
@@ -113,6 +123,8 @@ export class RuntimeBridge {
 
     return {
       endpointId: endpoint.endpointId,
+      principalId: endpoint.principalId,
+      deviceId: endpoint.deviceId,
       sessions: mappings.map(({ nativeHandle, serverHandle }) => ({ nativeHandle, serverHandle })),
       defaultRoute: this.#pendingDefaultRoute,
     };
@@ -131,10 +143,14 @@ export class RuntimeBridge {
   private async runEvents(): Promise<void> {
     const endpointId = this.requireEndpoint();
     const serverKey = this.options.spool.getIdentity("serverKey") ?? endpointId;
+    let reconnectDelayMs = 50;
+    let reconnectFailures = 0;
     while (!this.#controller.signal.aborted) {
       const cursor = this.options.spool.cursor(serverKey);
       try {
         for await (const event of this.options.transport.subscribeEvents(cursor, this.#controller.signal)) {
+          reconnectDelayMs = 50;
+          reconnectFailures = 0;
           try {
             await this.handleEvent(event);
           } catch (error) {
@@ -146,8 +162,20 @@ export class RuntimeBridge {
         }
       } catch (error) {
         if (!this.#controller.signal.aborted) {
-          this.options.log?.(`event stream reconnecting: ${String(error)}`);
-          await delay(50, this.#controller.signal);
+          if (error instanceof ApiError && error.status === 401) {
+            this.options.log?.("\n[bridge] Device token revoked or invalid (401 Unauthorized). Stopping bridge.");
+            this.options.log?.("Please run 'ccd login' to re-authenticate this machine.");
+            await this.stop();
+            return;
+          }
+          reconnectFailures += 1;
+          if (shouldLogReconnect(reconnectFailures)) {
+            this.options.log?.(
+              `event stream reconnecting after ${reconnectFailures} failed attempt(s); retrying in ${reconnectDelayMs}ms: ${String(error)}`,
+            );
+          }
+          await delay(reconnectDelayMs, this.#controller.signal);
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5_000);
         }
       }
     }
@@ -179,7 +207,22 @@ export class RuntimeBridge {
       }
     } else if (event.type === "comm.revoked") {
       const commSessionId = String(event.data.communicationSessionId ?? "");
-      if (commSessionId) this.options.spool.blockCommunicationSession(commSessionId, "communication_session_revoked");
+      if (commSessionId) {
+        this.options.spool.blockCommunicationSession(commSessionId, "communication_session_revoked", "revoked");
+        await this.options.adapter.releaseCommunicationSession?.(commSessionId);
+        const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
+        if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.#pendingDefaultRoute = sessionHandle;
+        this.options.spool.markDelegationsFailed(commSessionId, "communication_session_revoked");
+      }
+    } else if (event.type === "comm.expired") {
+      const commSessionId = String(event.data.communicationSessionId ?? "");
+      if (commSessionId) {
+        this.options.spool.blockCommunicationSession(commSessionId, "communication_session_expired", "expired");
+        await this.options.adapter.releaseCommunicationSession?.(commSessionId);
+        const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
+        if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.#pendingDefaultRoute = sessionHandle;
+        this.options.spool.markDelegationsFailed(commSessionId, "communication_session_expired");
+      }
     } else if (event.type === "comm.activated") {
       const commSessionId = String(event.data.communicationSessionId ?? "");
       if (commSessionId) this.options.spool.setGrant(
@@ -187,6 +230,44 @@ export class RuntimeBridge {
         "active",
         typeof event.data.grantExpiresAt === "string" ? event.data.grantExpiresAt : undefined,
       );
+      const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
+      if (sessionHandle && this.#serverToNative.has(sessionHandle)) {
+        const nativeHandle = this.#serverToNative.get(sessionHandle);
+        if (nativeHandle && commSessionId) {
+          await this.options.adapter.prepareCommunicationSession?.(nativeHandle, commSessionId);
+        }
+        this.rotateDefaultRouteAfterActivation(sessionHandle);
+      }
+      if (commSessionId) await this.retryPendingDelegations(commSessionId);
+    } else if (event.type === "relationship.policy_update") {
+      this.applyRelationshipPolicyUpdate(event.data);
+    }
+  }
+
+  private applyRelationshipPolicyUpdate(data: Record<string, unknown>): void {
+    if (!this.options.relationshipPolicyFile) {
+      this.options.log?.("relationship policy update ignored: no relationship policy file configured");
+      return;
+    }
+    const principalId = stringField(data, "requesterPrincipalId") ?? stringField(data, "principalId");
+    const deviceId = stringField(data, "requesterDeviceId") ?? stringField(data, "deviceId");
+    const preset = stringField(data, "access") ?? stringField(data, "preset");
+    const folder = stringField(data, "folderPath") ?? stringField(data, "folder");
+    if (!principalId || !deviceId || !isRelationshipAccessPreset(preset)) {
+      this.options.log?.("relationship policy update ignored: missing principalId, deviceId, or valid access preset");
+      return;
+    }
+    try {
+      upsertRelationshipPreset({
+        file: this.options.relationshipPolicyFile,
+        principalId,
+        deviceId,
+        preset,
+        ...(folder ? { folder } : {}),
+      });
+      this.options.log?.(`relationship policy updated for ${principalId} (${preset})`);
+    } catch (error) {
+      this.options.log?.(`relationship policy update failed: ${String(error)}`);
     }
   }
 
@@ -197,6 +278,12 @@ export class RuntimeBridge {
       try {
         await this.options.transport.heartbeatEndpoint(this.requireEndpoint());
       } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          this.options.log?.("\n[bridge] Device token revoked or invalid (401 Unauthorized). Stopping bridge.");
+          this.options.log?.("Please run 'ccd login' to re-authenticate this machine.");
+          await this.stop();
+          return;
+        }
         this.options.log?.(`heartbeat failed: ${String(error)}`);
       }
       // Publish the default route from here, not start(): by the first heartbeat the
@@ -206,6 +293,7 @@ export class RuntimeBridge {
         const handle = this.#pendingDefaultRoute;
         try {
           await this.options.transport.setDefaultRoute(this.requireEndpoint(), handle);
+          this.#publishedDefaultRoute = handle;
           this.#pendingDefaultRoute = undefined;
           this.options.log?.(`[bridge] default route -> ${handle}`);
         } catch (error) {
@@ -219,6 +307,59 @@ export class RuntimeBridge {
     while (!this.#controller.signal.aborted) {
       await this.#injector?.runOnce();
       await delay(this.options.injectorMs ?? 100, this.#controller.signal);
+    }
+  }
+
+  private async runPendingDelegations(): Promise<void> {
+    while (!this.#controller.signal.aborted) {
+      await this.retryPendingDelegations();
+      await delay(this.options.heartbeatMs ?? 20_000, this.#controller.signal);
+    }
+  }
+
+  private async retryPendingDelegations(commSessionId?: string): Promise<void> {
+    for (const pending of this.options.spool.listPendingDelegations(commSessionId)) {
+      if (Date.parse(pending.expiresAt) <= Date.now()) {
+        if (pending.communicationSessionId) {
+          this.options.spool.markDelegationsFailed(pending.communicationSessionId, "delegation_timeout");
+        } else {
+          this.options.spool.markDelegationAttempt(pending.clientMessageId, "delegation_timeout");
+        }
+        this.options.log?.(`delegation ${pending.clientMessageId} timed out before dispatch`);
+        continue;
+      }
+
+      try {
+        const result = await this.options.transport.delegateLocalAgentTask({
+          target: pending.target,
+          task: pending.task,
+          sessionHandle: pending.sessionHandle,
+          clientMessageId: pending.clientMessageId,
+          ...(pending.correlationId ? { correlationId: pending.correlationId } : {}),
+          ...(pending.requestedTtlMinutes ? { requestedTtlMinutes: pending.requestedTtlMinutes } : {}),
+        });
+        recordDelegationResult(this.options.spool, result, {
+          target: pending.target,
+          task: pending.task,
+          sessionHandle: pending.sessionHandle,
+          expiresAt: pending.expiresAt,
+          requestedTtlMinutes: pending.requestedTtlMinutes,
+        });
+      } catch (error) {
+        const terminal = error instanceof ApiError
+          && error.status >= 400
+          && error.status < 500
+          && error.status !== 408
+          && error.status !== 409
+          && error.status !== 429;
+        const message = error instanceof ApiError ? error.code : String(error);
+        if (terminal && pending.communicationSessionId) {
+          this.options.spool.markDelegationsFailed(pending.communicationSessionId, message);
+        } else {
+          this.options.spool.markDelegationAttempt(pending.clientMessageId, message);
+        }
+        if (terminal) this.options.log?.(`delegation ${pending.clientMessageId} failed: ${message}`);
+      }
     }
   }
 
@@ -307,6 +448,86 @@ export class RuntimeBridge {
     if (!this.#endpointId) throw new Error("Bridge is not started");
     return this.#endpointId;
   }
+
+  private rotateDefaultRouteAfterActivation(activatedServerHandle: string): void {
+    const currentDefault = this.#pendingDefaultRoute ?? this.#publishedDefaultRoute;
+    if (currentDefault && currentDefault !== activatedServerHandle) return;
+    const replacement = this.options.spool.listSessionMappings()
+      .map((mapping) => mapping.serverHandle)
+      .find((serverHandle) => serverHandle !== activatedServerHandle);
+    if (replacement) this.#pendingDefaultRoute = replacement;
+  }
+}
+
+export async function requestRuntimeDelegation(input: {
+  transport: BridgeOptions["transport"];
+  spool: BridgeSpool;
+  target: LocalAgentDelegationInput["target"];
+  task: LocalAgentDelegationInput["task"];
+  sessionHandle: string;
+  clientMessageId: string;
+  correlationId?: string;
+  requestedTtlMinutes?: number;
+  timeoutMs?: number;
+}): Promise<LocalAgentDelegationResponse> {
+  const expiresAt = new Date(Date.now() + (input.timeoutMs ?? 30 * 60_000)).toISOString();
+  const result = await input.transport.delegateLocalAgentTask({
+    target: input.target,
+    task: input.task,
+    sessionHandle: input.sessionHandle,
+    clientMessageId: input.clientMessageId,
+    ...(input.correlationId ? { correlationId: input.correlationId } : {}),
+    ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
+  });
+  recordDelegationResult(input.spool, result, {
+    target: input.target,
+    task: input.task,
+    sessionHandle: input.sessionHandle,
+    expiresAt,
+    requestedTtlMinutes: input.requestedTtlMinutes,
+  });
+  return result;
+}
+
+function recordDelegationResult(
+  spool: BridgeSpool,
+  result: LocalAgentDelegationResponse,
+  input: {
+    target: LocalAgentDelegationInput["target"];
+    task: LocalAgentDelegationInput["task"];
+    sessionHandle: string;
+    expiresAt: string;
+    requestedTtlMinutes?: number;
+  },
+): void {
+  if (result.status === "delegated") {
+    spool.storePendingDelegation({
+      clientMessageId: result.clientMessageId,
+      target: input.target,
+      task: input.task,
+      sessionHandle: input.sessionHandle,
+      ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+      ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
+      communicationSessionId: result.communicationSession.id,
+      messageId: result.receipt.messageId,
+      status: "delegated",
+      expiresAt: input.expiresAt,
+    });
+    spool.markDelegationDelegated(result.clientMessageId, result.receipt.messageId, result.communicationSession.id);
+    return;
+  }
+
+  spool.storePendingDelegation({
+    clientMessageId: result.clientMessageId,
+    target: input.target,
+    task: input.task,
+    sessionHandle: input.sessionHandle,
+    ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+    ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
+    communicationSessionId: result.communicationSession.id,
+    status: "grant_requested",
+    expiresAt: input.expiresAt,
+  });
 }
 
 function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -318,4 +539,17 @@ function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
       resolve();
     }, { once: true });
   });
+}
+
+function shouldLogReconnect(failures: number): boolean {
+  return failures <= 3 || (failures & (failures - 1)) === 0;
+}
+
+function stringField(data: Record<string, unknown>, key: string): string | undefined {
+  const value = data[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isRelationshipAccessPreset(value: string | undefined): value is RelationshipAccessPreset {
+  return value === "chat-only" || value === "read-project" || value === "edit-project";
 }

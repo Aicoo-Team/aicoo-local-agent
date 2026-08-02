@@ -46,6 +46,52 @@ describe("communication-session lifecycle", () => {
     expect((await api(app, TOKENS.c, `/api/v1/comm-sessions/${request.body.id}/accept`, "POST")).response.status).toBe(404);
   });
 
+  it("rejects a second active grant for the same frozen recipient runtime session", async () => {
+    const { a, b } = await activateDefaultGrant(app);
+    const request = await api<{ id: string }>(app, TOKENS.a, "/api/v1/comm-sessions", "POST", {
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      replyEndpointId: a.endpoint.endpointId,
+      replySessionHandle: a.session.sessionHandle,
+      requestedTtlMinutes: 30,
+    });
+    expect(request.response.status).toBe(201);
+
+    const accepted = await api<{ error: { code: string } }>(
+      app,
+      TOKENS.b,
+      `/api/v1/comm-sessions/${request.body.id}/accept`,
+      "POST",
+    );
+
+    expect(accepted.response.status).toBe(409);
+    expect(accepted.body.error.code).toBe("runtime_session_already_granted");
+    const currentRoute = await api(app, TOKENS.b, "/api/v1/default-route");
+    expect(currentRoute.body).toMatchObject({
+      endpointId: b.endpoint.endpointId,
+      sessionHandle: b.session.sessionHandle,
+    });
+  });
+
+  it("expires stale active grants on the same route before accepting a new one", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T00:00:00.000Z"));
+    const { a, commSessionId } = await activateDefaultGrant(app);
+    vi.setSystemTime(new Date("2026-07-16T00:31:00.000Z"));
+    const request = await api<{ id: string }>(app, TOKENS.a, "/api/v1/comm-sessions", "POST", {
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      replyEndpointId: a.endpoint.endpointId,
+      replySessionHandle: a.session.sessionHandle,
+      requestedTtlMinutes: 30,
+    });
+    expect(request.response.status).toBe(201);
+
+    const accepted = await api(app, TOKENS.b, `/api/v1/comm-sessions/${request.body.id}/accept`, "POST");
+
+    expect(accepted.response.status).toBe(200);
+    const old = await api<CommunicationSession>(app, TOKENS.a, `/api/v1/comm-sessions/${commSessionId}`);
+    expect(old.body.status).toBe("expired");
+  });
+
   it("expires from server time and cannot be reactivated", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-16T00:00:00.000Z"));
