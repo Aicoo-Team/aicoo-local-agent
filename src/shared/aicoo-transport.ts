@@ -9,6 +9,7 @@ import {
   type StartDeviceCodeResponse,
   type PollDeviceCodeResponse,
 } from "./http-client.js";
+import { describeTimeoutTiming, startEventLoopMonitor } from "./event-loop.js";
 import type {
   CommunicationGrant,
   CommunicationSession,
@@ -68,6 +69,7 @@ export class AicooTransport extends HttpMessageTransport {
     this.#fetch = options.fetchImpl ?? fetch;
     this.#deviceId = options.deviceId?.trim() ?? "";
     this.#onTokenRefreshed = options.onTokenRefreshed;
+    startEventLoopMonitor();
   }
 
   #authToken(): string {
@@ -114,12 +116,16 @@ export class AicooTransport extends HttpMessageTransport {
     const method = options.method ?? "GET";
     const controller = new AbortController();
     // Abort WITH a reason. A bare abort() surfaces as "AbortError: This operation was aborted",
-    // which is indistinguishable from a cancellation and tells an operator nothing.
+    // which is indistinguishable from a cancellation and tells an operator nothing. The timing
+    // verdict is the part that matters: without it a blocked event loop and a slow server are
+    // the same log line, and the elapsed time reads the same in both cases.
+    const startedAt = performance.now();
     const timer = setTimeout(
       () =>
         controller.abort(
           new Error(
-            `request timed out after ${timeoutMs}ms (attempt ${attempt}/${attempts}): ${method} ${path}`,
+            `request timed out after ${timeoutMs}ms (attempt ${attempt}/${attempts}): ${method} ${path}` +
+              ` [${describeTimeoutTiming(performance.now() - startedAt, timeoutMs)}]`,
           ),
         ),
       timeoutMs,
