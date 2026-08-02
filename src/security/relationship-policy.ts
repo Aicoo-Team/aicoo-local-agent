@@ -41,6 +41,7 @@ interface CompiledRelationship {
 }
 
 const PATH_INPUTS = {
+  List: ["file_path"],
   Read: ["file_path"],
   Write: ["file_path"],
   Edit: ["file_path"],
@@ -74,8 +75,8 @@ const EXECUTION_ON_NEXT_USE_PATHS = new Set([
 
 const PRESET_TOOLS: Readonly<Record<RelationshipAccessPreset, readonly string[]>> = {
   "chat-only": [],
-  "read-project": ["Read"],
-  "edit-project": ["Read", "Write", "Edit"],
+  "read-project": ["List", "Read"],
+  "edit-project": ["List", "Read", "Write", "Edit"],
 };
 
 export const DEFAULT_RELATIONSHIP_POLICY_FILE = join(

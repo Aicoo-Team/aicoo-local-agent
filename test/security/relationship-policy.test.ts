@@ -137,6 +137,10 @@ describe("RelationshipPolicy", () => {
     });
     let permissions = RelationshipPolicy.fromFile(file, directory);
     expect(permissions.authorize(
+      { toolName: "List", input: { file_path: project } },
+      inbound(),
+    )).toMatchObject({ behavior: "allow" });
+    expect(permissions.authorize(
       { toolName: "Read", input: { file_path: join(project, "README.md") } },
       inbound(),
     )).toMatchObject({ behavior: "allow" });

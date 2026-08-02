@@ -98,6 +98,59 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[1]?.prompt).toContain("[Aicoo brokered file-operation results]");
   });
 
+  it("brokers Codex List through the shared relationship policy", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-list-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const source = join(project, "src");
+    const config = join(directory, "config");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(config);
+    writeFileSync(join(project, "README.md"), "# Demo\n", "utf8");
+    writeFileSync(join(source, "index.ts"), "export const ok = true;\n", "utf8");
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "read-project",
+      folder: project,
+    });
+    const driver = new FakeCodexDriver((prompt) => {
+      if (prompt.includes("[Aicoo brokered file-operation request]")) {
+        expect(prompt).toContain(`Approved folders:\n- ${realpathSync.native(project)}`);
+        return JSON.stringify({ operations: [{ tool: "List", file_path: "." }] });
+      }
+      expect(prompt).toContain("README.md");
+      expect(prompt).toContain("src/index.ts");
+      return "Accessible files include README.md and src/index.ts.";
+    });
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_list"), "queue")).status)
+      .toBe("runtime_acked");
+
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started", inReplyTo: "msg_list" }),
+      expect.objectContaining({
+        type: "reply",
+        payload: expect.objectContaining({
+          text: "Accessible files include README.md and src/index.ts.",
+          brokered: true,
+        }),
+      }),
+    ]);
+  });
+
   it("passes edit-project folders as Codex writable roots", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-writable-roots-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
