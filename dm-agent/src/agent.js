@@ -11,6 +11,9 @@ const KNOWN_TOOLS = [
 ];
 
 const TURN_TIMEOUT_MS = 240_000;
+// One tool call reaches the gate from both the PreToolUse hook and canUseTool;
+// this window makes the owner answer once, not twice.
+const DECISION_MEMO_MS = 120_000;
 
 function buildSystemPrompt({ ownerLabel, peerLabel }) {
   return `You are ${ownerLabel}'s local DM agent, answering Aicoo direct messages on their machine.
@@ -30,7 +33,7 @@ as the DM reply.`;
  * Resolve `candidate` against the workspace and require the real path (symlinks
  * resolved, including for not-yet-existing leaves) to stay inside it.
  */
-function insideWorkspace(candidate, workspaceReal) {
+export function insideWorkspace(candidate, workspaceReal) {
   const resolved = path.resolve(workspaceReal, String(candidate));
   let real;
   if (existsSync(resolved)) {
@@ -48,6 +51,8 @@ function insideWorkspace(candidate, workspaceReal) {
 }
 
 export class LocalDmAgent {
+  #decisions = new Map();
+
   constructor({ workspace, state, approvals, ownerLabel, peerLabel, model, log = console.log }) {
     this.workspace = realpathSync(workspace);
     this.state = state;
@@ -58,25 +63,66 @@ export class LocalDmAgent {
     this.log = log;
   }
 
+  /**
+   * The single decision point: tool allowlist -> workspace path wall -> owner approval.
+   *
+   * Reached from two places that must agree. Built-in permission rules auto-allow
+   * reads inside cwd, so canUseTool alone is never consulted for them — the
+   * PreToolUse hook is what makes the gate unconditional. Decisions are memoized
+   * briefly so one tool call asks the owner at most once.
+   */
+  async decide(toolName, rawInput) {
+    const input = rawInput && typeof rawInput === "object" ? rawInput : {};
+    const key = `${toolName}:${JSON.stringify(input)}`;
+    const memo = this.#decisions.get(key);
+    if (memo && memo.expiresAt > Date.now()) return memo.decision;
+
+    const decision = await this.#evaluate(toolName, input);
+    this.#decisions.set(key, { decision, expiresAt: Date.now() + DECISION_MEMO_MS });
+    return decision;
+  }
+
+  async #evaluate(toolName, input) {
+    if (!READ_TOOLS.includes(toolName)) {
+      return { allow: false, reason: `Tool ${toolName} is not available to the DM agent (read-only workspace access).` };
+    }
+    const target = input.file_path ?? input.path ?? ".";
+    if (!insideWorkspace(target, this.workspace)) {
+      this.log(`[gate] path outside workspace denied: ${toolName} ${target}`);
+      return { allow: false, reason: "Path is outside the shared workspace." };
+    }
+    if (typeof input.pattern === "string" && input.pattern.includes("..")) {
+      return { allow: false, reason: "Pattern traversal is not allowed." };
+    }
+    const summary = `${toolName}(${JSON.stringify(input).slice(0, 160)}) in ${this.workspace}`;
+    const allowed = await this.approvals.ask({ toolName, summary });
+    return allowed
+      ? { allow: true, reason: "The owner approved this tool call." }
+      : { allow: false, reason: "The owner declined this tool call." };
+  }
+
+  /** PreToolUse hook — fires for every tool call, including reads inside cwd. */
+  #hook() {
+    return async (hookInput) => {
+      const decision = await this.decide(hookInput.tool_name, hookInput.tool_input);
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: decision.allow ? "allow" : "deny",
+          permissionDecisionReason: decision.reason,
+        },
+      };
+    };
+  }
+
+  /** Second layer: still consulted for anything the permission system routes here. */
   #gate() {
     return async (toolName, input) => {
-      if (!READ_TOOLS.includes(toolName)) {
-        return { behavior: "deny", message: `Tool ${toolName} is not available to the DM agent (read-only workspace access).`, interrupt: false };
-      }
-      const target = input?.file_path ?? input?.path ?? ".";
-      if (!insideWorkspace(target, this.workspace)) {
-        this.log(`[gate] path outside workspace denied: ${toolName} ${target}`);
-        return { behavior: "deny", message: "Path is outside the shared workspace.", interrupt: false };
-      }
-      if (typeof input?.pattern === "string" && input.pattern.includes("..")) {
-        return { behavior: "deny", message: "Pattern traversal is not allowed.", interrupt: false };
-      }
-      const summary = `${toolName}(${JSON.stringify({ ...input }).slice(0, 160)}) in ${this.workspace}`;
-      const allowed = await this.approvals.ask({ toolName, summary });
-      if (!allowed) {
-        return { behavior: "deny", message: "The owner declined this tool call.", interrupt: false };
-      }
-      return { behavior: "allow", updatedInput: input };
+      const decision = await this.decide(toolName, input);
+      return decision.allow
+        ? { behavior: "allow", updatedInput: input }
+        : { behavior: "deny", message: decision.reason, interrupt: false };
     };
   }
 
@@ -92,7 +138,12 @@ export class LocalDmAgent {
       settingSources: [],
       mcpServers: {},
       strictMcpConfig: true,
-      permissionMode: "dontAsk",
+      // NOT "dontAsk": that mode resolves every permission itself (auto-allowing
+      // reads inside cwd, auto-denying the rest) and never calls out, which left
+      // the owner-approval gate dead. "default" keeps the permission flow live;
+      // the PreToolUse hook below is what makes it unconditional.
+      permissionMode: "default",
+      hooks: { PreToolUse: [{ hooks: [this.#hook()] }] },
       canUseTool: this.#gate(),
       extraArgs: { "safe-mode": null },
       env: { ...process.env, CLAUDE_AGENT_SDK_CLIENT_APP: "aicoo-dm-agent" },

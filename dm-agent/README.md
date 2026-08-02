@@ -39,6 +39,16 @@ node src/cli.js approve <id> --allow --peer <their-username>
 - **Hard walls under the approval**: only Read/Glob/Grep exist; every path is
   realpath-checked into `--workspace`; `..` patterns rejected; everything else
   (Bash/Write/Edit/Web/MCP) is disallowed at session launch, not just denied.
+  Out-of-workspace and non-read attempts are refused by the wall *without* waking
+  the owner — the prompt is reserved for calls that are actually in scope.
+- **Why a PreToolUse hook, not just `canUseTool`**: Claude Code's built-in rules
+  auto-allow reads inside `cwd`, so `canUseTool` is never consulted for them
+  (`permissionMode: "dontAsk"` goes further and resolves everything itself,
+  auto-allowing in-cwd reads and auto-denying the rest). Either way the approval
+  callback is dead code. The `PreToolUse` hook fires for **every** tool call
+  regardless of permission rules, so the gate lives there; `canUseTool` stays as
+  a second layer, and one shared memoized decision keeps the owner from being
+  asked twice for the same call.
 - **Untrusted framing**: inbound content is wrapped as untrusted external material;
   the session's system prompt forbids treating it as instructions.
 - **Loop safety**: replies go out via the API and are stored as `senderType: agent`;
