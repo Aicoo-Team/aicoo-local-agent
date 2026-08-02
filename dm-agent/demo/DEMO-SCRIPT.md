@@ -6,37 +6,63 @@
 
 ## The shape
 
-Not "my agent asks your agent." **I ask your agent, and it goes and works.**
+The point is not two agents chatting. It is that two agents hold **different permissions,
+tools, memory, and capabilities** — and can now collaborate without either side handing over
+the underlying data. Each runs on its owner's machine. Only the *result* crosses.
 
-A human types one sentence to a teammate's agent. That agent — running on the teammate's
-laptop, in the teammate's repo — does the actual investigation, asks its owner for
-permission at the moment it needs a file, and comes back with the answer.
-
-That reads as *delegation to a person's machine*, which is a thing no product does today.
-"Two agents talking" is abstract; "I told his laptop to go find out" is not.
+Of the five axes that make up that thesis — permission, tools, memory, delegation, network
+— this demo shows **memory**, because it is the one that is fully real today and the one
+that cannot be reduced to file transfer.
 
 ---
 
 ## The one sentence the demo must land
 
-> I can hand a task to my teammate's agent — on his laptop, in his repo — and he approves
-> what it touches, one file at a time.
+> I asked my teammate's agent what it knows about a project. It read its own memory, on his
+> laptop, with his approval — and sent me a conclusion. Not the file. Not the database. The
+> conclusion.
 
 ---
 
-## The task (pick one, keep it real)
+## Why this beats every file-reading demo
 
-Say the honest version out loud: the agent has **read access only**, to one folder its
-owner named. It investigates; it does not deploy.
+A file demo always invites: *"why not just send me the file?"*
 
-| Task | Why it demos well |
+Here there is no file to send. The answer is a **synthesis** of several private memory
+entries — the asker never sees the rest, and the owner never hands anything over. What
+crosses the wire is a sentence that did not exist until the question was asked.
+
+That is also the only honest way to show the thesis on camera: **data stays local,
+conclusions travel.**
+
+---
+
+## The task
+
+Point the agent's workspace at the owner's **agent memory directory**, not a repo:
+
+```bash
+--workspace ~/.claude/projects/<project>/memory
+```
+
+Then ask something that requires reading several entries and forming a judgement:
+
+| Task | What it proves |
 | --- | --- |
-| **"帮我确认一下你那边 auth 模块是怎么配的,我这边跑不通"** ⭐ | Multi-step: glob, grep, read several files, then a conclusion. Visibly *work*, not a fetch |
-| "看看你分支上有没有那个 5 秒超时的修复" | Short, crisp, a yes/no with evidence |
-| "把你那边的依赖版本跟我这份对一下" | Comparison; the answer needs both sides |
+| **"你的 agent 对 Pulse 这个项目积累了什么?给我一段摘要"** ⭐ | The answer is a synthesis of several private notes. There is no single file that is the answer |
+| "John 是谁?我们跟他之前聊到哪一步了" | Relationship memory — the thing people keep in their head and never write down anywhere shareable |
+| "你那边关于这个 bug 的结论是什么" | A conclusion, not a log |
 
-Do **not** stage the answer. Use a real difference in a real repo — if a viewer suspects a
-planted file, everything after that lands as theatre.
+Two rules:
+
+- **Never a repo.** Anything committed is already on GitHub, where the asker can read it
+  without interrupting anyone. Demo that and the approval reads as friction, not safety.
+- **Never staged.** Real memory, real answer. If a viewer suspects a planted file,
+  everything after that lands as theatre.
+
+### One test for any scenario you invent later
+
+**Could the answer have been sent as a file?** If yes, the demo argues against itself.
 
 ---
 
@@ -62,10 +88,11 @@ rm -f ~/.aicoo-dm-agent/www.aicoo.io/admin--waterdoog/state.json
 Run it in a **visible** terminal — the approval prompt is the demo:
 
 ```bash
-AICOO_TOKEN=<their_key> node src/cli.js start --peer <you> --workspace ./demo-workspace
+AICOO_TOKEN=<their_key> node src/cli.js start --peer <you> --workspace ~/.claude/projects/<project>/memory
 ```
 
 - [ ] Fresh session — a resumed one already knows the answer and **skips the approval**
+- [ ] The memory directory has real entries the answer must be assembled from
 - [ ] Terminal font 18pt+
 - [ ] One dry run before recording
 
@@ -73,10 +100,10 @@ AICOO_TOKEN=<their_key> node src/cli.js start --peer <you> --workspace ./demo-wo
 
 ## The three beats
 
-### Beat 1 — hand over the task (0:00–0:20)
+### Beat 1 — ask his agent, not him (0:00–0:20)
 
-Type the task. Say: *"I'm not asking a person. I'm handing this to his agent, on his
-machine."*
+Type the question. Say: *"I'm not asking him. I'm asking his agent — the one that has been
+working alongside him all month and remembers things he never wrote down for me."*
 
 ### Beat 2 — his machine asks him (0:20–1:00) — **the hero shot**
 
@@ -85,17 +112,22 @@ The terminal wakes up and stops:
 ```
 == OWNER APPROVAL REQUIRED ==
    tool: Read
-   Read({"file_path":".../demo-workspace/..."})
+   Read({"file_path":".../memory/pulse-hotword-pipeline.md"})
    allow? [y/N]
 ```
 
 **Hold three seconds before typing `y`.** This frame goes in the deck.
 
-*"It stopped. It wants one file, and he decides — right now, for this call. Not a checkbox
-at install time."*
+*"His agent wants to open one memory entry. He decides — right now, for this question. Not
+a checkbox at install time."*
 
-Approve. It keeps working — more reads, each one asked for — then answers in the chat, with
-a **Local Agent** chip so it is never confused with the cloud agent's reply.
+Approve. It reads a second, then a third — **each one asked for separately** — and answers
+in the chat, tagged **Local Agent** so it is never confused with the cloud agent's reply.
+
+Then say the line the whole demo exists for:
+
+> *"He never sent me a file. I can't see his memory. What came back is a conclusion that
+> didn't exist until I asked."*
 
 ### Beat 3 — the refusal (1:00–1:30)
 
@@ -106,18 +138,37 @@ Two things happen, and **both** must be said:
 1. It refuses, and says authorization can only come from its owner.
 2. **His terminal stays silent.** No prompt appeared.
 
-*"Notice what did not happen: he was never asked. It's outside the shared folder, so it's
+*"Notice what did not happen: he was never asked. It's outside what he shared, so it's
 refused before a human is interrupted. Prompt injection doesn't get a vote."*
 
 Close on that. Do not add a fourth beat.
 
 ---
 
+## Where this goes (the slide after the demo — do not fake it live)
+
+Memory is one of five axes. Each is a different thing one agent has and another does not:
+
+| Axis | The ask | Status |
+| --- | --- | --- |
+| **Permission** | "Check your Gmail/Calendar for the thing we agreed" — without ever holding their credentials | Cloud-agent path exists today (agent permissions); local integrations not wired |
+| **Tools** | "Your machine has the GPU / Docker / Browser MCP — run it there" | Needs write/exec through the same gate; read-only today |
+| **Memory** | "What do you know about John?" | **Demoed above** |
+| **Delegation** | "Take this research task and come back with a result" | Investigation-shaped tasks work today; execution does not |
+| **Network** | After the conference: who overlaps, who can warm-intro whom | Vision |
+
+The end state is not two laptops talking. It is a network of permissions, tools, memory and
+capabilities — where the unit of sharing is a **result**, not a database.
+
+---
+
 ## If someone asks "so it just reads files?"
 
-Today, yes — read-only, one folder, every call approved. That is the deliberate first
-setting, and the same gate is what write access would flow through. The hard part was never
-running the tool; it was making a human's authorization real at the moment of access.
+Reading is how it *reaches* memory; it is not what crosses. What crosses is a conclusion.
+And yes — today the gate allows read only, one folder, every call approved. That is the
+deliberate first setting, and it is the same gate every future capability flows through. The
+hard part was never running a tool; it was making a human's authorization real at the
+moment of access.
 
 ---
 
