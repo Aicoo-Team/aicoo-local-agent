@@ -2,7 +2,14 @@ import { randomUUID } from "node:crypto";
 import { chmodSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { DatabaseSync } from "node:sqlite";
-import type { Options, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  HookInput,
+  Options,
+  PreToolUseHookInput,
+  SDKMessage,
+  SDKUserMessage,
+  SyncHookJSONOutput,
+} from "@anthropic-ai/claude-agent-sdk";
 import { RelationshipPolicy } from "../../security/relationship-policy.js";
 import { awaitToolApproval, TurnApprovalCache, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
@@ -423,6 +430,67 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const writableFolders = policy?.writableFolders() ?? [];
     const denyRead = policy?.sandboxDenyReadPaths() ?? [];
     const denyWrite = policy?.sandboxDenyWritePaths() ?? [];
+
+    /**
+     * Relationship policy first; if the policy does not already cover the call, ask the
+     * owner. Shared by the PreToolUse hook and canUseTool so both paths decide identically.
+     */
+    const resolveToolDecision = async (
+      toolName: string,
+      input: Record<string, unknown>,
+    ): Promise<{ behavior: "allow" | "deny"; message?: string; updatedInput?: Record<string, unknown> }> => {
+      const activeMessage = session.acceptedTurns[0]?.message;
+      if (!this.#config.relationshipPolicyFile) {
+        return {
+          behavior: "deny",
+          message: `Aicoo managed session denies tool ${toolName}: no relationship policy is configured`,
+        };
+      }
+      try {
+        const relationshipPolicy = RelationshipPolicy.fromFile(this.#config.relationshipPolicyFile, this.#config.cwd);
+        const decision = relationshipPolicy.authorize({ toolName, input }, activeMessage);
+        if (decision.behavior === "allow") {
+          this.#config.log?.(`claude tool allowed: ${toolName}`);
+          return { behavior: "allow", ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}) };
+        }
+        const gateway = this.#config.approvalGateway;
+        const commSessionId = activeMessage?.communicationSessionId;
+        if (!gateway || !commSessionId) {
+          this.#config.log?.(`claude tool denied: ${toolName}: ${decision.message ?? "denied"}`);
+          return {
+            behavior: "deny",
+            message: decision.message ?? `Aicoo relationship policy denies tool ${toolName}`,
+          };
+        }
+
+        const summary = summarizeToolInput(toolName, input);
+        if (session.approvals.has(toolName, summary)) {
+          this.#config.log?.(`claude tool allowed by earlier approval this turn: ${toolName}`);
+          return { behavior: "allow" };
+        }
+
+        const outcome = await awaitToolApproval(
+          gateway,
+          {
+            communicationSessionId: commSessionId,
+            sessionHandle: session.localHandle,
+            ...(activeMessage?.id ? { messageId: activeMessage.id } : {}),
+            toolName,
+            toolInputSummary: summary,
+          },
+          { log: this.#config.log },
+        );
+        if (outcome.behavior === "allow") {
+          session.approvals.remember(toolName, summary);
+          return { behavior: "allow" };
+        }
+        return { behavior: "deny", message: outcome.message };
+      } catch (error) {
+        this.#config.log?.(`claude relationship policy could not be loaded; denying tool ${toolName}: ${String(error)}`);
+        return { behavior: "deny", message: "Aicoo relationship policy could not be loaded" };
+      }
+    };
+
     const options: Options = {
       cwd: this.#config.cwd,
       abortController: session.abortController,
@@ -444,7 +512,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       settingSources: [],
       mcpServers: {},
       strictMcpConfig: true,
-      permissionMode: "dontAsk",
+      // NOT "dontAsk": that mode resolves every permission internally — auto-allowing reads
+      // inside cwd and auto-denying everything else — and never calls out, so neither the
+      // hook's decision nor canUseTool would be consulted for the common case.
+      permissionMode: "default",
       sandbox: {
         enabled: true,
         failIfUnavailable: true,
@@ -456,68 +527,42 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           ...(denyWrite.length > 0 ? { denyWrite } : {}),
         },
       },
-      canUseTool: async (toolName, input) => {
-        const activeMessage = session.acceptedTurns[0]?.message;
-        if (!this.#config.relationshipPolicyFile) {
-          return {
-            behavior: "deny" as const,
-            message: `Aicoo managed session denies tool ${toolName}: no relationship policy is configured`,
-            interrupt: false,
-          };
-        }
-        try {
-          const policy = RelationshipPolicy.fromFile(this.#config.relationshipPolicyFile, this.#config.cwd);
-          const decision = policy.authorize({ toolName, input }, activeMessage);
-          if (decision.behavior === "allow") {
-            this.#config.log?.(`claude tool allowed: ${toolName}`);
+      // The gate lives in a PreToolUse hook, not only in canUseTool, because Claude Code's
+      // built-in rules auto-allow reads inside cwd and never consult canUseTool for them —
+      // a peer reading the shared workspace would bypass both the relationship policy and
+      // the owner prompt. Hooks fire for every tool call regardless of those rules.
+      // canUseTool stays as a second layer; `session.approvals` keeps the owner from being
+      // asked twice for the same call.
+      hooks: {
+        PreToolUse: [{
+          hooks: [async (hookInput: HookInput): Promise<SyncHookJSONOutput> => {
+            const preToolUse = hookInput as PreToolUseHookInput;
+            const decision = await resolveToolDecision(
+              preToolUse.tool_name,
+              (preToolUse.tool_input ?? {}) as Record<string, unknown>,
+            );
             return {
-              behavior: "allow" as const,
-              ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}),
+              continue: true,
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: decision.behavior === "allow" ? "allow" : "deny",
+                ...(decision.behavior === "deny" && decision.message
+                  ? { permissionDecisionReason: decision.message }
+                  : {}),
+              },
             };
-          }
-          // Policy does not already cover this call. Rather than refusing something the owner
-          // would probably have allowed, ask them — canUseTool is async, so the turn simply waits.
-          const gateway = this.#config.approvalGateway;
-          const commSessionId = activeMessage?.communicationSessionId;
-          if (!gateway || !commSessionId) {
-            this.#config.log?.(`claude tool denied: ${toolName}: ${decision.message ?? "denied"}`);
-            return {
+          }],
+        }],
+      },
+      canUseTool: async (toolName, input) => {
+        const decision = await resolveToolDecision(toolName, input);
+        return decision.behavior === "allow"
+          ? { behavior: "allow" as const, ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}) }
+          : {
               behavior: "deny" as const,
-              message: decision.message ?? `Aicoo relationship policy denies tool ${toolName}`,
+              message: decision.message ?? `Aicoo managed session denies tool ${toolName}`,
               interrupt: false,
             };
-          }
-
-          const summary = summarizeToolInput(toolName, input);
-          if (session.approvals.has(toolName, summary)) {
-            this.#config.log?.(`claude tool allowed by earlier approval this turn: ${toolName}`);
-            return { behavior: "allow" as const };
-          }
-
-          const outcome = await awaitToolApproval(
-            gateway,
-            {
-              communicationSessionId: commSessionId,
-              sessionHandle: session.localHandle,
-              ...(activeMessage?.id ? { messageId: activeMessage.id } : {}),
-              toolName,
-              toolInputSummary: summary,
-            },
-            { log: this.#config.log },
-          );
-          if (outcome.behavior === "allow") {
-            session.approvals.remember(toolName, summary);
-            return { behavior: "allow" as const };
-          }
-          return { behavior: "deny" as const, message: outcome.message, interrupt: false };
-        } catch (error) {
-          this.#config.log?.(`claude relationship policy could not be loaded; denying tool ${toolName}: ${String(error)}`);
-          return {
-            behavior: "deny" as const,
-            message: "Aicoo relationship policy could not be loaded",
-            interrupt: false,
-          };
-        }
       },
       extraArgs: {
         "safe-mode": null,
