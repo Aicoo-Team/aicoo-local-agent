@@ -10,7 +10,10 @@ const KNOWN_TOOLS = [
   "Agent", "Task", "NotebookEdit", "Mcp", "Skill", "AskUserQuestion",
 ];
 
-const TURN_TIMEOUT_MS = 240_000;
+// Idle timeout, not total elapsed: waiting on the owner is progress, not a stall.
+// A total-elapsed cap shorter than the approval window kills turns the owner is
+// still deciding on, and the peer sees "denied" for a decision never made.
+const TURN_IDLE_TIMEOUT_MS = 240_000;
 // One tool call reaches the gate from both the PreToolUse hook and canUseTool;
 // this window makes the owner answer once, not twice.
 const DECISION_MEMO_MS = 120_000;
@@ -52,6 +55,8 @@ export function insideWorkspace(candidate, workspaceReal) {
 
 export class LocalDmAgent {
   #decisions = new Map();
+  /** Set while a turn is in flight; refreshes that turn's idle timer. */
+  #keepAlive = null;
 
   constructor({ workspace, state, approvals, ownerLabel, peerLabel, model, log = console.log }) {
     this.workspace = realpathSync(workspace);
@@ -79,6 +84,9 @@ export class LocalDmAgent {
 
     const decision = await this.#evaluate(toolName, input);
     this.#decisions.set(key, { decision, expiresAt: Date.now() + DECISION_MEMO_MS });
+    // An owner decision — however long it took — is progress: restart the idle clock
+    // so a slow approval never causes the turn to be killed mid-flight.
+    this.#keepAlive?.();
     return decision;
   }
 
@@ -179,7 +187,11 @@ Compose the reply to send back now.`;
 
   async #runOnce(prompt) {
     const abortController = new AbortController();
-    const timer = setTimeout(() => abortController.abort(), TURN_TIMEOUT_MS);
+    let timer = setTimeout(() => abortController.abort(), TURN_IDLE_TIMEOUT_MS);
+    this.#keepAlive = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => abortController.abort(), TURN_IDLE_TIMEOUT_MS);
+    };
     try {
       const run = query({ prompt, options: this.#options(abortController) });
       let resultText = null;
@@ -199,6 +211,7 @@ Compose the reply to send back now.`;
       return reply.trim();
     } finally {
       clearTimeout(timer);
+      this.#keepAlive = null;
     }
   }
 }

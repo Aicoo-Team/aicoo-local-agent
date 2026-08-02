@@ -235,7 +235,11 @@ async function main() {
               ? await codex.runTurn(inbound)
               : await agent.runTurn(inbound);
           log(`reply for #${message.id}: ${reply.slice(0, 120).replace(/\s+/g, " ")}`);
-          await api.withRetry(() => api.sendHuman(peer, reply, `dm-agent:${me.userId}:${message.id}`));
+          // The peer's thread also receives answers from Aicoo's cloud agent, which
+          // replies to the same message within seconds and has no access to this
+          // machine. Prefix ours so the two are never confused in the app.
+          const tagged = args["no-tag"] ? reply : `${args.tag ?? "🖥️ [本地 agent]"} ${reply}`;
+          await api.withRetry(() => api.sendHuman(peer, tagged, `dm-agent:${me.userId}:${message.id}`));
           state.setCursor(conv.conversationId, Number(message.id));
           log(`reply sent for #${message.id}`);
         }
