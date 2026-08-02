@@ -115,45 +115,66 @@ npm run ccd -- --server http://127.0.0.1:7790 --token <token> connect list
 
 `serve` bundles into the CLI too: `npm run ccd -- serve` starts the same mock control plane.
 
-## Connect to the hosted Aicoo service
+## Setup Guide
 
-The steps above use the local reference control plane. For the hosted Aicoo service, the owner-facing
-flow hides endpoint IDs, session handles, spool files, and communication IDs.
+Follow these three steps to connect your local coding agent and start collaborating.
 
-```bash
-export CCD_TOKEN=<aicoo_sk_...>
-npm run ccd -- start
-```
+Use this guide when the Aicoo app asks you to set up local-agent collaboration.
+Run the commands on the same machine where Claude Code or Codex can access the
+workspace you want to use. The app is the human collaboration surface; this
+package is the local bridge that keeps your coding agent reachable from Aicoo.
 
-Product is the default hosted target. To use preview, set `CCD_SERVER_URL`:
+**1. Log in your device**
 
-```bash
-export CCD_SERVER_URL=https://www.yourcoo.ai
-export CCD_TOKEN=<preview_aicoo_sk_...>
-npm run ccd -- start
-```
-
-The command starts a text-only Codex bridge by default, persists local bridge state under
-`~/.aicoo/local-agent/`, auto-generates a stable `deviceId`, publishes a default route, and prints
-your `principalId`.
-
-On the other machine:
+Run the local-agent login command in your terminal, then approve the device code in Aicoo:
 
 ```bash
-export CCD_TOKEN=<other_user_aicoo_sk_...>
-npm run ccd -- start
+npx @aicoo/local-agent login
 ```
 
-Then connect and message:
+This links your machine to your Aicoo account. Your coding agent stays on your device; Aicoo
+handles identity, grants, routing, delivery state, and revocation.
+
+After login, the CLI stores a local device credential under `~/.aicoo/local-agent/`.
+You only need to repeat this step when setting up another machine or re-authenticating.
+
+**2. Choose your runtime adapter**
+
+Start your local bridge with Claude Code or Codex:
 
 ```bash
-npm run ccd -- connect <other-principal-id>
-npm run ccd -- send-to <other-principal-id> "hello"
+ccd start --adapter claude-code
 ```
 
-The recipient accepts from Aicoo's UI. If the UI is unavailable during local testing, they can run
-`npm run ccd -- accept` as a CLI fallback. `send-to` waits for runtime acknowledgement by default;
-use `--no-watch` for fire-and-forget.
+```bash
+ccd start --adapter codex
+```
+
+The bridge registers your local runtime as reachable. It does not give teammates access to your
+files or tools unless you approve a relationship access preset and folder.
+
+Keep this process running while you want your local agent to receive requests.
+Use `claude-code` when Claude Code is the local runtime you want to expose, or
+`codex` when Codex should answer.
+
+**3. Collaborate with teammates**
+
+Open a DM with any teammate in Aicoo and click **Collaborate** to pair your agents.
+
+Aicoo relays between both local runtimes:
+
+```text
+your local Codex/Claude <-> Aicoo <-> their local Codex/Claude
+```
+
+If the UI is unavailable during local testing, the recipient can run `ccd accept` as a CLI
+fallback, and the sender can run `ccd connect <principal-id>` plus `ccd send-to <principal-id>
+"hello"`. `send-to` waits for runtime acknowledgement by default; use `--no-watch` for
+fire-and-forget.
+
+When a teammate sends a request, their local agent is the peer. Aicoo only
+relays the request to your local bridge and enforces the active grant. The
+incoming text is still treated as untrusted external content by your runtime.
 
 The lower-level commands remain available for debugging and self-hosted control planes:
 `bridge`, `connect request`, `connect accept <comm-id>`, and `send --comm-session <comm-id>`.
@@ -162,10 +183,11 @@ reference server you can self-host**.
 
 ### Optional relationship permissions
 
-Claude Code and Codex receivers are text-only. The CLI can record a verified
-user+device relationship with `--access chat-only`, but tool-capable presets
-are disabled until each relationship runs in its own OS sandbox. This avoids
-presenting a JSON/path allowlist as a filesystem security boundary.
+Receivers are chat-only by default. The owner can approve a verified peer device
+for `chat-only`, `read-project`, or `edit-project` access. Claude Code enforces
+allowed file operations per tool call; Codex uses the local bridge broker for
+allowed `Read`, `Write`, and `Edit` operations. Shell, network, browser, Git,
+package-manager, MCP, and delegated tools remain unsupported.
 See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
 
 ## Develop

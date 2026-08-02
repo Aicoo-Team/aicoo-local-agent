@@ -1,10 +1,37 @@
-# Relationship-based access
+# Peer local-agent access
 
-The live bridge is text-only for both Claude Code and Codex. A relationship
-matches identity derived by the control plane from authentication — never
-user-provided identity fields in the message body.
+The live bridge connects one person's local Codex or Claude Code session to
+another person's local Codex or Claude Code session through Aicoo. Aicoo is the
+relay, identity, grants, routing, delivery-state, and revocation layer; it is
+not the requesting agent.
 
-## Simple onboarding flow
+The receiving bridge is chat-only by default. A relationship matches identity
+derived by the control plane from authentication, never user-provided identity
+fields in the message body.
+
+Claude Code can optionally expose a narrow file-tool set for a verified
+user+device relationship. Codex supports the same file presets through a
+bridge-side broker: Codex plans structured file operations, and the bridge
+validates and executes only allowed `Read`, `Write`, and `Edit` operations.
+
+## Main app setup flow
+
+In the hosted app, the owner-facing flow is:
+
+1. Run `npx @aicoo/local-agent login`, open `/local-agent/device-code`, and
+   approve the device code.
+2. Start a local runtime bridge with `ccd start --adapter claude-code` or
+   `ccd start --adapter codex`.
+3. Open a teammate DM in Aicoo and click **Collaborate** to pair the two local
+   agents.
+
+Aicoo relays messages between both local runtimes:
+
+```text
+your local Codex/Claude <-> Aicoo <-> their local Codex/Claude
+```
+
+## CLI policy flow
 
 Start the receiving bridge. By default, its relationship policy is outside the
 workspace at `~/.aicoo/local-agent/relationships.json`:
@@ -23,29 +50,45 @@ npm run bridge -- \
   --spool me.spool
 ```
 
-Accept a relationship normally, or record the explicit chat-only policy:
+Accept a relationship normally, record the explicit chat-only policy, or grant
+file-tool access for one folder:
 
 ```bash
 npm run ccd -- connect accept <comm-id> \
   --access chat-only
+
+npm run ccd -- connect accept <comm-id> \
+  --access read-project \
+  --folder /path/to/project
+
+npm run ccd -- connect accept <comm-id> \
+  --access edit-project \
+  --folder /path/to/project
 ```
 
-The CLI gets the requester's verified user and device IDs from the accepted
-grant and writes the local policy automatically. Automatic agent-to-agent text
-replies are unchanged.
+The CLI gets the peer's verified user and device IDs from the accepted grant
+and writes the local policy automatically. Automatic local-agent-to-local-agent
+text replies are unchanged.
 
-## Tool-access security hold
+## Tool Access
 
-`read-project` and `edit-project` are not exposed by the CLI and neither live
-adapter activates policy tools. They must remain disabled until the runtime
-provides:
+- `chat-only` lets the peer's local agent send messages, with no file/tool access.
+- `read-project` lets the peer's local agent request reads through Aicoo, limited
+  to the approved folder.
+- `edit-project` lets the peer's local agent request reads, writes, and edits
+  through Aicoo, limited to the approved folder.
+- `--folder` is required for `read-project` and `edit-project`.
 
-- multiple simultaneous relationship-isolated runtime sessions;
-- an OS-enforced filesystem sandbox for the granted folder;
-- grant expiry/revocation binding and an owner-visible audit trail.
+Claude Code exposes the supported tools to the managed session, but every tool
+call goes through the local relationship policy before execution. The policy is
+reloaded on each tool request, matches the active message's verified
+`senderPrincipalId` and `senderDeviceId`, canonicalizes literal file paths, and
+passes forward only the canonical authorized path.
 
-The dormant policy engine is still fail-closed and adversarially tested so it
-can be reused beneath that future sandbox.
+Codex does not receive direct filesystem tools. For relationships with file
+access, it first returns structured broker requests. The bridge validates each
+request with the same policy and performs only authorized operations, then gives
+Codex the broker results for the final text reply.
 
 ## Policy file format
 
@@ -58,8 +101,8 @@ The generated file is ordinary JSON for auditability and advanced editing:
     {
       "principalId": "USER_UUID",
       "deviceId": "VERIFIED_DEVICE_ID",
-      "tools": [],
-      "folders": []
+      "tools": ["Read"],
+      "folders": ["/path/to/project"]
     }
   ]
 }
@@ -72,7 +115,7 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 
 - Both `principalId` and `deviceId` must match exactly.
 - Unknown, MCP, shell, delegation, web, Glob, and Grep tools deny by default.
-- The dormant path gate recognizes only `Read`, `Write`, and `Edit`.
+- The path gate recognizes only `Read`, `Write`, and `Edit`.
 - Literal paths are resolved through the filesystem before containment checks;
   the canonical authorized path is also the path passed forward for execution.
 - A policy inside a granted folder is rejected, and the policy itself cannot be
@@ -82,7 +125,11 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 - Each Claude conversation and Codex thread binds to one communication session,
   rejects messages from a different relationship, and is released when that
   communication session is revoked or expired.
-- Live Claude and Codex adapters expose no relationship-policy tools.
+- Claude Code exposes only `Read`, `Write`, and `Edit` and denies every call
+  that the relationship policy does not explicitly allow.
+- Codex exposes no direct relationship-policy tools; the bridge broker executes
+  only policy-authorized `Read`, `Write`, and `Edit` requests. Shell, network,
+  MCP, browser, Git, and package-manager actions remain unsupported.
 
 The hosted control plane must include `senderDeviceId` in dispatch envelopes,
 and `requesterDeviceId` in grant responses, both derived from authenticated
