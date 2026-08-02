@@ -56,8 +56,8 @@ which aicoo-dm-agent
 
 Any output means you are set.
 
-> Don't want to type each step? `demo/SETUP-PROMPT.md` has a block you can paste into your
-> own Claude Code or Codex and it will do the first few steps for you.
+> Don't want to type each step? `demo/SETUP-PROMPT.en.md` has a block you can paste into
+> your own Claude Code or Codex and it will do the first few steps for you.
 
 ---
 
