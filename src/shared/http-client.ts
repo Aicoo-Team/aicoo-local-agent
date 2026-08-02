@@ -324,11 +324,20 @@ export class HttpMessageTransport implements MessageTransport {
   }
 
   private async throwApiError(response: Response): Promise<never> {
-    let body: unknown;
+    // Read the body exactly once. json() consumes the stream even when parsing fails, so the
+    // old json()-then-text() fallback threw "TypeError: Body is unusable" and replaced every
+    // non-JSON error response with that instead of the real status.
+    let body: unknown = "<error body could not be read>";
     try {
-      body = await response.json();
+      const raw = await response.text();
+      body = raw;
+      try {
+        if (raw) body = JSON.parse(raw);
+      } catch {
+        /* non-JSON error body — keep raw text */
+      }
     } catch {
-      body = await response.text();
+      /* body already consumed or stream failed — keep the placeholder */
     }
     const code = isErrorBody(body) ? body.error.code : "http_error";
     throw new ApiError(response.status, code, body);
