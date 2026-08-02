@@ -382,6 +382,7 @@ const EVENT_TYPE_MAP: Record<string, RuntimeEvent["type"]> = {
   "grant.declined": "comm.declined",
   "grant.revoked": "comm.revoked",
   "message.dispatch": "message.dispatch",
+  "relationship.policy_update": "relationship.policy_update",
 };
 
 async function* parseSse(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<RuntimeEvent> {

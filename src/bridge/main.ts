@@ -6,6 +6,7 @@ import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/selec
 import { DEFAULT_RELATIONSHIP_POLICY_FILE } from "../security/relationship-policy.js";
 import { makeTransport } from "../shared/aicoo-transport.js";
 import { RuntimeBridge } from "./bridge.js";
+import { startLocalHelper } from "./local-helper.js";
 import { BridgeSpool } from "./spool.js";
 
 /**
@@ -48,6 +49,9 @@ const program = new Command()
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
+  .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
+  .option("--no-local-helper", "disable the localhost folder/file picker helper")
   .option(
     "--relationship-policy <file>",
     "JSON allowlist of tools/folders for verified users and devices",
@@ -69,6 +73,9 @@ const options = program.opts<{
   claudePath?: string;
   codexState?: string;
   codexPath?: string;
+  localHelper: boolean;
+  localHelperPort: string;
+  localHelperHost: string;
   relationshipPolicy?: string;
   model?: string;
 }>();
@@ -95,8 +102,24 @@ const bridge = new RuntimeBridge({
   adapter: selected.adapter,
   adapterVersion: selected.adapterVersion,
   runtime: selected.runtime,
+  relationshipPolicyFile: options.relationshipPolicy,
   log: console.log,
 });
+let localHelper: ReturnType<typeof startLocalHelper> | undefined;
+if (options.localHelper) {
+  try {
+    localHelper = startLocalHelper({
+      hostname: options.localHelperHost,
+      port: Number.parseInt(options.localHelperPort, 10),
+      log: console.log,
+    });
+    localHelper?.on("listening", () => {
+      console.log(`[local-helper] listening on http://${options.localHelperHost}:${options.localHelperPort}`);
+    });
+  } catch (error) {
+    console.log(`[local-helper] not started: ${String(error)}`);
+  }
+}
 const started = await bridge.start();
 console.log(JSON.stringify({
   status: "ready",
@@ -108,6 +131,7 @@ console.log(JSON.stringify({
 
 async function shutdown() {
   await bridge.stop();
+  localHelper?.close();
   spool.close();
   process.exit(0);
 }

@@ -1,5 +1,6 @@
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
 import { FakeRuntimeAdapter } from "../adapters/fake/fake-adapter.js";
+import { upsertRelationshipPreset, type RelationshipAccessPreset } from "../security/relationship-policy.js";
 import type { RuntimeEvent } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
@@ -15,6 +16,7 @@ export interface BridgeOptions {
   adapterVersion?: string;
   heartbeatMs?: number;
   injectorMs?: number;
+  relationshipPolicyFile?: string;
   hooks?: InjectionHooks;
   log?: (line: string) => void;
 }
@@ -233,6 +235,35 @@ export class RuntimeBridge {
         }
         this.rotateDefaultRouteAfterActivation(sessionHandle);
       }
+    } else if (event.type === "relationship.policy_update") {
+      this.applyRelationshipPolicyUpdate(event.data);
+    }
+  }
+
+  private applyRelationshipPolicyUpdate(data: Record<string, unknown>): void {
+    if (!this.options.relationshipPolicyFile) {
+      this.options.log?.("relationship policy update ignored: no relationship policy file configured");
+      return;
+    }
+    const principalId = stringField(data, "requesterPrincipalId") ?? stringField(data, "principalId");
+    const deviceId = stringField(data, "requesterDeviceId") ?? stringField(data, "deviceId");
+    const preset = stringField(data, "access") ?? stringField(data, "preset");
+    const folder = stringField(data, "folderPath") ?? stringField(data, "folder");
+    if (!principalId || !deviceId || !isRelationshipAccessPreset(preset)) {
+      this.options.log?.("relationship policy update ignored: missing principalId, deviceId, or valid access preset");
+      return;
+    }
+    try {
+      upsertRelationshipPreset({
+        file: this.options.relationshipPolicyFile,
+        principalId,
+        deviceId,
+        preset,
+        ...(folder ? { folder } : {}),
+      });
+      this.options.log?.(`relationship policy updated for ${principalId} (${preset})`);
+    } catch (error) {
+      this.options.log?.(`relationship policy update failed: ${String(error)}`);
     }
   }
 
@@ -384,4 +415,13 @@ function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
 
 function shouldLogReconnect(failures: number): boolean {
   return failures <= 3 || (failures & (failures - 1)) === 0;
+}
+
+function stringField(data: Record<string, unknown>, key: string): string | undefined {
+  const value = data[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isRelationshipAccessPreset(value: string | undefined): value is RelationshipAccessPreset {
+  return value === "chat-only" || value === "read-project" || value === "edit-project";
 }

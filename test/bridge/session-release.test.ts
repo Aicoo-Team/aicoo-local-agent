@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { RuntimeAdapter } from "../../src/adapters/runtime-adapter.js";
 import { RuntimeBridge } from "../../src/bridge/bridge.js";
 import { BridgeSpool } from "../../src/bridge/spool.js";
@@ -79,9 +82,41 @@ describe("RuntimeBridge communication session release", () => {
     expect(attempts).toBe(4);
   });
 
+  it("applies relationship policy updates from the app", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-policy-update-"));
+    const policyFile = join(directory, "relationships.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const { bridge } = setup({ relationshipPolicyFile: policyFile });
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-1",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        access: "read-project",
+        folderPath: folder,
+      },
+    });
+
+    expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [realpathSync.native(folder)],
+      }],
+    });
+  });
+
   function setup(options?: {
     sessions?: Awaited<ReturnType<RuntimeAdapter["listSessions"]>>;
     transport?: HttpMessageTransport;
+    relationshipPolicyFile?: string;
   }): {
     bridge: RuntimeBridge;
     spool: BridgeSpool;
@@ -116,6 +151,7 @@ describe("RuntimeBridge communication session release", () => {
       adapter,
       heartbeatMs: 60_000,
       injectorMs: 60_000,
+      relationshipPolicyFile: options?.relationshipPolicyFile,
     });
     return { bridge, spool, adapter };
   }

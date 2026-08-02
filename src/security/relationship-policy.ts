@@ -140,7 +140,7 @@ export class RelationshipPolicy {
     for (const path of paths) {
       let candidate: string;
       try {
-        candidate = canonicalPath(toLiteralAbsolute(this.#cwd, path.value));
+        candidate = resolveRelationshipPath(this.#cwd, relationship.folders, path.value);
       } catch {
         return deny("Path could not be resolved safely");
       }
@@ -241,6 +241,17 @@ function canonicalPath(input: string): string {
 
 function toLiteralAbsolute(cwd: string, input: string): string {
   return isAbsolute(input) ? input : `${cwd}${sep}${input}`;
+}
+
+function resolveRelationshipPath(cwd: string, folders: readonly string[], input: string): string {
+  const cwdCandidate = canonicalPath(toLiteralAbsolute(cwd, input));
+  if (folders.some((folder) => isWithin(folder, cwdCandidate))) return cwdCandidate;
+  if (isAbsolute(input)) return cwdCandidate;
+  for (const folder of folders) {
+    const folderCandidate = canonicalPath(toLiteralAbsolute(folder, input));
+    if (isWithin(folder, folderCandidate)) return folderCandidate;
+  }
+  return cwdCandidate;
 }
 
 function isMissingPathError(error: unknown): boolean {

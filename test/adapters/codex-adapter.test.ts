@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -49,13 +49,64 @@ describe("CodexAdapter managed sessions", () => {
     expect(adapter.providerThreadId("codex-managed-1")).toMatch(/^fake-codex-thread-/);
   });
 
-  it("accepts the shared relationship policy flow but keeps Codex text-only", async () => {
+  it("brokers Codex Read through the shared relationship policy", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
     const config = join(directory, "config");
     mkdirSync(project);
     mkdirSync(config);
+    writeFileSync(join(project, "README.md"), "# Demo\n\nRun npm test.\n", "utf8");
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "read-project",
+      folder: project,
+    });
+    const driver = new FakeCodexDriver((prompt) => {
+      if (prompt.includes("[Aicoo brokered file-operation request]")) {
+        return JSON.stringify({ operations: [{ tool: "Read", file_path: "README.md" }] });
+      }
+      expect(prompt).toContain("# Demo\\n\\nRun npm test.");
+      return "README says to run npm test.";
+    });
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_policy"), "queue")).status)
+      .toBe("runtime_acked");
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started", inReplyTo: "msg_policy" }),
+      expect.objectContaining({
+        type: "reply",
+        inReplyTo: "msg_policy",
+        payload: expect.objectContaining({ text: "README says to run npm test.", provider: "codex", brokered: true }),
+      }),
+    ]);
+    expect(driver.turns[0]?.prompt).toContain("[Aicoo brokered file-operation request]");
+    expect(driver.turns[1]?.prompt).toContain("[Aicoo brokered file-operation results]");
+  });
+
+  it("denies brokered Codex file operations outside the granted folder", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-deny-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const outside = join(directory, "outside");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(outside);
+    mkdirSync(config);
+    writeFileSync(join(outside, "secret.txt"), "secret", "utf8");
     const policyFile = join(config, "relationships.json");
     upsertRelationshipPreset({
       file: policyFile,
@@ -64,25 +115,34 @@ describe("CodexAdapter managed sessions", () => {
       preset: "edit-project",
       folder: project,
     });
-    const logs: string[] = [];
-    const driver = new FakeCodexDriver("SAFE_REPLY");
+    const driver = new FakeCodexDriver((prompt) => {
+      if (prompt.includes("[Aicoo brokered file-operation request]")) {
+        return JSON.stringify({ operations: [{ tool: "Read", file_path: join(outside, "secret.txt") }] });
+      }
+      expect(prompt).toContain("Path is outside the folders allowed for this relationship");
+      return "Denied: outside the granted folder.";
+    });
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
       cwd: project,
       relationshipPolicyFile: policyFile,
       driver,
       turnAckTimeoutMs: 500,
-      log: (line) => logs.push(line),
     });
     cleanups.push(() => adapter.close());
 
     await adapter.initialize();
-    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_policy"), "queue")).status)
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_denied"), "queue")).status)
       .toBe("runtime_acked");
-    expect(driver.turns[0]?.prompt).toContain("Do not run commands, read or write files");
-    expect(logs).toContain(
-      "codex relationship requested tool access; continuing chat-only because Codex folder enforcement is not yet a security boundary",
-    );
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started", inReplyTo: "msg_denied" }),
+      expect.objectContaining({
+        type: "reply",
+        payload: expect.objectContaining({ text: "Denied: outside the granted folder.", brokered: true }),
+      }),
+    ]);
+    expect(readFileSync(join(outside, "secret.txt"), "utf8")).toBe("secret");
   });
 
   it("injects a remote reply as context-only and never emits an egress reply event for it", async () => {

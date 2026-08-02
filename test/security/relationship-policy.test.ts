@@ -63,6 +63,39 @@ describe("RelationshipPolicy", () => {
     )).toMatchObject({ behavior: "deny", message: expect.stringContaining("unavailable") });
   });
 
+  it("resolves relative paths against an approved folder", () => {
+    const directory = makeDirectory();
+    const workspace = join(directory, "workspace");
+    const allowed = join(directory, "approved");
+    const config = join(directory, "config");
+    mkdirSync(workspace);
+    mkdirSync(allowed);
+    mkdirSync(config);
+    writeFileSync(join(allowed, "README.md"), "approved readme");
+    const policy = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [allowed],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(policy, workspace);
+
+    expect(permissions.authorize(
+      { toolName: "Read", input: { file_path: "README.md" } },
+      inbound(),
+    )).toMatchObject({
+      behavior: "allow",
+      updatedInput: { file_path: join(realpathSync.native(allowed), "README.md") },
+    });
+    expect(permissions.authorize(
+      { toolName: "Read", input: { file_path: "../secret.txt" } },
+      inbound(),
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("outside") });
+  });
+
   it("keeps shell and delegation tools blocked because folders cannot scope them safely", () => {
     const directory = makeDirectory();
     const allowed = join(directory, "allowed");

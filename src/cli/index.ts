@@ -5,6 +5,7 @@ import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
 import { RuntimeBridge } from "../bridge/bridge.js";
+import { startLocalHelper } from "../bridge/local-helper.js";
 import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
@@ -122,6 +123,9 @@ program.command("bridge")
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
+  .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
+  .option("--no-local-helper", "disable the localhost folder/file picker helper")
   .option(
     "--relationship-policy <file>",
     "JSON allowlist of tools/folders for verified users and devices",
@@ -140,6 +144,9 @@ program.command("start")
   .option("--workspace <dir>", "managed-session workspace", process.cwd())
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
+  .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
+  .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
+  .option("--no-local-helper", "disable the localhost folder/file picker helper")
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
   .option("--json", "output raw JSON status blob", false)
   .action(async (options) => {
@@ -303,7 +310,7 @@ connect.command("accept")
         preset: options.access,
         ...(options.folder ? { folder: options.folder } : {}),
         policyFile: options.policy,
-        note: "Claude Code enforces this policy per tool call. Codex remains text-only until it has an enforceable tool gate.",
+        note: "Aicoo relays between local runtimes. Claude Code enforces this policy per tool call; Codex uses the local bridge broker for allowed file operations.",
       },
     });
   });
@@ -503,6 +510,9 @@ async function startBridge(options: {
   claudePath?: string;
   codexState?: string;
   codexPath?: string;
+  localHelper?: boolean;
+  localHelperPort?: string;
+  localHelperHost?: string;
   relationshipPolicy?: string;
   model?: string;
   hosted?: boolean;
@@ -532,8 +542,26 @@ async function startBridge(options: {
     adapter: selected.adapter,
     adapterVersion: selected.adapterVersion,
     runtime: selected.runtime,
+    relationshipPolicyFile: options.relationshipPolicy ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
     log: console.log,
   });
+  let localHelper: ReturnType<typeof startLocalHelper> | undefined;
+  if (options.localHelper ?? true) {
+    try {
+      const host = options.localHelperHost ?? "127.0.0.1";
+      const port = options.localHelperPort ?? "43177";
+      localHelper = startLocalHelper({
+        hostname: host,
+        port: Number.parseInt(port, 10),
+        log: console.log,
+      });
+      localHelper?.on("listening", () => {
+        console.log(`[local-helper] listening on http://${host}:${port}`);
+      });
+    } catch (error) {
+      console.log(`[local-helper] not started: ${String(error)}`);
+    }
+  }
   const started = await bridge.start();
   if (options.json) {
     console.log(JSON.stringify({
@@ -553,6 +581,7 @@ async function startBridge(options: {
   }
   const shutdown = async () => {
     await bridge.stop();
+    localHelper?.close();
     spool.close();
     process.exit(0);
   };
