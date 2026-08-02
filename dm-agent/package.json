@@ -1,0 +1,20 @@
+{
+  "name": "@aicoo/dm-agent",
+  "version": "0.1.0",
+  "description": "Chat-rails local agent for Aicoo: your peers DM you, your local agent answers — every tool call approved by you. No bridge, no grants, no parallel realtime stack.",
+  "type": "module",
+  "bin": {
+    "aicoo-dm-agent": "./src/cli.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.211"
+  },
+  "license": "Apache-2.0"
+}
