@@ -1,6 +1,6 @@
 ---
 name: aicoo-c2c
-description: Delegate work from this local Codex session to a peer local Codex or Claude through Aicoo relay and grants.
+description: "Use this instead of the root Aicoo agent skill whenever the user says local agent, local Codex, local Claude, bridge, c2c, or asks this Codex session to reach another person's local runtime. Delegate work from this local Codex session to a peer local Codex or Claude through Aicoo relay/grants using ccd delegate, not /agent/message."
 ---
 
 # Aicoo Local-To-Local Delegation
@@ -29,13 +29,13 @@ When the user asks to reach a peer local agent, run the repo-local CLI if the
 current working directory is this `aicoo-local-agent` checkout:
 
 ```bash
-CCD_SERVER_URL=<same-server-as-bridge> npm run ccd -- delegate --spool <same-spool-as-bridge> @username "task for the peer local agent"
+CCD_SERVER_URL=<same-server-as-bridge> npm run ccd -- delegate --wait --spool <same-spool-as-bridge> @username "task for the peer local agent"
 ```
 
 Otherwise run `ccd delegate` from the current shell:
 
 ```bash
-ccd delegate @username "task for the peer local agent"
+ccd delegate --wait @username "task for the peer local agent"
 ```
 
 Use the same `CCD_SERVER_URL` and `--spool` file as the running bridge, so the
@@ -50,12 +50,9 @@ If the command reports approval is needed, tell the user that the peer must
 approve in Aicoo and that this turn is parked. Do not poll or repeatedly post
 "still waiting" messages.
 
-If the command reports delegated, tell the user the task was sent and that the
-reply will arrive back in this local session. Stop the turn.
-
-When an Aicoo reply arrives later in this session, present the peer local
-agent's answer to the user. Do not send another reply back to the peer unless
-the user explicitly asks for a follow-up.
+If the command prints a peer reply, present that answer naturally to the user.
+If `--wait` times out, say the task was delegated but no reply arrived before
+the local timeout. Do not poll or repeatedly post "still waiting" messages.
 
 ## Safety
 

@@ -347,6 +347,7 @@ export class RuntimeBridge {
           target: pending.target,
           task: pending.task,
           sessionHandle: pending.sessionHandle,
+          clientMessageId: pending.clientMessageId,
           expiresAt: pending.expiresAt,
           requestedTtlMinutes: pending.requestedTtlMinutes,
         });
@@ -488,6 +489,7 @@ export async function requestRuntimeDelegation(input: {
     target: input.target,
     task: input.task,
     sessionHandle: input.sessionHandle,
+    clientMessageId: input.clientMessageId,
     expiresAt,
     requestedTtlMinutes: input.requestedTtlMinutes,
   });
@@ -501,38 +503,58 @@ function recordDelegationResult(
     target: LocalAgentDelegationInput["target"];
     task: LocalAgentDelegationInput["task"];
     sessionHandle: string;
+    clientMessageId: string;
     expiresAt: string;
     requestedTtlMinutes?: number;
   },
 ): void {
+  const communicationSessionId = delegationCommunicationSessionId(result);
+  const clientMessageId = result.clientMessageId ?? input.clientMessageId;
   if (result.status === "delegated") {
+    const receipt = delegationReceipt(result);
     spool.storePendingDelegation({
-      clientMessageId: result.clientMessageId,
+      clientMessageId,
       target: input.target,
       task: input.task,
       sessionHandle: input.sessionHandle,
       ...(result.correlationId ? { correlationId: result.correlationId } : {}),
       ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
-      communicationSessionId: result.communicationSession.id,
-      messageId: result.receipt.messageId,
+      communicationSessionId,
+      messageId: receipt.messageId,
       status: "delegated",
       expiresAt: input.expiresAt,
     });
-    spool.markDelegationDelegated(result.clientMessageId, result.receipt.messageId, result.communicationSession.id);
+    spool.markDelegationDelegated(clientMessageId, receipt.messageId, communicationSessionId);
     return;
   }
 
   spool.storePendingDelegation({
-    clientMessageId: result.clientMessageId,
+    clientMessageId,
     target: input.target,
     task: input.task,
     sessionHandle: input.sessionHandle,
     ...(result.correlationId ? { correlationId: result.correlationId } : {}),
     ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
-    communicationSessionId: result.communicationSession.id,
+    communicationSessionId,
     status: "grant_requested",
     expiresAt: input.expiresAt,
   });
+}
+
+function delegationCommunicationSessionId(result: LocalAgentDelegationResponse): string {
+  const compact = result as LocalAgentDelegationResponse & { communicationSessionId?: string };
+  const id = result.communicationSession?.id ?? compact.communicationSessionId;
+  if (!id) throw new Error("delegation response did not include a communication session id");
+  return id;
+}
+
+function delegationReceipt(result: Extract<LocalAgentDelegationResponse, { status: "delegated" }>): {
+  messageId: string;
+} {
+  const compact = result as Extract<LocalAgentDelegationResponse, { status: "delegated" }> & { messageId?: string };
+  const receipt = result.receipt ?? (compact.messageId ? { messageId: compact.messageId } : undefined);
+  if (!receipt?.messageId) throw new Error("delegation response did not include a message id");
+  return receipt;
 }
 
 function delay(milliseconds: number, signal: AbortSignal): Promise<void> {

@@ -37,6 +37,23 @@ describe("bearer token normalization", () => {
     const request = fetchMock.mock.calls[0]?.[1];
     expect(request?.headers).toMatchObject({ authorization: "Bearer aicoo_sk_example" });
   });
+
+  it("reads non-OK response bodies once before throwing API errors", async () => {
+    // Regression: failed localhost checks surfaced as "Body is unusable".
+    const fetchMock = vi.fn(async () =>
+      Response.json({ error: "invalid_device_token", message: "login again" }, { status: 401 }));
+    const transport = new HttpMessageTransport({
+      baseUrl: "http://localhost:3000",
+      token: "aicoo_sk_example",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.requestJson("/api/v1/whoami")).rejects.toMatchObject({
+      status: 401,
+      code: "invalid_device_token",
+      body: { error: "invalid_device_token", message: "login again" },
+    });
+  });
 });
 
 describe("hosted Aicoo transport", () => {
@@ -113,5 +130,43 @@ describe("hosted Aicoo transport", () => {
       value: { type: "relationship.policy_update", data: { access: "read-project" } },
       done: false,
     });
+  });
+
+  it("polls hosted inbox after restoring the bridge endpoint id", async () => {
+    // Regression: one-shot delegate commands could dispatch work but could not
+    // wait for replies because AicooTransport kept its hosted endpoint privately.
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      Response.json([
+        {
+          cursor: "10",
+          type: "message.dispatch",
+          endpointId: "ep-1",
+          createdAt: "2026-08-01T00:00:00.000Z",
+          data: { envelope: { id: "msg_reply", payload: { text: "hello" } } },
+        },
+        {
+          cursor: "11",
+          type: "grant.activated",
+          endpointId: "ep-1",
+          createdAt: "2026-08-01T00:00:01.000Z",
+          data: { communicationSessionId: "comm-1" },
+        },
+      ]));
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_sk_example",
+      deviceId: "device-1",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    transport.setEndpointId("ep-1");
+
+    await expect(transport.fetchInbox("9")).resolves.toMatchObject([
+      { cursor: "10", type: "message.dispatch" },
+      { cursor: "11", type: "comm.activated" },
+    ]);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "https://example.test/api/v1/local-realtime/poll?endpointId=ep-1&cursor=9",
+    );
   });
 });

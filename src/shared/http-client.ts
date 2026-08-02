@@ -324,13 +324,18 @@ export class HttpMessageTransport implements MessageTransport {
   }
 
   private async throwApiError(response: Response): Promise<never> {
-    let body: unknown;
+    const raw = await response.text();
+    let body: unknown = raw;
     try {
-      body = await response.json();
+      if (raw) body = JSON.parse(raw);
     } catch {
-      body = await response.text();
+      /* keep raw text */
     }
-    const code = isErrorBody(body) ? body.error.code : "http_error";
+    const code = isErrorBody(body)
+      ? body.error.code
+      : typeof body === "object" && body !== null && "error" in body
+        ? String((body as { error: unknown }).error)
+        : "http_error";
     throw new ApiError(response.status, code, body);
   }
 }

@@ -13,7 +13,7 @@ describe("Codex skill installer", () => {
     expect(result.overwritten).toBe(false);
     const installed = readFileSync(result.skillFile, "utf8");
     expect(installed).toMatch(/^---\nname: aicoo-c2c\n/s);
-    expect(installed).toContain("ccd delegate @username");
+    expect(installed).toContain("ccd delegate --wait @username");
     expect(installed).toContain("local Aicoo bridge <-> Aicoo relay");
   });
 

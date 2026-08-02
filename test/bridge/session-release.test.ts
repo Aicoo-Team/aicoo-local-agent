@@ -198,6 +198,69 @@ describe("RuntimeBridge communication session release", () => {
     }]);
   });
 
+  it("stores Pulse compact delegation responses without crashing", async () => {
+    const delegateLocalAgentTask = vi.fn(async () => ({
+      status: "grant_requested" as const,
+      communicationSessionId: "comm_waiting",
+      clientMessageId: "delegate_3",
+      correlationId: "corr_3",
+      duplicate: false,
+    }) as unknown as Awaited<ReturnType<HttpMessageTransport["delegateLocalAgentTask"]>>);
+    const spool = new BridgeSpool(":memory:");
+    cleanups.push(() => spool.close());
+
+    await expect(requestRuntimeDelegation({
+      transport: transport({ delegateLocalAgentTask }),
+      spool,
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      task: "Ask status",
+      sessionHandle: "server-session",
+      clientMessageId: "delegate_3",
+      correlationId: "corr_3",
+      timeoutMs: 60_000,
+    })).resolves.toMatchObject({
+      status: "grant_requested",
+      communicationSessionId: "comm_waiting",
+    });
+
+    expect(spool.listPendingDelegations("comm_waiting")).toMatchObject([{
+      clientMessageId: "delegate_3",
+      task: "Ask status",
+      status: "grant_requested",
+    }]);
+  });
+
+  it("stores Pulse compact delegated responses without crashing", async () => {
+    const delegateLocalAgentTask = vi.fn(async () => ({
+      status: "delegated" as const,
+      communicationSessionId: "comm_active",
+      messageId: "msg_delegate",
+      deliveryId: "del_delegate",
+      correlationId: "corr_4",
+      duplicate: false,
+      queuedAt: new Date().toISOString(),
+    }) as unknown as Awaited<ReturnType<HttpMessageTransport["delegateLocalAgentTask"]>>);
+    const spool = new BridgeSpool(":memory:");
+    cleanups.push(() => spool.close());
+
+    await expect(requestRuntimeDelegation({
+      transport: transport({ delegateLocalAgentTask }),
+      spool,
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      task: "Ask status",
+      sessionHandle: "server-session",
+      clientMessageId: "delegate_4",
+      correlationId: "corr_4",
+      timeoutMs: 60_000,
+    })).resolves.toMatchObject({
+      status: "delegated",
+      communicationSessionId: "comm_active",
+      messageId: "msg_delegate",
+    });
+
+    expect(spool.listPendingDelegations("comm_active")).toEqual([]);
+  });
+
   it("backs off event stream reconnect failures", async () => {
     vi.useFakeTimers();
     let attempts = 0;

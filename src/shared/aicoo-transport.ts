@@ -63,6 +63,11 @@ export class AicooTransport extends HttpMessageTransport {
     return this.#deviceToken ?? this.#userToken;
   }
 
+  override setEndpointId(endpointId: string): void {
+    super.setEndpointId(endpointId);
+    this.#endpoint = endpointId;
+  }
+
   override async requestJson<T = unknown>(
     path: string,
     options: { method?: string; body?: unknown; timeoutMs?: number } = {},
@@ -111,7 +116,6 @@ export class AicooTransport extends HttpMessageTransport {
       { method: "POST", body: { ...input, deviceId: this.#deviceId } },
     );
     this.#deviceToken = normalizeBearerToken(deviceToken);
-    this.#endpoint = endpoint.endpointId;
     this.setEndpointId(endpoint.endpointId);
     if (this.#onTokenRefreshed) {
       this.#onTokenRefreshed(deviceToken);
@@ -257,9 +261,10 @@ export class AicooTransport extends HttpMessageTransport {
   override async fetchInbox(afterCursor = "0"): Promise<RuntimeEvent[]> {
     const endpointId = this.#endpoint;
     if (!endpointId) throw new Error("AicooTransport endpoint is not registered");
-    return this.requestJson(
+    const events = await this.requestJson<Array<RuntimeEvent & { type: string }>>(
       `${LR}/poll?endpointId=${encodeURIComponent(endpointId)}&cursor=${encodeURIComponent(afterCursor)}`,
     );
+    return events.map(mapRuntimeEvent).filter((event): event is RuntimeEvent => Boolean(event));
   }
 
   async requestToolApproval(
@@ -410,9 +415,8 @@ async function* parseSse(stream: ReadableStream<Uint8Array>, signal?: AbortSigna
           .map((line) => line.slice(5).trimStart())
           .join("\n");
         if (data) {
-          const raw = JSON.parse(data) as RuntimeEvent & { type: string };
-          const mapped = EVENT_TYPE_MAP[raw.type];
-          if (mapped) yield { ...raw, type: mapped };
+          const event = mapRuntimeEvent(JSON.parse(data) as RuntimeEvent & { type: string });
+          if (event) yield event;
         }
         boundary = buffer.indexOf("\n\n");
       }
@@ -421,6 +425,11 @@ async function* parseSse(stream: ReadableStream<Uint8Array>, signal?: AbortSigna
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
+}
+
+function mapRuntimeEvent(raw: RuntimeEvent & { type: string }): RuntimeEvent | undefined {
+  const mapped = EVENT_TYPE_MAP[raw.type];
+  return mapped ? { ...raw, type: mapped } : undefined;
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {

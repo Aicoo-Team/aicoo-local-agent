@@ -7,7 +7,15 @@ import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/selec
 import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
 import { BridgeSpool } from "../bridge/spool.js";
-import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
+import type {
+  CommunicationGrant,
+  CommunicationSession,
+  HumanInboxSendMessageInput,
+  LocalAgentDelegationResponse,
+  MessageEnvelope,
+  RequestCommunicationSessionInput,
+  RuntimeEvent,
+} from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
 import {
@@ -150,10 +158,13 @@ program.command("start")
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
   .option("--json", "output raw JSON status blob", false)
   .action(async (options) => {
-    await startBridge({ ...options, hosted: true, server: hostedServerUrl() });
+    await startBridge({ ...options, hosted: true, server: hostedServerUrl(options.server) });
   });
 
-program.command("whoami").action(async () => print(await makeClient().whoami()));
+program.command("whoami")
+  .option("--spool <file>", "credentials spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .action(async (options) => print(await makeHostedClient(options.server, options.spool).whoami()));
 
 program.command("targets")
   .requiredOption("--person <principalId>")
@@ -164,15 +175,22 @@ defaultRoute.command("set")
   .option("--endpoint <id>")
   .option("--session <handle>")
   .option("--spool <file>")
+  .option("--server <url>", "control-plane URL")
   .action(async (options) => {
     const route = await resolveRoute(options);
-    print(await makeClient().setDefaultRoute(route.endpointId, route.sessionHandle));
+    print(await makeHostedClient(options.server, options.spool).setDefaultRoute(route.endpointId, route.sessionHandle));
   });
-defaultRoute.command("get").action(async () => print(await makeClient().getDefaultRoute()));
-defaultRoute.command("clear").action(async () => {
-  await makeClient().clearDefaultRoute();
-  console.log("default route cleared");
-});
+defaultRoute.command("get")
+  .option("--spool <file>", "credentials spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .action(async (options) => print(await makeHostedClient(options.server, options.spool).getDefaultRoute()));
+defaultRoute.command("clear")
+  .option("--spool <file>", "credentials spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .action(async (options) => {
+    await makeHostedClient(options.server, options.spool).clearDefaultRoute();
+    console.log("default route cleared");
+  });
 
 const offer = program.command("offer");
 offer.command("create")
@@ -376,7 +394,7 @@ program.command("send-to")
         return;
       }
     }
-    const session = await activeSessionForPeer(targetPrincipalId, options.server);
+    const session = await activeSessionForPeer(targetPrincipalId, options.server, options.spool);
     const receipt = await client.sendMessage({
       communicationSessionId: session.id,
       clientMessageId: options.clientId ?? randomUUID(),
@@ -400,6 +418,8 @@ program.command("delegate")
   .option("--correlation-id <id>", "stable id used to correlate the peer reply")
   .option("--ttl <minutes>", "grant TTL", "30")
   .option("--timeout <seconds>", "local pending-delegation timeout", "1800")
+  .option("--wait", "wait for the peer local agent reply and print it", false)
+  .option("--reply-timeout <seconds>", "how long --wait should wait for the peer reply", "180")
   .option("--server <url>", "control-plane URL")
   .action(async (person, taskParts, options) => {
     const client = makeHostedClient(options.server, options.spool);
@@ -432,14 +452,30 @@ program.command("delegate")
         timeoutMs: Number.parseInt(options.timeout, 10) * 1000,
       });
       if (result.status === "delegated") {
-        console.log(`Delegated to ${person}'s local agent.`);
-        console.log(`messageId: ${result.receipt.messageId}`);
+        const messageId = delegationMessageId(result);
+        if (!options.wait) {
+          console.log(`Delegated to ${person}'s local agent.`);
+          console.log(`messageId: ${messageId}`);
+        } else {
+          console.log(`Delegated to ${person}'s local agent. Waiting for their reply...`);
+          const reply = await waitForDelegationReply({
+            client,
+            spoolFile: options.spool,
+            correlationId: result.correlationId ?? correlationId,
+            sentMessageId: messageId,
+            timeoutMs: Number.parseInt(options.replyTimeout, 10) * 1000,
+          });
+          console.log("");
+          console.log(reply.text);
+        }
       } else {
         console.log(`Approval requested from ${person}. The bridge will dispatch after they approve.`);
-        console.log(`requestId: ${result.communicationSession.id}`);
+        console.log(`requestId: ${delegationCommunicationSessionId(result)}`);
       }
-      console.log(`clientMessageId: ${result.clientMessageId}`);
-      console.log(`correlationId: ${result.correlationId ?? correlationId}`);
+      if (!options.wait || result.status !== "delegated") {
+        console.log(`clientMessageId: ${result.clientMessageId ?? clientMessageId}`);
+        console.log(`correlationId: ${result.correlationId ?? correlationId}`);
+      }
     } finally {
       spool.close();
     }
@@ -844,8 +880,8 @@ async function acceptConnection(
   return { grant, accessPolicy: { status: "saved", preset: access, policyFile, ...(folder ? { folder } : {}) } };
 }
 
-async function activeSessionForPeer(peerPrincipalId: string, server?: string): Promise<CommunicationSession> {
-  const active = (await makeHostedClient(server).listCommunicationSessions())
+async function activeSessionForPeer(peerPrincipalId: string, server?: string, spool?: string): Promise<CommunicationSession> {
+  const active = (await makeHostedClient(server, spool).listCommunicationSessions())
     .filter((session) =>
       session.status === "active"
       && (session.requester.principalId === peerPrincipalId || session.recipient.principalId === peerPrincipalId))
@@ -853,6 +889,20 @@ async function activeSessionForPeer(peerPrincipalId: string, server?: string): P
   const session = active[0];
   if (!session) throw new Error(`No active connection found for ${peerPrincipalId}. Run ccd connect ${peerPrincipalId} first.`);
   return session;
+}
+
+function delegationCommunicationSessionId(result: LocalAgentDelegationResponse): string {
+  const compact = result as LocalAgentDelegationResponse & { communicationSessionId?: string };
+  const id = result.communicationSession?.id ?? compact.communicationSessionId;
+  if (!id) throw new Error("delegation response did not include a communication session id");
+  return id;
+}
+
+function delegationMessageId(result: Extract<LocalAgentDelegationResponse, { status: "delegated" }>): string {
+  const compact = result as Extract<LocalAgentDelegationResponse, { status: "delegated" }> & { messageId?: string };
+  const id = result.receipt?.messageId ?? compact.messageId;
+  if (!id) throw new Error("delegation response did not include a message id");
+  return id;
 }
 
 function resolveDeviceId(explicit: string | undefined, spoolFile: string): string {
@@ -892,6 +942,64 @@ async function watchDelivery(client: HttpMessageTransport, messageId: string): P
     if (["runtime_acked", "inbox_persisted", "failed", "expired", "revoked", "rejected"].includes(status.status)) return;
     await new Promise((resolve) => setTimeout(resolve, 500));
   } while (true);
+}
+
+async function waitForDelegationReply(options: {
+  client: HttpMessageTransport;
+  spoolFile: string;
+  correlationId: string;
+  sentMessageId: string;
+  timeoutMs: number;
+}): Promise<{ text: string; event: RuntimeEvent }> {
+  const timeoutAt = Date.now() + Math.max(1, options.timeoutMs);
+  primeClientEndpoint(options.client, options.spoolFile);
+  let cursor = "0";
+  while (Date.now() < timeoutAt) {
+    const events = await options.client.fetchInbox(cursor);
+    if (events.length > 0) cursor = events.at(-1)?.cursor ?? cursor;
+    const reply = events
+      .map((event) => ({ event, envelope: messageEnvelope(event) }))
+      .find(({ envelope }) =>
+        envelope?.kind === "text"
+        && envelope.correlationId === options.correlationId
+        && envelope.replyTo === options.sentMessageId);
+    if (reply?.envelope) {
+      return { text: messageText(reply.envelope), event: reply.event };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`Timed out waiting for peer local agent reply (${options.correlationId}).`);
+}
+
+function primeClientEndpoint(client: HttpMessageTransport, spoolFile: string): void {
+  const spool = new BridgeSpool(spoolFile);
+  try {
+    const endpointId = spool.getIdentity("endpointId");
+    if (!endpointId) throw new Error("spool does not contain a registered endpoint");
+    client.setEndpointId(endpointId);
+  } finally {
+    spool.close();
+  }
+}
+
+function messageEnvelope(event: RuntimeEvent): MessageEnvelope | undefined {
+  if (event.type !== "message.dispatch") return undefined;
+  const envelope = (event.data as { envelope?: unknown }).envelope;
+  return isMessageEnvelope(envelope) ? envelope : undefined;
+}
+
+function isMessageEnvelope(value: unknown): value is MessageEnvelope {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as { id?: unknown }).id === "string"
+    && typeof (value as { kind?: unknown }).kind === "string"
+    && typeof (value as { payload?: unknown }).payload === "object"
+    && (value as { payload?: unknown }).payload !== null;
+}
+
+function messageText(envelope: MessageEnvelope): string {
+  const text = envelope.payload.text;
+  return typeof text === "string" ? text : JSON.stringify(envelope.payload);
 }
 
 function errorMessage(error: unknown): string {
