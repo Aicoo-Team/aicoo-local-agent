@@ -490,8 +490,12 @@ program.command("audit")
 program.command("doctor")
   .description("check whether this machine is ready for text-only c2c")
   .option("--spool <file>", "bridge spool to inspect")
+  .option("--server <url>", "control-plane URL")
   .action(async (options) => {
-    const client = makeClient();
+    // Resolve the hosted control plane the way login and start do. Inheriting the root --server
+    // default sent doctor at http://127.0.0.1:7790, which only `ccd serve` hosts — so on a machine
+    // running `ccd start` every check failed and the advice was to start what was already running.
+    const client = makeHostedClient(options.server, options.spool);
     const checks: Array<{ name: string; ok: boolean; detail?: unknown; next?: string }> = [];
 
     try {
@@ -505,8 +509,11 @@ program.command("doctor")
       });
     }
 
+    let endpointId: string | undefined;
     try {
-      checks.push({ name: "defaultRoute", ok: true, detail: await client.getDefaultRoute() });
+      const route = await client.getDefaultRoute();
+      endpointId = route.endpointId;
+      checks.push({ name: "defaultRoute", ok: true, detail: route });
     } catch (error) {
       checks.push({
         name: "defaultRoute",
@@ -514,6 +521,31 @@ program.command("doctor")
         detail: errorMessage(error),
         next: "Start the bridge and wait for the '[bridge] default route -> ...' log.",
       });
+    }
+
+    // Every check above is a GET. In the field a machine has reported all of them green while
+    // every write — heartbeat, default-route, message ack — timed out at the cap, which is the
+    // failure that actually stops messages being delivered. So exercise one write too. Heartbeat
+    // is the cheapest and is idempotent, so probing costs a `lastSeenAt` bump and nothing else.
+    if (endpointId) {
+      const startedAt = Date.now();
+      try {
+        await client.heartbeatEndpoint(endpointId);
+        checks.push({
+          name: "controlPlaneWrite",
+          ok: true,
+          detail: { endpointId, method: "POST heartbeat", elapsedMs: Date.now() - startedAt },
+        });
+      } catch (error) {
+        checks.push({
+          name: "controlPlaneWrite",
+          ok: false,
+          detail: { endpointId, method: "POST heartbeat", elapsedMs: Date.now() - startedAt, error: errorMessage(error) },
+          next: "Reads work but writes do not, so this machine cannot ack messages. Compare a direct "
+            + "POST (curl reaches the same route) against this one: if curl is fast, the difference is "
+            + "Node's fetch ignoring your proxy settings — retry with NODE_USE_ENV_PROXY=1 on Node 24+.",
+        });
+      }
     }
 
     if (options.spool) {
