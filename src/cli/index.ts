@@ -10,6 +10,7 @@ import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
+import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import {
   DEFAULT_RELATIONSHIP_POLICY_FILE,
   upsertRelationshipPreset,
@@ -617,6 +618,13 @@ async function startBridge(options: {
   json?: boolean;
 }): Promise<void> {
   ensureParentDirectory(options.spool);
+  const deviceId = resolveDeviceId(undefined, options.spool);
+  const transport = makeClient({ hosted: options.hosted, server: options.server, deviceId, spool: options.spool });
+  // Only the hosted transport can reach the approval endpoints; a self-hosted mock cannot, and
+  // wiring it anyway would turn every un-preauthorized tool into a confusing runtime error.
+  const approvalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
+    ? (transport as unknown as ToolApprovalGateway)
+    : undefined;
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
     sessions: Number.parseInt(options.sessions, 10),
@@ -628,16 +636,16 @@ async function startBridge(options: {
     codexStateFile: options.codexState,
     codexPath: options.codexPath,
     relationshipPolicyFile: options.relationshipPolicy ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    ...(approvalGateway ? { approvalGateway } : {}),
     model: options.model,
     log: console.log,
   });
   if (selected.runtime === "codex") {
     ensureCodexSkill({ log: options.json ? undefined : console.log });
   }
-  const deviceId = resolveDeviceId(undefined, options.spool);
   const spool = new BridgeSpool(options.spool);
   const bridge = new RuntimeBridge({
-    transport: makeClient({ hosted: options.hosted, server: options.server, deviceId, spool: options.spool }),
+    transport,
     spool,
     adapter: selected.adapter,
     adapterVersion: selected.adapterVersion,
