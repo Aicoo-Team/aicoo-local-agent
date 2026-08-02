@@ -18,6 +18,19 @@ export class ApprovalBroker {
     this.autoAllowRead = autoAllowRead;
     this.log = log;
     mkdirSync(approvalsDir, { recursive: true });
+    this.#sweepOrphans();
+  }
+
+  /**
+   * A killed process never runs its cleanup, so its pending files outlive the turn
+   * that was waiting on them. They would otherwise show up in `pending` forever and
+   * invite the owner to approve a call nobody is waiting for.
+   */
+  #sweepOrphans() {
+    for (const record of listApprovals(this.approvalsDir)) {
+      rmSync(join(this.approvalsDir, `${record.id}.json`), { force: true });
+      this.log(`[approval] swept orphaned request ${record.id} (${record.toolName}) from a previous run`);
+    }
   }
 
   async ask({ toolName, summary }) {
