@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { AicooApi } from "./api.js";
 import { LocalDmAgent } from "./agent.js";
+import { CodexResponder } from "./codex.js";
 import { ApprovalBroker, resolveApproval, listApprovals } from "./approval.js";
 import { AgentState } from "./state.js";
 
@@ -169,10 +170,22 @@ async function main() {
     model: args.model,
     log,
   });
-  // --responder echo: transport smoke-test mode — no local LLM turn, replies with an
-  // echo. Lets the full aicoo loop (poll -> detect -> reply -> threading) be verified
-  // on machines whose claude CLI is not logged in.
+  // --responder: "agent" (Claude SDK, per-call owner approval), "codex" (codex exec,
+  // read-only sandbox as the wall — no per-call approval hook), or "echo" (transport
+  // smoke test, no LLM — for machines whose local runtime is not logged in).
   const responder = args.responder ?? "agent";
+  const codex = responder === "codex"
+    ? new CodexResponder({
+        workspace,
+        state,
+        ownerLabel: `@${me.username}`,
+        peerLabel: `@${peer}`,
+        codexPath: args["codex-path"],
+        model: args.model,
+        log,
+      })
+    : null;
+  if (codex) log(`[codex] containment = read-only sandbox in ${workspace}; per-call owner approval NOT wired on this runtime`);
   log(`state: ${stateDir}  responder=${responder}`);
 
   if (args.reachout) {
@@ -210,14 +223,17 @@ async function main() {
         for (const message of fresh) {
           const preview = String(message.content).slice(0, 120).replace(/\s+/g, " ");
           log(`inbound #${message.id} (conv ${conv.conversationId}, ${conv.type}): ${preview}`);
+          const inbound = {
+            text: String(message.content),
+            from: message.senderLabel ?? `@${peer}`,
+            conversationId: conv.conversationId,
+            createdAt: message.createdAt,
+          };
           const reply = responder === "echo"
             ? `[transport-test echo] 已收到你的消息(#${message.id}): "${String(message.content).slice(0, 200)}" — 本地 runtime 等 owner 重新 claude /login 后切换真实 agent 模式。`
-            : await agent.runTurn({
-                text: String(message.content),
-                from: message.senderLabel ?? `@${peer}`,
-                conversationId: conv.conversationId,
-                createdAt: message.createdAt,
-              });
+            : responder === "codex"
+              ? await codex.runTurn(inbound)
+              : await agent.runTurn(inbound);
           log(`reply for #${message.id}: ${reply.slice(0, 120).replace(/\s+/g, " ")}`);
           await api.withRetry(() => api.sendHuman(peer, reply, `dm-agent:${me.userId}:${message.id}`));
           state.setCursor(conv.conversationId, Number(message.id));
