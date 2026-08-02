@@ -71,7 +71,15 @@ Three questions, all of which must be **no**:
 2. Could it be synced to a cloud agent?
 3. Could the answer have been sent as a file?
 
-`.env` is the only common file that answers no to all three.
+`.env` is the only common file that answers no to all three — which is why it is the demo.
+
+But there is a fourth question that unlocks a different, larger class:
+
+**4. Could this person be given access at all?**
+
+Sometimes the data is perfectly syncable and the repo is perfectly available — and the
+asker still cannot have it. That is not a data problem; it is a permissions problem, and it
+is the one companies live with every day.
 
 ---
 
@@ -156,7 +164,44 @@ Close on that. Do not add a fourth beat.
 
 ---
 
-## Where this goes (the slide after the demo — do not fake it live)
+## The slide right after the demo: access asymmetry
+
+The `.env` beat proves the thing is *possible*. This slide proves it is *recurring* — and it
+is where the money is.
+
+> The product team and the researchers do not have access to our repo. They are never going
+> to. But they have questions about the product every week.
+
+Today those questions become a Slack ping that interrupts an engineer, a stale wiki page, or
+an access request nobody wants to approve. **Access is binary and permanent; a question is
+scoped and momentary** — and no ACL can express the difference. An agent can: it reads what
+its owner may read, and answering does not grant the asker anything.
+
+Same shape, different asker:
+
+| Asker | Question | Why they can't self-serve |
+| --- | --- | --- |
+| **Product / research** | "How does the onboarding flow actually decide who sees the paywall?" | No repo access, and never will have |
+| **A new teammate** | "The handover doc stops halfway — what actually happened with the delivery fix?" | The doc is partial; the rest is on someone's machine and in their agent's memory |
+| **Support / sales** | "Does the enterprise plan really gate this?" | The answer is in code, and they will never read code |
+
+### This case needs the *opposite* approval mode
+
+Per-call approval is the feature in the `.env` demo — and it is friction here. A PM asking
+five questions a day cannot interrupt an engineer fifteen times; two days of that and the
+feature gets turned off.
+
+That case wants a **standing grant** — folders and tools pre-approved for a relationship,
+with the prompt reserved for anything outside it. That machinery already exists
+(relationship policy presets, `agentPermissions`, one approval covering a whole
+collaboration). The product point is to make both modes legible:
+
+- **Stranger, sensitive, one-off** → ask every time
+- **Teammate, scoped, recurring** → grant once, revoke any time
+
+---
+
+## Where this goes (the slide after that — do not fake it live)
 
 Memory is one of five axes. Each is a different thing one agent has and another does not:
 
