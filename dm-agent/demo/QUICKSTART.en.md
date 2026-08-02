@@ -35,12 +35,36 @@ claude -p "reply with exactly OK"
 
 You need to see `OK`.
 
-> **If this times out** — browser says success, terminal hangs ~30s and reports an OAuth
-> timeout — you are behind a proxy:
-> ```bash
-> HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 claude /login
-> ```
-> Use your own proxy port.
+### If your network needs a proxy
+
+Two symptoms, one cause:
+
+- `claude /login` succeeds in the browser but the terminal hangs ~30s and reports an OAuth
+  timeout
+- once running, the agent logs `403 Request not allowed` every few seconds
+
+How to tell (403 direct but 405 through the proxy means the network is refusing it, not
+Anthropic):
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://api.anthropic.com/v1/messages
+```
+
+**Both the login and the agent need the proxy.** Use your own port:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 claude /login
+```
+
+> Proxying only the login is not enough — the agent calls the API on every turn. Pass the
+> same variables in Step 5, or a successful login still 403s forever.
+
+Verify the login for real (`env -i` strips inherited variables, so you test what the agent
+actually sees):
+
+```bash
+env -i HOME="$HOME" PATH="$PATH" HTTPS_PROXY=http://127.0.0.1:7897 claude -p "reply with exactly OK"
+```
 
 ---
 
@@ -112,6 +136,12 @@ Replace `their-username` with the Aicoo username of the person you are working w
 aicoo-dm-agent start --peer their-username --workspace ~/aicoo-demo
 ```
 
+Behind a proxy (see Step 1), pass it here too:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 aicoo-dm-agent start --peer their-username --workspace ~/aicoo-demo
+```
+
 `agent online as @your-username` means you are reachable.
 
 > **Do not background it with `nohup` or `&`.** Approval prompts appear in this terminal and
@@ -177,4 +207,6 @@ blocked before a human is ever interrupted.
 | The reply is "Please run /login" | Claude Code is not logged in — back to Step 1 |
 | Nothing happens at all | Check the terminal from Step 5 is still open; closing it takes the agent down |
 | An answer arrived with no approval prompt | That file was already read earlier in the session, so no new tool call was needed. To get the prompt back: `rm ~/.aicoo-dm-agent/www.aicoo.io/*/state.json` and restart |
-| `401` | Wrong or rotated key — back to Step 3 |
+| `401` | Wrong or rotated Aicoo key — back to Step 3 |
+| `403 Request not allowed`, repeatedly | Not your key — the network is refusing the request. Restart with `HTTPS_PROXY` (Step 1) |
+| `Not logged in`, repeatedly | Claude Code is not logged in — back to Step 1 |

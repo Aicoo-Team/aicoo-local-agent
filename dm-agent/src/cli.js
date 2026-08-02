@@ -194,6 +194,7 @@ async function main() {
   }
 
   let stopping = false;
+  let runtimeHintShown = false;
   process.on("SIGINT", () => { stopping = true; log("stopping…"); });
   process.on("SIGTERM", () => { stopping = true; });
 
@@ -252,7 +253,22 @@ async function main() {
         log(`FATAL: API key rejected (401). Exiting.`);
         process.exit(1);
       }
-      log(`poll error: ${String(error.message ?? error).slice(0, 300)}`);
+      const detail = String(error.message ?? error);
+      log(`poll error: ${detail.slice(0, 300)}`);
+      // These two fail identically every few seconds forever, and the raw text says
+      // nothing about the fix. Name it once, the first time it happens.
+      if (!runtimeHintShown) {
+        if (/Request not allowed|403/.test(detail)) {
+          runtimeHintShown = true;
+          log(`[hint] Anthropic returned 403 "Request not allowed" — that is the network refusing the`);
+          log(`[hint] request, not your Aicoo key. If you reach the API through a proxy, restart with:`);
+          log(`[hint]   HTTPS_PROXY=http://127.0.0.1:<port> HTTP_PROXY=http://127.0.0.1:<port> aicoo-dm-agent start ...`);
+        } else if (/Not logged in|Please run \/login|authenticate/i.test(detail)) {
+          runtimeHintShown = true;
+          log(`[hint] The local Claude Code is not logged in. In a plain terminal run 'claude /login',`);
+          log(`[hint] then verify with: env -i HOME="$HOME" PATH="$PATH" claude -p "reply with exactly OK"`);
+        }
+      }
       await delay(5000);
     }
     await delay(pollMs);

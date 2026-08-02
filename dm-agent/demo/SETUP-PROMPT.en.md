@@ -24,9 +24,11 @@ do not skip ahead:
    `npm i -g @anthropic-ai/claude-code@latest`. Then verify it is logged in with
    `claude -p "reply with exactly OK"`.
    If that fails with anything OAuth-related, do NOT retry it in a loop. Hand me the
-   command `claude /login` to run myself, and warn me that if the browser succeeds but the
-   terminal times out after ~30s, it's a proxy issue and I should run
-   `HTTPS_PROXY=http://127.0.0.1:<my proxy port> claude /login` instead.
+   command `claude /login` to run myself. First check whether a proxy is needed: run
+   `curl -s -o /dev/null -w "%{http_code}\n" https://api.anthropic.com/v1/messages`. A 403
+   means the network is refusing the request, and then **both** the login and the Step 6
+   start command need `HTTPS_PROXY=http://127.0.0.1:<my proxy port>` and `HTTP_PROXY` set —
+   proxying only the login is not enough.
 
 3. Run `npm i -g @aicoo/dm-agent`, then `which aicoo-dm-agent` to confirm the command is on
    PATH.

@@ -19,8 +19,10 @@
 2. 检查 `claude --version`。没装就 `npm i -g @anthropic-ai/claude-code@latest`。
    然后跑 `claude -p "reply with exactly OK"` 验证登录状态。
    如果它报 OAuth 相关错误,不要自己反复重试——把 `claude /login` 这条命令原样给我,
-   让我自己在终端跑,并提醒我:如果浏览器成功但终端 30 秒超时,是代理问题,
-   要改成 `HTTPS_PROXY=http://127.0.0.1:<我的代理端口> claude /login`。
+   让我自己在终端跑。先帮我判断需不需要代理:跑
+   `curl -s -o /dev/null -w "%{http_code}\n" https://api.anthropic.com/v1/messages`,
+   如果是 403,说明网络层被拦,那么登录和第 6 步启动**都**要带
+   `HTTPS_PROXY=http://127.0.0.1:<我的代理端口> HTTP_PROXY=同上`。只在登录时加不够。
 
 3. `npm i -g @aicoo/dm-agent`,然后 `which aicoo-dm-agent` 确认命令在 PATH 上。
 

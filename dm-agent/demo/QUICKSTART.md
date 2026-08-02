@@ -34,11 +34,33 @@ claude -p "reply with exactly OK"
 
 看到 `OK` 才算过。
 
-> **如果这里超时**(浏览器成功但终端卡住 30 秒后报 OAuth timeout):你在用代理。改成
-> ```bash
-> HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 claude /login
-> ```
-> 端口换成你自己代理的端口。
+### 如果你的网络需要代理
+
+两个症状,同一个原因:
+
+- `claude /login` 浏览器成功了,但终端卡 30 秒报 OAuth timeout
+- agent 跑起来后每隔几秒报 `403 Request not allowed`
+
+判断方法(直连拿到 403、走代理拿到 405,就说明被网络层拦了):
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://api.anthropic.com/v1/messages
+```
+
+**登录和运行都要带代理**,端口换成你自己的:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 claude /login
+```
+
+> 只在登录时加代理是不够的——agent 每一轮都要调 API。第 5 步启动时同样要带上,
+> 否则登录成功了照样一直 403。
+
+验证登录真的成功(`env -i` 剥掉继承的环境变量,才是 agent 实际看到的样子):
+
+```bash
+env -i HOME="$HOME" PATH="$PATH" HTTPS_PROXY=http://127.0.0.1:7897 claude -p "reply with exactly OK"
+```
 
 ---
 
@@ -107,6 +129,12 @@ EOF
 aicoo-dm-agent start --peer 对方用户名 --workspace ~/aicoo-demo
 ```
 
+需要代理的话(见第 1 步),启动时也要带上:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 aicoo-dm-agent start --peer 对方用户名 --workspace ~/aicoo-demo
+```
+
 看到 `agent online as @你的用户名` 就是通了。
 
 > **别用 `nohup` 或 `&` 放后台** —— 审批提示要出现在这个终端里,你才能按 y。
@@ -165,4 +193,6 @@ GitHub 做不到(`.env` 从不入库)、云端 agent 做不到(上传密钥本�
 | 回复是 "Please run /login" | Claude Code 没登录,回第 1 步 |
 | 一直没反应 | 检查启动那个终端还在不在;它一关 agent 就没了 |
 | 答案没弹审批就出来了 | 这轮对话之前已经读过那个文件(会话有记忆)。想重现审批: `rm ~/.aicoo-dm-agent/www.aicoo.io/*/state.json` 后重启 |
-| `401` | key 错了或已轮换,回第 3 步 |
+| `401` | Aicoo key 错了或已轮换,回第 3 步 |
+| 反复 `403 Request not allowed` | 不是 key 的问题,是网络层拦截。带 `HTTPS_PROXY` 重启(见第 1 步) |
+| 反复 `Not logged in` | Claude Code 没登录,回第 1 步 |
