@@ -42,19 +42,20 @@ claude -p "reply with exactly OK"
 
 ---
 
-## 第 2 步 · 拿到本地 agent
-
-还没发 npm,先从仓库跑:
+## 第 2 步 · 装本地 agent
 
 ```bash
-git clone -b feat/dm-agent-chat-rails https://github.com/Aicoo-Team/aicoo-local-agent.git ~/aicoo-dm-agent
+npm i -g @aicoo/dm-agent
 ```
 
 ```bash
-cd ~/aicoo-dm-agent/dm-agent && npm install && npm test
+which aicoo-dm-agent
 ```
 
-看到 `WALL-OK` / `GATE-OK` / `FILTER-OK` 就是装好了。
+有输出就是装好了。
+
+> 懒得一步步敲?`demo/SETUP-PROMPT.md` 里有一段可以直接粘给你自己 Claude Code / Codex
+> 的提示词,它会替你做完前几步。
 
 ---
 
@@ -69,7 +70,7 @@ export AICOO_TOKEN="把_key_粘在这里"
 验证是你本人:
 
 ```bash
-cd ~/aicoo-dm-agent/dm-agent && node src/cli.js whoami
+aicoo-dm-agent whoami
 ```
 
 ---
@@ -103,7 +104,7 @@ EOF
 把 `对方用户名` 换成要跟你协作的人的 Aicoo username:
 
 ```bash
-cd ~/aicoo-dm-agent/dm-agent && node src/cli.js start --peer 对方用户名 --workspace ~/aicoo-demo
+aicoo-dm-agent start --peer 对方用户名 --workspace ~/aicoo-demo
 ```
 
 看到 `agent online as @你的用户名` 就是通了。

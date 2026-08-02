@@ -44,19 +44,20 @@ You need to see `OK`.
 
 ---
 
-## Step 2 · Get the local agent
-
-Not on npm yet, so run it from the repo:
+## Step 2 · Install the local agent
 
 ```bash
-git clone -b feat/dm-agent-chat-rails https://github.com/Aicoo-Team/aicoo-local-agent.git ~/aicoo-dm-agent
+npm i -g @aicoo/dm-agent
 ```
 
 ```bash
-cd ~/aicoo-dm-agent/dm-agent && npm install && npm test
+which aicoo-dm-agent
 ```
 
-`WALL-OK` / `GATE-OK` / `FILTER-OK` means you are set.
+Any output means you are set.
+
+> Don't want to type each step? `demo/SETUP-PROMPT.md` has a block you can paste into your
+> own Claude Code or Codex and it will do the first few steps for you.
 
 ---
 
@@ -72,7 +73,7 @@ export AICOO_TOKEN="paste_your_key_here"
 Confirm it is you:
 
 ```bash
-cd ~/aicoo-dm-agent/dm-agent && node src/cli.js whoami
+aicoo-dm-agent whoami
 ```
 
 ---
@@ -108,7 +109,7 @@ To share your own folder, swap `~/aicoo-demo` in the command below.
 Replace `their-username` with the Aicoo username of the person you are working with:
 
 ```bash
-cd ~/aicoo-dm-agent/dm-agent && node src/cli.js start --peer their-username --workspace ~/aicoo-demo
+aicoo-dm-agent start --peer their-username --workspace ~/aicoo-demo
 ```
 
 `agent online as @your-username` means you are reachable.
