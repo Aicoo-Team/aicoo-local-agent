@@ -13,6 +13,8 @@ export class FakeCodexDriver implements CodexDriver {
   resultDelayMs = 0;
   failTurn = false;
   failBeforeTurnStart = false;
+  /** Recoverable `type:"error"` lines emitted mid-turn, the way Codex reports a dropped socket. */
+  transientErrors: string[] = [];
 
   constructor(resultText: string | ((prompt: string) => string) = "reply from managed codex") {
     this.resultText = resultText;
@@ -48,7 +50,8 @@ class FakeCodexTurn implements CodexTurn {
   private async run(): Promise<void> {
     try {
       if (this.driver.failBeforeTurnStart) {
-        await this.push({ type: "error", message: "codex exited with code 1: no rollout found" });
+        // fatal: this stands in for the real driver synthesizing a non-zero process exit.
+        await this.push({ type: "error", message: "codex exited with code 1: no rollout found", fatal: true });
         return;
       }
       const threadId = this.input.resumeThreadId ?? `fake-codex-thread-${randomUUID()}`;
@@ -58,6 +61,10 @@ class FakeCodexTurn implements CodexTurn {
         await new Promise((resolve) => setTimeout(resolve, this.driver.resultDelayMs));
       }
       if (this.#closed) return;
+      for (const message of this.driver.transientErrors) {
+        await this.push({ type: "error", message });
+        if (this.#closed) return;
+      }
       if (this.driver.failTurn) {
         await this.push({ type: "turn.failed", error: { message: "fake codex turn failure" } });
         return;

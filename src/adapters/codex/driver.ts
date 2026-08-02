@@ -17,7 +17,13 @@ export type CodexThreadEvent =
   | { type: "item.completed"; item: CodexThreadItem }
   | { type: "turn.completed"; usage?: Record<string, unknown> }
   | { type: "turn.failed"; error?: { message?: string } }
-  | { type: "error"; message?: string };
+  /**
+   * `fatal` separates the two very different things that arrive as `type: "error"`.
+   * Codex CLI emits recoverable ones on stdout mid-turn — notably `"Reconnecting..."` when its
+   * WebSocket drops, after which it falls back to HTTPS and still produces `agent_message` and
+   * `turn.completed`. Only errors this driver synthesizes (spawn failure, non-zero exit) end a turn.
+   */
+  | { type: "error"; message?: string; fatal?: boolean };
 
 export interface CodexTurnStartInput {
   prompt: string;
@@ -80,8 +86,13 @@ class CodexExecTurn implements CodexTurn {
         input.log?.(`codex non-JSON output ignored: ${trimmed}`);
         return;
       }
-      if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "error") {
+      if (event.type === "turn.completed" || event.type === "turn.failed") {
         this.#sawTerminalEvent = true;
+      }
+      if (event.type === "error") {
+        // Recoverable by default: Codex reports transport hiccups this way and keeps going.
+        // A turn that really dies still ends the process, and the close handler below catches that.
+        input.log?.(`codex reported a recoverable error, still waiting: ${event.message ?? "(no message)"}`);
       }
       this.push(event);
     });
@@ -91,7 +102,7 @@ class CodexExecTurn implements CodexTurn {
       input.log?.(`codex stderr: ${text.trimEnd()}`);
     });
     this.#child.on("error", (error) => {
-      this.push({ type: "error", message: `codex spawn failed: ${String(error)}` });
+      this.push({ type: "error", message: `codex spawn failed: ${String(error)}`, fatal: true });
       this.#events.close();
     });
     this.#child.on("close", (code) => {
@@ -99,6 +110,7 @@ class CodexExecTurn implements CodexTurn {
         this.push({
           type: "error",
           message: `codex exited with code ${code}: ${this.#stderrTail.trim() || "no stderr output"}`,
+          fatal: true,
         });
       }
       this.#events.close();

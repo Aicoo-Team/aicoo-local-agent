@@ -368,7 +368,10 @@ export class CodexAdapter implements RuntimeAdapter {
       sink.onTerminal();
       return;
     }
-    if (event.type === "turn.failed" || event.type === "error") {
+    // A bare `error` off Codex's stdout is a progress report, not a verdict — "Reconnecting..."
+    // arrives that way and is followed by a normal agent_message. Only turn.failed, or an error
+    // this driver synthesized from a spawn failure or non-zero exit, actually ends the turn.
+    if (event.type === "turn.failed" || (event.type === "error" && event.fatal)) {
       const reason = event.type === "turn.failed"
         ? event.error?.message ?? "codex turn failed"
         : event.message ?? "codex error";
@@ -451,7 +454,7 @@ export class CodexAdapter implements RuntimeAdapter {
       } else if (event.type === "turn.completed") {
         if (replyText === undefined) throw new Error("codex completed the brokered turn without an agent message");
         return replyText;
-      } else if (event.type === "turn.failed" || event.type === "error") {
+      } else if (event.type === "turn.failed" || (event.type === "error" && event.fatal)) {
         throw new Error(event.type === "turn.failed" ? event.error?.message ?? "codex turn failed" : event.message ?? "codex error");
       }
     }

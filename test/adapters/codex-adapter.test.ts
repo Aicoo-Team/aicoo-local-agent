@@ -321,6 +321,31 @@ describe("CodexAdapter managed sessions", () => {
     });
   });
 
+  it("keeps waiting through a recoverable codex error and still delivers the reply", async () => {
+    // Reported from the field on 0.1.1: Codex CLI emits {"type":"error","message":"Reconnecting..."}
+    // when its WebSocket drops, then falls back to HTTPS and produces a normal agent_message plus
+    // turn.completed. Treating that first error as terminal closed the turn early and lost the reply.
+    const driver = new FakeCodexDriver("REPLY_AFTER_RECONNECT");
+    driver.transientErrors = ["Reconnecting...", "Reconnecting..."];
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    const result = await adapter.deliverToSession("codex-managed-1", inbound("msg_reconnect"), "queue");
+
+    expect(result.status).toBe("runtime_acked");
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started", inReplyTo: "msg_reconnect" }),
+      expect.objectContaining({
+        type: "reply",
+        inReplyTo: "msg_reconnect",
+        payload: expect.objectContaining({ text: "REPLY_AFTER_RECONNECT" }),
+      }),
+    ]);
+    await waitForIdle(adapter, "codex-managed-1");
+  });
+
   it("emits turn_failed when codex fails after accepting the turn", async () => {
     const driver = new FakeCodexDriver();
     driver.failTurn = true;
