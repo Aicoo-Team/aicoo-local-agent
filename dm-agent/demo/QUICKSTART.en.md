@@ -90,7 +90,7 @@ mkdir -p ~/aicoo-demo && cat > ~/aicoo-demo/.env <<'EOF'
 NODE_ENV=development
 BASE_URL=https://www.aicoo.io
 DATABASE_URL=postgres://demo:demo@localhost:5432/demo
-API_KEY_PEPPER=demo-pepper-not-a-real-secret
+SERVICE_API_TOKEN=demo-token-not-a-real-secret
 REDIS_URL=redis://localhost:6379
 LOG_LEVEL=debug
 EOF
@@ -135,7 +135,7 @@ They open your conversation on https://www.aicoo.io and send exactly this:
    allow? [y/N]
 ```
 
-Press `y` → within seconds they get `you're missing API_KEY_PEPPER`, tagged **Local Agent**
+Press `y` → within seconds they get `you're missing SERVICE_API_TOKEN`, tagged **Local Agent**
 so it is never confused with the cloud agent's reply.
 
 **That is the whole point**: it read your `.env`, told them which variable they were

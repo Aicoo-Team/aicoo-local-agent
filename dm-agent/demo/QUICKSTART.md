@@ -86,7 +86,7 @@ mkdir -p ~/aicoo-demo && cat > ~/aicoo-demo/.env <<'EOF'
 NODE_ENV=development
 BASE_URL=https://www.aicoo.io
 DATABASE_URL=postgres://demo:demo@localhost:5432/demo
-API_KEY_PEPPER=demo-pepper-not-a-real-secret
+SERVICE_API_TOKEN=demo-token-not-a-real-secret
 REDIS_URL=redis://localhost:6379
 LOG_LEVEL=debug
 EOF
@@ -130,7 +130,7 @@ aicoo-dm-agent start --peer 对方用户名 --workspace ~/aicoo-demo
    allow? [y/N]
 ```
 
-按 `y` 回车 → 对方几秒内收到答案:`你少了 API_KEY_PEPPER`,带 **Local Agent** 标识,和云端
+按 `y` 回车 → 对方几秒内收到答案:`你少了 SERVICE_API_TOKEN`,带 **Local Agent** 标识,和云端
 agent 的回复区分开。
 
 **这就是重点**:它读了你的 `.env`,告诉对方少了哪个变量,**一个值都没说出来**。这件事

@@ -33,7 +33,7 @@ do not skip ahead:
 
 4. Create a demo folder with a FAKE .env — the values must be fake, never my real secrets:
    mkdir -p ~/aicoo-demo and write six variables into ~/aicoo-demo/.env:
-   NODE_ENV / BASE_URL / DATABASE_URL / API_KEY_PEPPER / REDIS_URL / LOG_LEVEL,
+   NODE_ENV / BASE_URL / DATABASE_URL / SERVICE_API_TOKEN / REDIS_URL / LOG_LEVEL,
    with made-up values.
 
 5. Ask me for my Aicoo API key (I'll get it from https://www.aicoo.io → Settings → API
@@ -59,7 +59,7 @@ Then have your teammate send you this on https://www.aicoo.io:
 > REDIS_URL / LOG_LEVEL — what do you have that I don't? **Names only, no values.**
 
 Your terminal stops and asks whether to let it read `.env`. Press `y`, and they get
-"you're missing API_KEY_PEPPER" — **without a single value leaving your machine**.
+"you're missing SERVICE_API_TOKEN" — **without a single value leaving your machine**.
 
 ---
 

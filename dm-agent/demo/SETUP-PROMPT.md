@@ -26,7 +26,7 @@
 
 4. 建演示目录和一份**假的** .env(值必须是假的,绝对不要用我真实的密钥):
    mkdir -p ~/aicoo-demo,写入 NODE_ENV / BASE_URL / DATABASE_URL /
-   API_KEY_PEPPER / REDIS_URL / LOG_LEVEL 六个变量,值随便编。
+   SERVICE_API_TOKEN / REDIS_URL / LOG_LEVEL 六个变量,值随便编。
 
 5. 问我要 Aicoo API key(我去 https://www.aicoo.io → Settings → API Keys 拿),
    然后用它跑 `AICOO_TOKEN=<key> aicoo-dm-agent whoami` 确认身份正确。
@@ -49,7 +49,7 @@
 > 我调服务一直 401。我这边 .env 里有 NODE_ENV / BASE_URL / DATABASE_URL / REDIS_URL /
 > LOG_LEVEL,你那边还多了什么我没有的?**只要变量名,不要值。**
 
-你的终端会停下来问你要不要让它读 `.env`。按 `y`,对方会收到「你少了 API_KEY_PEPPER」
+你的终端会停下来问你要不要让它读 `.env`。按 `y`,对方会收到「你少了 SERVICE_API_TOKEN」
 ——**而值一个都没说出去**。
 
 ---

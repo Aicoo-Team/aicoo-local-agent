@@ -46,7 +46,7 @@ and *why it has to be local at all*.
 The last clause matters — say it, and type it. It sets up the payoff before the payoff
 happens: the asker is explicitly *not* asking for secrets, and the answer still arrives.
 
-A good answer looks like: *"You're missing `API_KEY_PEPPER`, and your BASE_URL points at the
+A good answer looks like: *"You're missing `SERVICE_API_TOKEN`, and your BASE_URL points at the
 apex — mine is www. The apex 307 strips the Authorization header."*
 
 Use a **real** misconfiguration you actually hit. A staged one reads as staged.
@@ -97,18 +97,17 @@ Say once: *"Left is me. Right is my teammate's laptop."* Nothing else needs expl
 ## Pre-flight
 
 ```bash
-cd ~/Desktop/pulse/aicoo-dm-agent/dm-agent
-npm test
-rm -f ~/.aicoo-dm-agent/www.aicoo.io/admin--waterdoog/state.json
+npm i -g @aicoo/dm-agent
+rm -f ~/.aicoo-dm-agent/www.aicoo.io/*/state.json
 ```
 
 Run it in a **visible** terminal — the approval prompt is the demo:
 
 ```bash
-AICOO_TOKEN=<their_key> node src/cli.js start --peer <you> --workspace ./demo-workspace
+AICOO_TOKEN=<their_key> aicoo-dm-agent start --peer <you> --workspace ~/aicoo-demo
 ```
 
-- [ ] `demo-workspace/.env` exists, with **fake values** and a real-looking shape
+- [ ] `~/aicoo-demo/.env` exists, with **fake values** and a real-looking shape
 - [ ] Fresh session — a resumed one already read the file and **skips the approval**
 - [ ] Terminal font 18pt+, and `.env` legible in the approval line
 - [ ] One dry run before recording
@@ -129,7 +128,7 @@ The terminal wakes up and stops:
 ```
 == OWNER APPROVAL REQUIRED ==
    tool: Read
-   Read({"file_path":".../demo-workspace/.env"})
+   Read({"file_path":"/Users/.../aicoo-demo/.env"})
    allow? [y/N]
 ```
 
