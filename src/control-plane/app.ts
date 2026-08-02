@@ -8,6 +8,7 @@ import { resolveBearer, type AuthContext } from "./auth.js";
 import type { AppDatabase } from "./db.js";
 import { EventStore } from "./events.js";
 import { CommunicationSessionService } from "./services/comm-sessions.js";
+import { DelegationService } from "./services/delegations.js";
 import { EndpointService } from "./services/endpoints.js";
 import { MessageService } from "./services/messages.js";
 import { OfferService } from "./services/offers.js";
@@ -71,6 +72,15 @@ const sendMessageSchema = z.union([
   }),
 ]);
 
+const delegationSchema = z.object({
+  target: requestCommSchema.shape.target,
+  task: z.union([z.string().min(1), z.record(z.string(), z.unknown())]),
+  sessionHandle: z.string().min(1),
+  clientMessageId: z.string().min(1).max(200),
+  correlationId: z.string().min(1).optional(),
+  requestedTtlMinutes: z.number().int().positive().max(30).optional(),
+});
+
 export function createApp(db: AppDatabase, config: AppConfig = {}) {
   const app = new Hono<{ Variables: Variables }>();
   const events = new EventStore(db);
@@ -78,6 +88,7 @@ export function createApp(db: AppDatabase, config: AppConfig = {}) {
   const offers = new OfferService(db, endpoints);
   const comms = new CommunicationSessionService(db, endpoints, offers, events);
   const messages = new MessageService(db, comms, endpoints, events);
+  const delegations = new DelegationService(db, comms, endpoints, messages);
 
   app.get("/health", (c) => c.json({ ok: true }));
 
@@ -179,6 +190,14 @@ export function createApp(db: AppDatabase, config: AppConfig = {}) {
     const parsed = sendMessageSchema.safeParse(raw);
     if (!parsed.success) return invalid(c, parsed.error);
     return respond(c, messages.send(c.get("auth"), parsed.data), 201);
+  });
+
+  app.post("/api/v1/local-agent/delegations", async (c) => {
+    const parsed = delegationSchema.safeParse(await safeJson(c));
+    if (!parsed.success) return invalid(c, parsed.error);
+    const result = delegations.delegate(c.get("auth"), parsed.data);
+    const status = result.ok && result.value.status === "delegated" ? 201 : 200;
+    return respond(c, result, status);
   });
 
   app.get("/api/v1/messages/:id/status", (c) =>

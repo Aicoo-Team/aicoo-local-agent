@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -83,6 +83,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
     const policyFile = join(directory, "relationships.json");
+    mkdirSync(project);
     writeFileSync(policyFile, JSON.stringify({
       version: 1,
       relationships: [{
@@ -109,6 +110,17 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_tools"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
     const options = driver.starts[0]!.options;
+    expect(options.additionalDirectories).toEqual([realpathSync.native(project)]);
+    expect(options.sandbox).toMatchObject({
+      enabled: true,
+      failIfUnavailable: true,
+      autoAllowBashIfSandboxed: false,
+      allowUnsandboxedCommands: false,
+      filesystem: {
+        denyRead: expect.arrayContaining([join(realpathSync.native(project), ".env")]),
+        denyWrite: expect.arrayContaining([join(realpathSync.native(project), "package.json")]),
+      },
+    });
 
     expect(await options.canUseTool?.("Read", { file_path: join(project, "README.md") }, {
       signal: new AbortController().signal,

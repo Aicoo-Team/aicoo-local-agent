@@ -23,6 +23,7 @@ export interface CodexTurnStartInput {
   prompt: string;
   cwd: string;
   resumeThreadId?: string;
+  writableRoots?: string[];
   codexPath?: string;
   model?: string;
   log?: (line: string) => void;
@@ -147,15 +148,20 @@ export function buildCodexSpawnCommand(
 }
 
 function buildArgs(input: CodexTurnStartInput): string[] {
-  // The receiver stays as close to text-only as codex allows: read-only sandbox,
-  // no user config/rules/AGENTS.md ingestion, no web search. `-` reads the prompt
-  // from stdin so message content never appears in the process argument list.
+  const writableRoots = input.writableRoots ?? [];
+  // The receiver stays as close to text-only as codex allows: no user
+  // config/rules/AGENTS.md ingestion and no web search. Edit grants switch to
+  // workspace-write with explicit writable roots. `-` reads the prompt from
+  // stdin so message content never appears in the process argument list.
   const isolation = [
     "--json",
     "--skip-git-repo-check",
     "--ignore-user-config",
     "--ignore-rules",
-    "-c", 'sandbox_mode="read-only"',
+    "-c", writableRoots.length > 0 ? 'sandbox_mode="workspace-write"' : 'sandbox_mode="read-only"',
+    ...(writableRoots.length > 0
+      ? ["-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`]
+      : []),
     "-c", "project_doc_max_bytes=0",
     "-c", "tools.web_search=false",
     ...(input.model ? ["-m", input.model] : []),

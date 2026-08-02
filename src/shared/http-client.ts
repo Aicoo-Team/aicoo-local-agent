@@ -5,6 +5,8 @@ import type {
   DeliveryAckInput,
   Endpoint,
   HumanInboxSendMessageInput,
+  LocalAgentDelegationInput,
+  LocalAgentDelegationResponse,
   MessageDelivery,
   MessageReceipt,
   ReachableTarget,
@@ -173,6 +175,10 @@ export class HttpMessageTransport implements MessageTransport {
 
   async sendMessage(input: SendMessageInput): Promise<MessageReceipt> {
     return this.requestJson("/api/v1/messages", { method: "POST", body: input });
+  }
+
+  async delegateLocalAgentTask(input: LocalAgentDelegationInput): Promise<LocalAgentDelegationResponse> {
+    return this.requestJson("/api/v1/local-agent/delegations", { method: "POST", body: input });
   }
 
   async sendInbox(input: HumanInboxSendMessageInput): Promise<MessageReceipt> {

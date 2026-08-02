@@ -408,9 +408,15 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
   private async launchSession(session: ManagedSession): Promise<void> {
     const managedTools = RelationshipPolicy.supportedTools();
+    const policy = this.relationshipPolicy();
+    const additionalDirectories = policy?.grantedFolders() ?? [];
+    const writableFolders = policy?.writableFolders() ?? [];
+    const denyRead = policy?.sandboxDenyReadPaths() ?? [];
+    const denyWrite = policy?.sandboxDenyWritePaths() ?? [];
     const options: Options = {
       cwd: this.#config.cwd,
       abortController: session.abortController,
+      ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
       ...(session.initialized
         ? { resume: session.providerSessionId }
         : { sessionId: session.providerSessionId }),
@@ -429,6 +435,17 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       mcpServers: {},
       strictMcpConfig: true,
       permissionMode: "dontAsk",
+      sandbox: {
+        enabled: true,
+        failIfUnavailable: true,
+        autoAllowBashIfSandboxed: false,
+        allowUnsandboxedCommands: false,
+        filesystem: {
+          ...(writableFolders.length > 0 ? { allowWrite: writableFolders } : {}),
+          ...(denyRead.length > 0 ? { denyRead } : {}),
+          ...(denyWrite.length > 0 ? { denyWrite } : {}),
+        },
+      },
       canUseTool: async (toolName, input) => {
         const activeMessage = session.acceptedTurns[0]?.message;
         if (!this.#config.relationshipPolicyFile) {
@@ -587,6 +604,16 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       };
       return { cursor: String(row.seq), type: row.event_type, ...data };
     });
+  }
+
+  private relationshipPolicy(): RelationshipPolicy | undefined {
+    if (!this.#config.relationshipPolicyFile) return undefined;
+    try {
+      return RelationshipPolicy.fromFile(this.#config.relationshipPolicyFile, this.#config.cwd);
+    } catch (error) {
+      this.#config.log?.(`claude relationship policy could not be loaded for sandbox setup: ${String(error)}`);
+      return undefined;
+    }
   }
 }
 

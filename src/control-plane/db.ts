@@ -122,6 +122,19 @@ CREATE TABLE IF NOT EXISTS deliveries (
   adapter_label TEXT
 );
 
+CREATE TABLE IF NOT EXISTS local_agent_delegations (
+  requester_principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+  client_message_id TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  comm_session_id TEXT REFERENCES comm_sessions(comm_session_id),
+  message_id TEXT REFERENCES messages(message_id),
+  correlation_id TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(requester_principal_id, client_message_id)
+);
+
 CREATE TABLE IF NOT EXISTS delivery_attempts (
   attempt_id TEXT PRIMARY KEY,
   delivery_id TEXT NOT NULL REFERENCES deliveries(delivery_id),

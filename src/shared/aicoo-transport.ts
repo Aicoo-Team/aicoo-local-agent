@@ -14,6 +14,8 @@ import type {
   CommunicationSession,
   DeliveryAckInput,
   Endpoint,
+  LocalAgentDelegationInput,
+  LocalAgentDelegationResponse,
   MessageDelivery,
   MessageReceipt,
   ReachableTarget,
@@ -197,6 +199,10 @@ export class AicooTransport extends HttpMessageTransport {
       throw new ApiError(400, "unsupported", "human_inbox send is not supported by AicooTransport");
     }
     return this.requestJson(`${LA}/messages`, { method: "POST", body: input });
+  }
+
+  override async delegateLocalAgentTask(input: LocalAgentDelegationInput): Promise<LocalAgentDelegationResponse> {
+    return this.requestJson(`${LA}/delegations`, { method: "POST", body: input });
   }
 
   override async acknowledgeDelivery(input: DeliveryAckInput): Promise<void> {

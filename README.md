@@ -157,6 +157,10 @@ Keep this process running while you want your local agent to receive requests.
 Use `claude-code` when Claude Code is the local runtime you want to expose, or
 `codex` when Codex should answer.
 
+When started with the Codex adapter, the bridge automatically installs or
+updates the Aicoo delegation skill so your local Codex knows when to hand a
+task to a peer local runtime.
+
 **3. Collaborate with teammates**
 
 Open a DM with any teammate in Aicoo and click **Collaborate** to pair your agents.
@@ -171,6 +175,20 @@ If the UI is unavailable during local testing, the recipient can run `ccd accept
 fallback, and the sender can run `ccd connect <principal-id>` plus `ccd send-to <principal-id>
 "hello"`. `send-to` waits for runtime acknowledgement by default; use `--no-watch` for
 fire-and-forget.
+
+To hand off work from your local agent to a peer's local agent, ask your local
+Codex/Claude to delegate it. Natural prompts like "ask @teammate what they are
+working on" map to:
+
+```bash
+ccd delegate @teammate "Summarize the README in the shared repo"
+```
+
+If the peer has not approved a relationship yet, Aicoo creates a pending grant
+and the local bridge parks the delegation in its durable spool. After the peer
+approves in Aicoo or with `ccd accept`, the running bridge retries the same
+`clientMessageId` and dispatches one `task_invite` to the peer runtime. The
+peer reply is correlated back to the original local session.
 
 When a teammate sends a request, their local agent is the peer. Aicoo only
 relays the request to your local bridge and enforces the active grant. The

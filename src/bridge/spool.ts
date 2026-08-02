@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import type { MessageEnvelope, RuntimeEvent } from "../shared/contracts.js";
+import type { LocalAgentDelegationInput, MessageEnvelope, RuntimeEvent } from "../shared/contracts.js";
 
 export type SpoolStatus =
   | "received"
@@ -44,6 +44,25 @@ export interface OutboundReply {
   status: "pending" | "sent" | "failed";
   attemptCount: number;
   lastError?: string;
+}
+
+export type PendingDelegationStatus = "grant_requested" | "delegated" | "failed";
+
+export interface PendingDelegation {
+  clientMessageId: string;
+  target: LocalAgentDelegationInput["target"];
+  task: LocalAgentDelegationInput["task"];
+  sessionHandle: string;
+  correlationId?: string;
+  requestedTtlMinutes?: number;
+  communicationSessionId?: string;
+  messageId?: string;
+  status: PendingDelegationStatus;
+  attemptCount: number;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
 }
 
 export class BridgeSpool {
@@ -108,8 +127,26 @@ export class BridgeSpool {
         attempt_count INTEGER NOT NULL DEFAULT 0,
         last_error TEXT
       );
+      CREATE TABLE IF NOT EXISTS pending_delegations (
+        client_message_id TEXT PRIMARY KEY,
+        target_json TEXT NOT NULL,
+        task_json TEXT NOT NULL,
+        session_handle TEXT NOT NULL,
+        correlation_id TEXT,
+        requested_ttl_minutes INTEGER,
+        comm_session_id TEXT,
+        message_id TEXT,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_spool_injectable
         ON spool_messages(status, comm_session_id, sequence);
+      CREATE INDEX IF NOT EXISTS idx_pending_delegations_status
+        ON pending_delegations(status, comm_session_id, expires_at);
     `);
   }
 
@@ -364,6 +401,84 @@ export class BridgeSpool {
     return row ? mapOutbound(row) : undefined;
   }
 
+  storePendingDelegation(input: {
+    clientMessageId: string;
+    target: LocalAgentDelegationInput["target"];
+    task: LocalAgentDelegationInput["task"];
+    sessionHandle: string;
+    correlationId?: string;
+    requestedTtlMinutes?: number;
+    communicationSessionId?: string;
+    messageId?: string;
+    status: PendingDelegationStatus;
+    expiresAt: string;
+  }): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `INSERT INTO pending_delegations(client_message_id, target_json, task_json, session_handle,
+       correlation_id, requested_ttl_minutes, comm_session_id, message_id, status, created_at, updated_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(client_message_id) DO UPDATE SET
+       comm_session_id = COALESCE(excluded.comm_session_id, pending_delegations.comm_session_id),
+       message_id = COALESCE(excluded.message_id, pending_delegations.message_id),
+       status = excluded.status,
+       updated_at = excluded.updated_at,
+       expires_at = excluded.expires_at`,
+    ).run(
+      input.clientMessageId,
+      JSON.stringify(input.target),
+      JSON.stringify(input.task),
+      input.sessionHandle,
+      input.correlationId ?? null,
+      input.requestedTtlMinutes ?? null,
+      input.communicationSessionId ?? null,
+      input.messageId ?? null,
+      input.status,
+      now,
+      now,
+      input.expiresAt,
+    );
+  }
+
+  listPendingDelegations(commSessionId?: string): PendingDelegation[] {
+    const rows = commSessionId
+      ? this.db.prepare(
+        `SELECT * FROM pending_delegations
+         WHERE status = 'grant_requested' AND comm_session_id = ?
+         ORDER BY created_at`,
+      ).all(commSessionId)
+      : this.db.prepare(
+        `SELECT * FROM pending_delegations
+         WHERE status = 'grant_requested'
+         ORDER BY created_at`,
+      ).all();
+    return (rows as unknown as PendingDelegationRow[]).map(mapPendingDelegation);
+  }
+
+  markDelegationAttempt(clientMessageId: string, error?: string): void {
+    this.db.prepare(
+      `UPDATE pending_delegations
+       SET attempt_count = attempt_count + 1, last_error = ?, updated_at = ?
+       WHERE client_message_id = ?`,
+    ).run(error ?? null, new Date().toISOString(), clientMessageId);
+  }
+
+  markDelegationDelegated(clientMessageId: string, messageId: string, commSessionId: string): void {
+    this.db.prepare(
+      `UPDATE pending_delegations
+       SET status = 'delegated', message_id = ?, comm_session_id = ?, last_error = NULL, updated_at = ?
+       WHERE client_message_id = ?`,
+    ).run(messageId, commSessionId, new Date().toISOString(), clientMessageId);
+  }
+
+  markDelegationsFailed(commSessionId: string, error: string): void {
+    this.db.prepare(
+      `UPDATE pending_delegations
+       SET status = 'failed', last_error = ?, updated_at = ?
+       WHERE comm_session_id = ? AND status = 'grant_requested'`,
+    ).run(error, new Date().toISOString(), commSessionId);
+  }
+
   getMessage(messageId: string): SpoolMessage | undefined {
     const row = this.db.prepare("SELECT * FROM spool_messages WHERE message_id = ?").get(messageId) as unknown as
       | SpoolRow
@@ -402,6 +517,23 @@ interface OutboundRow {
   last_error: string | null;
 }
 
+interface PendingDelegationRow {
+  client_message_id: string;
+  target_json: string;
+  task_json: string;
+  session_handle: string;
+  correlation_id: string | null;
+  requested_ttl_minutes: number | null;
+  comm_session_id: string | null;
+  message_id: string | null;
+  status: PendingDelegationStatus;
+  attempt_count: number;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+}
+
 function mapSpool(row: SpoolRow): SpoolMessage {
   return {
     messageId: row.message_id,
@@ -428,5 +560,24 @@ function mapOutbound(row: OutboundRow): OutboundReply {
     status: row.status,
     attemptCount: row.attempt_count,
     ...(row.last_error ? { lastError: row.last_error } : {}),
+  };
+}
+
+function mapPendingDelegation(row: PendingDelegationRow): PendingDelegation {
+  return {
+    clientMessageId: row.client_message_id,
+    target: JSON.parse(row.target_json) as LocalAgentDelegationInput["target"],
+    task: JSON.parse(row.task_json) as LocalAgentDelegationInput["task"],
+    sessionHandle: row.session_handle,
+    ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
+    ...(row.requested_ttl_minutes ? { requestedTtlMinutes: row.requested_ttl_minutes } : {}),
+    ...(row.comm_session_id ? { communicationSessionId: row.comm_session_id } : {}),
+    ...(row.message_id ? { messageId: row.message_id } : {}),
+    status: row.status,
+    attemptCount: row.attempt_count,
+    ...(row.last_error ? { lastError: row.last_error } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    expiresAt: row.expires_at,
   };
 }

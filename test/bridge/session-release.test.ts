@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeAdapter } from "../../src/adapters/runtime-adapter.js";
-import { RuntimeBridge } from "../../src/bridge/bridge.js";
+import { requestRuntimeDelegation, RuntimeBridge } from "../../src/bridge/bridge.js";
 import { BridgeSpool } from "../../src/bridge/spool.js";
 import type { RuntimeEvent } from "../../src/shared/contracts.js";
 import type { HttpMessageTransport } from "../../src/shared/http-client.js";
@@ -52,6 +52,86 @@ describe("RuntimeBridge communication session release", () => {
     await callHandleEvent(bridge, event("comm.activated", "comm_new", "server-session"));
 
     expect(adapter.prepareCommunicationSession).toHaveBeenCalledWith("native-session", "comm_new");
+  });
+
+  it("retries a parked local delegation when the peer approves the grant", async () => {
+    const delegateLocalAgentTask = vi.fn(async () => ({
+      status: "delegated" as const,
+      communicationSession: communicationSession("comm_new", "active"),
+      receipt: {
+        messageId: "msg_delegate",
+        deliveryId: "del_delegate",
+        status: "queued" as const,
+        duplicate: false,
+        queuedAt: new Date().toISOString(),
+      },
+      clientMessageId: "delegate_1",
+      correlationId: "corr_1",
+      duplicate: false,
+    }));
+    const { bridge, spool } = setup({
+      sessions: [{ sessionHandle: "native-session", label: "Native session", state: "idle", allowInbound: true }],
+      transport: transport({ delegateLocalAgentTask }),
+    });
+    cleanups.push(() => void bridge.stop());
+    await bridge.start();
+
+    // Regression: a local-to-local task parked while waiting for approval must
+    // resume from the bridge when the out-of-band grant activation arrives.
+    spool.storePendingDelegation({
+      clientMessageId: "delegate_1",
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      task: "Summarize README",
+      sessionHandle: "server-session",
+      correlationId: "corr_1",
+      communicationSessionId: "comm_new",
+      status: "grant_requested",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    await callHandleEvent(bridge, event("comm.activated", "comm_new", "server-session"));
+
+    expect(delegateLocalAgentTask).toHaveBeenCalledTimes(1);
+    expect(delegateLocalAgentTask).toHaveBeenCalledWith({
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      task: "Summarize README",
+      sessionHandle: "server-session",
+      clientMessageId: "delegate_1",
+      correlationId: "corr_1",
+    });
+    expect(spool.listPendingDelegations("comm_new")).toEqual([]);
+  });
+
+  it("stores a local delegation for the running bridge to resume after approval", async () => {
+    const delegateLocalAgentTask = vi.fn(async () => ({
+      status: "grant_requested" as const,
+      communicationSession: communicationSession("comm_waiting", "pending"),
+      clientMessageId: "delegate_2",
+      correlationId: "corr_2",
+      duplicate: false,
+    }));
+    const spool = new BridgeSpool(":memory:");
+    cleanups.push(() => spool.close());
+
+    const result = await requestRuntimeDelegation({
+      transport: transport({ delegateLocalAgentTask }),
+      spool,
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      task: "Deploy preview",
+      sessionHandle: "server-session",
+      clientMessageId: "delegate_2",
+      correlationId: "corr_2",
+      timeoutMs: 60_000,
+    });
+
+    expect(result.status).toBe("grant_requested");
+    expect(spool.listPendingDelegations("comm_waiting")).toMatchObject([{
+      clientMessageId: "delegate_2",
+      task: "Deploy preview",
+      sessionHandle: "server-session",
+      correlationId: "corr_2",
+      status: "grant_requested",
+    }]);
   });
 
   it("backs off event stream reconnect failures", async () => {
@@ -182,9 +262,40 @@ function transport(overrides: Partial<HttpMessageTransport> = {}): HttpMessageTr
     updateRuntimeSession: vi.fn(async () => undefined),
     heartbeatEndpoint: vi.fn(async () => undefined),
     setDefaultRoute: vi.fn(async () => undefined),
+    delegateLocalAgentTask: vi.fn(async () => {
+      throw new Error("delegateLocalAgentTask not mocked");
+    }),
     subscribeEvents: vi.fn(async function* () {}),
     ...overrides,
   } as unknown as HttpMessageTransport;
+}
+
+function communicationSession(id: string, status: "pending" | "active") {
+  return {
+    id,
+    requester: {
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      replyEndpointId: "ep_a",
+      replySessionHandle: "server-session",
+    },
+    recipient: {
+      principalId: "prn_b",
+      targetKind: "person_default_runtime" as const,
+      endpointId: "ep_b",
+      sessionHandle: "server-session-b",
+    },
+    status,
+    capabilities: ["message:send", "message:reply"] as ["message:send", "message:reply"],
+    requestedAt: new Date().toISOString(),
+    requestExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    ...(status === "active"
+      ? {
+          activatedAt: new Date().toISOString(),
+          grantExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        }
+      : {}),
+  };
 }
 
 function storeDeviceAckedMessage(spool: BridgeSpool, communicationSessionId: string): void {

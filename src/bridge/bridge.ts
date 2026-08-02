@@ -1,7 +1,7 @@
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
 import { FakeRuntimeAdapter } from "../adapters/fake/fake-adapter.js";
 import { upsertRelationshipPreset, type RelationshipAccessPreset } from "../security/relationship-policy.js";
-import type { RuntimeEvent } from "../shared/contracts.js";
+import type { LocalAgentDelegationInput, LocalAgentDelegationResponse, RuntimeEvent } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
@@ -106,6 +106,7 @@ export class RuntimeBridge {
       this.runEvents(),
       this.runHeartbeat(),
       this.runInjector(),
+      this.runPendingDelegations(),
       this.runOutboundReplies(),
       ...this.options.spool.listSessionMappings().map(({ nativeHandle, serverHandle }) =>
         this.runAdapterEvents(nativeHandle, serverHandle)),
@@ -211,6 +212,7 @@ export class RuntimeBridge {
         await this.options.adapter.releaseCommunicationSession?.(commSessionId);
         const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
         if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.#pendingDefaultRoute = sessionHandle;
+        this.options.spool.markDelegationsFailed(commSessionId, "communication_session_revoked");
       }
     } else if (event.type === "comm.expired") {
       const commSessionId = String(event.data.communicationSessionId ?? "");
@@ -219,6 +221,7 @@ export class RuntimeBridge {
         await this.options.adapter.releaseCommunicationSession?.(commSessionId);
         const sessionHandle = typeof event.data.sessionHandle === "string" ? event.data.sessionHandle : undefined;
         if (sessionHandle && this.#serverToNative.has(sessionHandle)) this.#pendingDefaultRoute = sessionHandle;
+        this.options.spool.markDelegationsFailed(commSessionId, "communication_session_expired");
       }
     } else if (event.type === "comm.activated") {
       const commSessionId = String(event.data.communicationSessionId ?? "");
@@ -235,6 +238,7 @@ export class RuntimeBridge {
         }
         this.rotateDefaultRouteAfterActivation(sessionHandle);
       }
+      if (commSessionId) await this.retryPendingDelegations(commSessionId);
     } else if (event.type === "relationship.policy_update") {
       this.applyRelationshipPolicyUpdate(event.data);
     }
@@ -303,6 +307,59 @@ export class RuntimeBridge {
     while (!this.#controller.signal.aborted) {
       await this.#injector?.runOnce();
       await delay(this.options.injectorMs ?? 100, this.#controller.signal);
+    }
+  }
+
+  private async runPendingDelegations(): Promise<void> {
+    while (!this.#controller.signal.aborted) {
+      await this.retryPendingDelegations();
+      await delay(this.options.heartbeatMs ?? 20_000, this.#controller.signal);
+    }
+  }
+
+  private async retryPendingDelegations(commSessionId?: string): Promise<void> {
+    for (const pending of this.options.spool.listPendingDelegations(commSessionId)) {
+      if (Date.parse(pending.expiresAt) <= Date.now()) {
+        if (pending.communicationSessionId) {
+          this.options.spool.markDelegationsFailed(pending.communicationSessionId, "delegation_timeout");
+        } else {
+          this.options.spool.markDelegationAttempt(pending.clientMessageId, "delegation_timeout");
+        }
+        this.options.log?.(`delegation ${pending.clientMessageId} timed out before dispatch`);
+        continue;
+      }
+
+      try {
+        const result = await this.options.transport.delegateLocalAgentTask({
+          target: pending.target,
+          task: pending.task,
+          sessionHandle: pending.sessionHandle,
+          clientMessageId: pending.clientMessageId,
+          ...(pending.correlationId ? { correlationId: pending.correlationId } : {}),
+          ...(pending.requestedTtlMinutes ? { requestedTtlMinutes: pending.requestedTtlMinutes } : {}),
+        });
+        recordDelegationResult(this.options.spool, result, {
+          target: pending.target,
+          task: pending.task,
+          sessionHandle: pending.sessionHandle,
+          expiresAt: pending.expiresAt,
+          requestedTtlMinutes: pending.requestedTtlMinutes,
+        });
+      } catch (error) {
+        const terminal = error instanceof ApiError
+          && error.status >= 400
+          && error.status < 500
+          && error.status !== 408
+          && error.status !== 409
+          && error.status !== 429;
+        const message = error instanceof ApiError ? error.code : String(error);
+        if (terminal && pending.communicationSessionId) {
+          this.options.spool.markDelegationsFailed(pending.communicationSessionId, message);
+        } else {
+          this.options.spool.markDelegationAttempt(pending.clientMessageId, message);
+        }
+        if (terminal) this.options.log?.(`delegation ${pending.clientMessageId} failed: ${message}`);
+      }
     }
   }
 
@@ -400,6 +457,77 @@ export class RuntimeBridge {
       .find((serverHandle) => serverHandle !== activatedServerHandle);
     if (replacement) this.#pendingDefaultRoute = replacement;
   }
+}
+
+export async function requestRuntimeDelegation(input: {
+  transport: BridgeOptions["transport"];
+  spool: BridgeSpool;
+  target: LocalAgentDelegationInput["target"];
+  task: LocalAgentDelegationInput["task"];
+  sessionHandle: string;
+  clientMessageId: string;
+  correlationId?: string;
+  requestedTtlMinutes?: number;
+  timeoutMs?: number;
+}): Promise<LocalAgentDelegationResponse> {
+  const expiresAt = new Date(Date.now() + (input.timeoutMs ?? 30 * 60_000)).toISOString();
+  const result = await input.transport.delegateLocalAgentTask({
+    target: input.target,
+    task: input.task,
+    sessionHandle: input.sessionHandle,
+    clientMessageId: input.clientMessageId,
+    ...(input.correlationId ? { correlationId: input.correlationId } : {}),
+    ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
+  });
+  recordDelegationResult(input.spool, result, {
+    target: input.target,
+    task: input.task,
+    sessionHandle: input.sessionHandle,
+    expiresAt,
+    requestedTtlMinutes: input.requestedTtlMinutes,
+  });
+  return result;
+}
+
+function recordDelegationResult(
+  spool: BridgeSpool,
+  result: LocalAgentDelegationResponse,
+  input: {
+    target: LocalAgentDelegationInput["target"];
+    task: LocalAgentDelegationInput["task"];
+    sessionHandle: string;
+    expiresAt: string;
+    requestedTtlMinutes?: number;
+  },
+): void {
+  if (result.status === "delegated") {
+    spool.storePendingDelegation({
+      clientMessageId: result.clientMessageId,
+      target: input.target,
+      task: input.task,
+      sessionHandle: input.sessionHandle,
+      ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+      ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
+      communicationSessionId: result.communicationSession.id,
+      messageId: result.receipt.messageId,
+      status: "delegated",
+      expiresAt: input.expiresAt,
+    });
+    spool.markDelegationDelegated(result.clientMessageId, result.receipt.messageId, result.communicationSession.id);
+    return;
+  }
+
+  spool.storePendingDelegation({
+    clientMessageId: result.clientMessageId,
+    target: input.target,
+    task: input.task,
+    sessionHandle: input.sessionHandle,
+    ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+    ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
+    communicationSessionId: result.communicationSession.id,
+    status: "grant_requested",
+    expiresAt: input.expiresAt,
+  });
 }
 
 function delay(milliseconds: number, signal: AbortSignal): Promise<void> {

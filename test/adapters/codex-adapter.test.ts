@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -94,7 +94,40 @@ describe("CodexAdapter managed sessions", () => {
       }),
     ]);
     expect(driver.turns[0]?.prompt).toContain("[Aicoo brokered file-operation request]");
+    expect(driver.turns[0]?.writableRoots).toEqual([]);
     expect(driver.turns[1]?.prompt).toContain("[Aicoo brokered file-operation results]");
+  });
+
+  it("passes edit-project folders as Codex writable roots", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-writable-roots-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "edit-project",
+      folder: project,
+    });
+    const driver = new FakeCodexDriver(JSON.stringify({ response: "No write needed." }));
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_edit_policy"), "queue")).status)
+      .toBe("runtime_acked");
+
+    expect(driver.turns[0]?.writableRoots).toEqual([realpathSync.native(project)]);
   });
 
   it("denies brokered Codex file operations outside the granted folder", async () => {

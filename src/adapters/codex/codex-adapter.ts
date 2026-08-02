@@ -239,6 +239,7 @@ export class CodexAdapter implements RuntimeAdapter {
     const turn = this.#driver.startTurn({
       prompt: brokerPolicy && !contextOnly ? formatBrokerRequest(message) : formatInbound(message, contextOnly),
       cwd: this.#config.cwd,
+      ...(brokerPolicy && !contextOnly ? { writableRoots: brokerPolicy.writableFolders() } : {}),
       ...(session.providerThreadId ? { resumeThreadId: session.providerThreadId } : {}),
       ...(this.#config.codexPath ? { codexPath: this.#config.codexPath } : {}),
       ...(this.#config.model ? { model: this.#config.model } : {}),

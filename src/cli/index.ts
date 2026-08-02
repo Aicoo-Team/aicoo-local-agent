@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
-import { RuntimeBridge } from "../bridge/bridge.js";
+import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
 import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
@@ -17,6 +17,7 @@ import {
 } from "../security/relationship-policy.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
+import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
@@ -391,6 +392,60 @@ program.command("send-to")
     }
   });
 
+program.command("delegate")
+  .description("ask a peer's local Codex/Claude to do a task through Aicoo relay")
+  .argument("<person>", "peer principal ID or @handle")
+  .argument("<task...>", "task for the peer local agent")
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--client-id <id>", "stable id for retrying this delegation")
+  .option("--correlation-id <id>", "stable id used to correlate the peer reply")
+  .option("--ttl <minutes>", "grant TTL", "30")
+  .option("--timeout <seconds>", "local pending-delegation timeout", "1800")
+  .option("--server <url>", "control-plane URL")
+  .action(async (person, taskParts, options) => {
+    const client = makeHostedClient(options.server, options.spool);
+    let targetPrincipalId = person;
+    if (person.startsWith("@") || !isUuid(person)) {
+      try {
+        const resolved = await client.resolvePerson(person);
+        targetPrincipalId = resolved.principalId;
+      } catch (error) {
+        console.error(`Could not resolve person '${person}': ${errorMessage(error)}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    const route = await resolveRoute({ spool: options.spool });
+    const clientMessageId = options.clientId ?? `delegate:${randomUUID()}`;
+    const correlationId = options.correlationId ?? clientMessageId;
+    const spool = new BridgeSpool(options.spool);
+    try {
+      const result = await requestRuntimeDelegation({
+        transport: client,
+        spool,
+        target: { kind: "person_default_runtime", principalId: targetPrincipalId },
+        task: taskParts.join(" "),
+        sessionHandle: route.sessionHandle,
+        clientMessageId,
+        correlationId,
+        requestedTtlMinutes: Number.parseInt(options.ttl, 10),
+        timeoutMs: Number.parseInt(options.timeout, 10) * 1000,
+      });
+      if (result.status === "delegated") {
+        console.log(`Delegated to ${person}'s local agent.`);
+        console.log(`messageId: ${result.receipt.messageId}`);
+      } else {
+        console.log(`Approval requested from ${person}. The bridge will dispatch after they approve.`);
+        console.log(`requestId: ${result.communicationSession.id}`);
+      }
+      console.log(`clientMessageId: ${result.clientMessageId}`);
+      console.log(`correlationId: ${result.correlationId ?? correlationId}`);
+    } finally {
+      spool.close();
+    }
+  });
+
 program.command("send-inbox")
   .requiredOption("--to <principalId>")
   .requiredOption("--text <message>")
@@ -488,6 +543,16 @@ program.command("doctor")
     });
   });
 
+program.command("install-codex-skill")
+  .description("install the Aicoo local-to-local delegation skill for Codex")
+  .option("--target-dir <dir>", "Codex skill directory to write")
+  .action((options) => {
+    const result = installCodexSkill({ targetDir: options.targetDir });
+    console.log(`${result.overwritten ? "Updated" : "Installed"} Aicoo C2C Codex skill.`);
+    console.log(`skillFile: ${result.skillFile}`);
+    console.log("Restart Codex so it can load the new skill.");
+  });
+
 program.showHelpAfterError();
 program.parseAsync().catch((error: unknown) => {
   if (error instanceof ApiError) {
@@ -534,6 +599,9 @@ async function startBridge(options: {
     model: options.model,
     log: console.log,
   });
+  if (selected.runtime === "codex") {
+    ensureCodexSkill({ log: options.json ? undefined : console.log });
+  }
   const deviceId = resolveDeviceId(undefined, options.spool);
   const spool = new BridgeSpool(options.spool);
   const bridge = new RuntimeBridge({

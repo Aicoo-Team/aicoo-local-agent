@@ -3,6 +3,8 @@ import type {
   CommunicationSession,
   DeliveryAckInput,
   Endpoint,
+  LocalAgentDelegationInput,
+  LocalAgentDelegationResponse,
   MessageDelivery,
   MessageReceipt,
   ReachableTarget,
@@ -21,6 +23,7 @@ export interface MessageTransport {
   declineCommunicationSession(sessionId: string): Promise<void>;
   revokeCommunicationSession(sessionId: string): Promise<void>;
   sendMessage(input: SendMessageInput): Promise<MessageReceipt>;
+  delegateLocalAgentTask(input: LocalAgentDelegationInput): Promise<LocalAgentDelegationResponse>;
   subscribeEvents(cursor?: string, signal?: AbortSignal): AsyncIterable<RuntimeEvent>;
   fetchInbox(afterCursor?: string): Promise<RuntimeEvent[]>;
   validateInjection(input: {
