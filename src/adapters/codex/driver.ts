@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { AsyncMessageQueue } from "../claude-code/message-queue.js";
 import type { PreparedCodexProfile } from "./permission-profile.js";
+import type { CodexApprovalDecision, CodexApprovalRequest } from "./app-server-protocol.js";
 
 export interface CodexThreadItem {
   id?: string;
@@ -39,6 +40,13 @@ export interface CodexTurnStartInput {
   permissionProfile?: PreparedCodexProfile;
   codexPath?: string;
   model?: string;
+  /**
+   * Asked before anything the sandbox cannot already do, so the owner decides instead of the
+   * caller getting a refusal for something they would have allowed. Per turn rather than per
+   * driver because the answer has to be attributed to the message that provoked it.
+   * Only the app-server driver can honour this; `codex exec` has no way to be interrupted.
+   */
+  onApproval?: (request: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
   log?: (line: string) => void;
 }
 

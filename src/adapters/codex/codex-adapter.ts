@@ -6,7 +6,8 @@ import { RelationshipPolicy } from "../../security/relationship-policy.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
 import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from "../runtime-adapter.js";
-import { CodexExecDriver, type CodexDriver, type CodexThreadEvent, type CodexTurn } from "./driver.js";
+import { CodexExecDriver, type CodexDriver, type CodexThreadEvent, type CodexTurn, type CodexTurnStartInput } from "./driver.js";
+import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 
 export interface CodexAdapterConfig {
   stateFile: string;
@@ -17,6 +18,11 @@ export interface CodexAdapterConfig {
   model?: string;
   turnAckTimeoutMs?: number;
   driver?: CodexDriver;
+  /**
+   * When set, a call the sandbox cannot satisfy becomes a question for the owner instead of a
+   * refusal. Only reachable with the app-server driver; `codex exec` cannot be interrupted.
+   */
+  approvalGateway?: ToolApprovalGateway;
   log?: (line: string) => void;
 }
 
@@ -77,6 +83,36 @@ export class CodexAdapter implements RuntimeAdapter {
   readonly #config: CodexAdapterConfig;
   #closing = false;
   #closed = false;
+
+  /**
+   * Turns a Codex approval question into the same owner prompt Claude Code raises, so one
+   * relationship behaves the same way whichever runtime the peer happens to run.
+   *
+   * Returns nothing when there is no gateway or no live session to attribute the answer to; the
+   * driver then refuses on its own, which is the pre-existing behaviour rather than a new bypass.
+   */
+  #approvalRoute(message: InboundMessage, sessionHandle: string): { onApproval?: CodexTurnStartInput["onApproval"] } {
+    const gateway = this.#config.approvalGateway;
+    const communicationSessionId = message.communicationSessionId;
+    if (!gateway || !communicationSessionId) return {};
+    return {
+      onApproval: async (request) => {
+        const outcome = await awaitToolApproval(
+          gateway,
+          {
+            communicationSessionId,
+            sessionHandle,
+            ...(message.id ? { messageId: message.id } : {}),
+            // The owner reads one line, so it names the command, not the mechanism.
+            toolName: request.kind === "commandExecution" ? "Bash" : request.kind === "fileChange" ? "Edit" : "Permissions",
+            toolInputSummary: request.summary,
+          },
+          { log: this.#config.log },
+        );
+        return outcome.behavior === "allow" ? "accept" : "decline";
+      },
+    };
+  }
 
   constructor(config: CodexAdapterConfig) {
     this.#config = config;
@@ -243,6 +279,7 @@ export class CodexAdapter implements RuntimeAdapter {
       ...(session.providerThreadId ? { resumeThreadId: session.providerThreadId } : {}),
       ...(this.#config.codexPath ? { codexPath: this.#config.codexPath } : {}),
       ...(this.#config.model ? { model: this.#config.model } : {}),
+      ...this.#approvalRoute(message, session.localHandle),
       log: this.#config.log,
     });
     const active: ActiveTurn = { message, runtimeTurnId, contextOnly, turn, done: Promise.resolve(), ...(brokerPolicy && !contextOnly ? { brokerPolicy } : {}) };

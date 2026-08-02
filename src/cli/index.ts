@@ -125,6 +125,7 @@ program.command("bridge")
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
   .option("--no-local-helper", "disable the localhost folder/file picker helper")
@@ -145,6 +146,7 @@ program.command("start")
   .option("--sessions <count>", "managed session count", "2")
   .option("--workspace <dir>", "managed-session workspace", process.cwd())
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
@@ -608,6 +610,7 @@ async function startBridge(options: {
   claudePath?: string;
   codexState?: string;
   codexPath?: string;
+  codexAppServer?: boolean;
   localHelper?: boolean;
   localHelperPort?: string;
   localHelperHost?: string;
@@ -637,6 +640,8 @@ async function startBridge(options: {
     codexPath: options.codexPath,
     relationshipPolicyFile: options.relationshipPolicy ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
     ...(approvalGateway ? { approvalGateway } : {}),
+    // Opt-in: drives Codex through app-server so the owner can be asked mid-turn.
+    ...(options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1" ? { codexAppServer: true } : {}),
     model: options.model,
     log: console.log,
   });
