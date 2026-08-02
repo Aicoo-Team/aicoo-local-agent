@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { AsyncMessageQueue } from "../claude-code/message-queue.js";
+import type { PreparedCodexProfile } from "./permission-profile.js";
 
 export interface CodexThreadItem {
   id?: string;
@@ -30,6 +31,12 @@ export interface CodexTurnStartInput {
   cwd: string;
   resumeThreadId?: string;
   writableRoots?: string[];
+  /**
+   * Kernel-enforced scoping for this relationship. When present it replaces the sandbox_mode
+   * flags entirely: those grant root-level read (writable_roots scopes writes only), so they
+   * cannot express "this folder and nothing else". See permission-profile.ts.
+   */
+  permissionProfile?: PreparedCodexProfile;
   codexPath?: string;
   model?: string;
   log?: (line: string) => void;
@@ -71,7 +78,9 @@ class CodexExecTurn implements CodexTurn {
     this.#child = spawn(spawnCommand.command, spawnCommand.args, {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: input.permissionProfile
+        ? { ...process.env, CODEX_HOME: input.permissionProfile.codexHome }
+        : process.env,
       windowsVerbatimArguments: false,
     });
     this.#child.stdin?.end(input.prompt);
@@ -159,21 +168,33 @@ export function buildCodexSpawnCommand(
   };
 }
 
-function buildArgs(input: CodexTurnStartInput): string[] {
+export function buildArgs(input: CodexTurnStartInput): string[] {
   const writableRoots = input.writableRoots ?? [];
   // The receiver stays as close to text-only as codex allows: no user
   // config/rules/AGENTS.md ingestion and no web search. Edit grants switch to
   // workspace-write with explicit writable roots. `-` reads the prompt from
   // stdin so message content never appears in the process argument list.
+  // A permission profile expresses what sandbox_mode cannot: reads scoped to the granted
+  // folders. When one is supplied it is authoritative and the sandbox_mode flags are dropped,
+  // since the profile already pins both read and write scope plus network.
+  const profile = input.permissionProfile;
   const isolation = [
     "--json",
     "--skip-git-repo-check",
-    "--ignore-user-config",
+    // --ignore-user-config means "do not load $CODEX_HOME/config.toml", which is exactly where
+    // the permission profile lives — passing both would silently run with no profile. It exists
+    // to keep the owner's own Codex config away from a remote caller, and the private CODEX_HOME
+    // the profile is written into already does that, more thoroughly.
+    ...(profile ? [] : ["--ignore-user-config"]),
     "--ignore-rules",
-    "-c", writableRoots.length > 0 ? 'sandbox_mode="workspace-write"' : 'sandbox_mode="read-only"',
-    ...(writableRoots.length > 0
-      ? ["-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`]
-      : []),
+    ...(profile
+      ? ["-P", profile.profileName]
+      : [
+        "-c", writableRoots.length > 0 ? 'sandbox_mode="workspace-write"' : 'sandbox_mode="read-only"',
+        ...(writableRoots.length > 0
+          ? ["-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`]
+          : []),
+      ]),
     "-c", "project_doc_max_bytes=0",
     "-c", "tools.web_search=false",
     ...(input.model ? ["-m", input.model] : []),
