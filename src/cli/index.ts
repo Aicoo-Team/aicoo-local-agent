@@ -662,15 +662,48 @@ function getCredentialsFile(spoolFile?: string): string {
   return `${spoolFile}.credentials.json`;
 }
 
+interface SavedCredentials {
+  token?: string;
+  deviceToken?: string;
+  userId?: string;
+  deviceId?: string;
+  updatedAt?: string;
+}
+
+function loadSavedCredentials(spoolFile?: string): SavedCredentials | undefined {
+  const primaryFile = getCredentialsFile(spoolFile);
+  const files = primaryFile === DEFAULT_CREDENTIALS_FILE ? [primaryFile] : [primaryFile, DEFAULT_CREDENTIALS_FILE];
+  for (const file of files) {
+    try {
+      if (existsSync(file)) {
+        return JSON.parse(readFileSync(file, "utf8")) as SavedCredentials;
+      }
+    } catch {
+      /* unreadable credentials file */
+    }
+  }
+  return undefined;
+}
+
 function loadSavedToken(spoolFile?: string): string | undefined {
-  const file = getCredentialsFile(spoolFile);
+  const parsed = loadSavedCredentials(spoolFile);
+  return parsed ? parsed.token ?? parsed.deviceToken : undefined;
+}
+
+function loadSavedDeviceId(spoolFile?: string): string | undefined {
+  const saved = loadSavedCredentials(spoolFile)?.deviceId?.trim();
+  return saved || undefined;
+}
+
+function loadSavedDeviceIdFromFile(spoolFile: string): string | undefined {
+  const file = `${spoolFile}.device-id`;
   try {
     if (existsSync(file)) {
-      const parsed = JSON.parse(readFileSync(file, "utf8"));
-      return (parsed.token ?? parsed.deviceToken) as string | undefined;
+      const saved = readFileSync(file, "utf8").trim();
+      if (saved) return saved;
     }
   } catch {
-    /* unreadable credentials file */
+    /* unreadable device-id file */
   }
   return undefined;
 }
@@ -837,14 +870,8 @@ function resolveDeviceId(explicit: string | undefined, spoolFile: string): strin
   const trimmed = explicit?.trim();
   if (trimmed) return trimmed;
   const idFile = `${spoolFile}.device-id`;
-  try {
-    if (existsSync(idFile)) {
-      const saved = readFileSync(idFile, "utf8").trim();
-      if (saved) return saved;
-    }
-  } catch {
-    /* unreadable — fall through and regenerate */
-  }
+  const saved = loadSavedDeviceIdFromFile(spoolFile) ?? loadSavedDeviceId(spoolFile);
+  if (saved) return saved;
   const generated = `${hostname()}-${randomUUID()}`;
   ensureParentDirectory(idFile);
   try {
