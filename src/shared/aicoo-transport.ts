@@ -31,6 +31,17 @@ const LA = "/api/v1/local-agent";
 const LR = "/api/v1/local-realtime";
 
 /**
+ * Attempts per call. Two, not more: the presence caps are bounded by the control plane's 60s
+ * endpoint-staleness window (LOCAL_AGENT_ENDPOINT_STALE_MS). runHeartbeat is a serial loop —
+ * delay(heartbeatMs) -> heartbeat -> setDefaultRoute — and lastSeenAt only advances on a
+ * successful heartbeat, so the worst gap between successful beats is
+ * heartbeatMs + attempts * (heartbeatCap + routeCap). At heartbeatMs=10s and 5s caps that is
+ * 30s, comfortably inside 60s. Raising either the cap or the attempt count past this trades a
+ * recovered request for the endpoint being declared unreachable, which is strictly worse.
+ */
+const DEFAULT_ATTEMPTS = 2;
+
+/**
  * Real Aicoo transport. Implements the same surface as HttpMessageTransport but
  * targets the production endpoints (`/api/v1/local-agent/*` + `/api/v1/local-realtime/*`)
  * and swaps the Aicoo user key for a device-scoped token minted at registration.
@@ -63,39 +74,95 @@ export class AicooTransport extends HttpMessageTransport {
     return this.#deviceToken ?? this.#userToken;
   }
 
+  /**
+   * Every route this transport calls is idempotent by construction — heartbeat and
+   * setDefaultRoute are upserts, acknowledgeDelivery carries `attemptId`, sendMessage carries
+   * `clientMessageId` — so a timed-out attempt is always safe to repeat. Repeating it is worth
+   * doing: in the field we see an attempt abort at the cap and the very next request, issued
+   * microseconds later on the socket the failed attempt just opened, succeed. One retry converts
+   * that whole class of failure into a success without widening the cap.
+   *
+   * Only timeouts and transport errors are retried. An ApiError is a real answer from the server
+   * and must reach the caller intact — retrying a 401 would paper over the token-revoked path in
+   * Bridge.runHeartbeat, and retrying a 409 would just repeat a refusal.
+   */
   override async requestJson<T = unknown>(
     path: string,
-    options: { method?: string; body?: unknown; timeoutMs?: number } = {},
+    options: { method?: string; body?: unknown; timeoutMs?: number; attempts?: number } = {},
   ): Promise<T> {
+    const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
+    const attempts = Math.max(1, options.attempts ?? DEFAULT_ATTEMPTS);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return await this.#attempt<T>(path, options, timeoutMs, attempt, attempts);
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  async #attempt<T>(
+    path: string,
+    options: { method?: string; body?: unknown },
+    timeoutMs: number,
+    attempt: number,
+    attempts: number,
+  ): Promise<T> {
+    const method = options.method ?? "GET";
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? this.#timeoutMs);
+    // Abort WITH a reason. A bare abort() surfaces as "AbortError: This operation was aborted",
+    // which is indistinguishable from a cancellation and tells an operator nothing.
+    const timer = setTimeout(
+      () =>
+        controller.abort(
+          new Error(
+            `request timed out after ${timeoutMs}ms (attempt ${attempt}/${attempts}): ${method} ${path}`,
+          ),
+        ),
+      timeoutMs,
+    );
     try {
       const response = await this.#fetch(`${this.#base}${path}`, {
-        method: options.method ?? "GET",
+        method,
         headers: {
           authorization: `Bearer ${this.#authToken()}`,
           ...(options.body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
         signal: controller.signal,
+        // The apex domain 307s to www, and undici drops Authorization across that origin hop —
+        // which surfaces as an unexplained 401. Fail loudly instead.
+        redirect: "error",
       });
-      if (!response.ok) {
+      // Capture the status before touching the body: the abort timer is still armed, so a slow
+      // body read would otherwise turn a perfectly good 401 into an AbortError and bypass the
+      // token-revoked handling in Bridge.runHeartbeat.
+      const { ok, status } = response;
+      if (!ok) {
         // Read the body exactly once (undici forbids a second read); parse JSON if we can,
         // otherwise keep the raw text so the real error isn't masked.
-        const raw = await response.text();
-        let errBody: unknown = raw;
+        let errBody: unknown;
         try {
-          if (raw) errBody = JSON.parse(raw);
+          const raw = await response.text();
+          errBody = raw;
+          try {
+            if (raw) errBody = JSON.parse(raw);
+          } catch {
+            /* non-JSON error body — keep raw text */
+          }
         } catch {
-          /* non-JSON error body — keep raw text */
+          errBody = "<error body could not be read>";
         }
         const code =
           typeof errBody === "object" && errBody !== null && "error" in errBody
             ? String((errBody as { error: unknown }).error)
             : "http_error";
-        throw new ApiError(response.status, code, errBody);
+        throw new ApiError(status, code, errBody);
       }
-      if (response.status === 204) return undefined as T;
+      if (status === 204) return undefined as T;
       return (await response.json()) as T;
     } finally {
       clearTimeout(timer);
@@ -207,7 +274,15 @@ export class AicooTransport extends HttpMessageTransport {
 
   override async acknowledgeDelivery(input: DeliveryAckInput): Promise<void> {
     const { messageId, ...body } = input;
-    await this.requestJson(`${LA}/messages/${encodeURIComponent(messageId)}/ack`, { method: "POST", body });
+    // Single attempt on purpose. Injector.ackReceived() awaits this serially for every message
+    // still in 'received', so each attempt blocks the whole injector pass for its full cap —
+    // an in-transport retry would double that stall for every stuck message. The injector is
+    // already the retry loop: it re-drives this every runOnce with the same idempotent attemptId.
+    await this.requestJson(`${LA}/messages/${encodeURIComponent(messageId)}/ack`, {
+      method: "POST",
+      body,
+      attempts: 1,
+    });
   }
 
   override async validateInjection(input: {

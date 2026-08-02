@@ -7,6 +7,16 @@ import { id } from "../shared/ids.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
 import { BridgeSpool } from "./spool.js";
 
+/**
+ * The control plane declares an endpoint unreachable once lastSeenAt is older than 60s
+ * (LOCAL_AGENT_ENDPOINT_STALE_MS), and lastSeenAt only advances on a *successful* heartbeat.
+ * runHeartbeat is serial, so the worst gap between successful beats is
+ * DEFAULT_HEARTBEAT_MS + attempts * (heartbeatCap + defaultRouteCap) = 10s + 2*(5s+5s) = 30s.
+ * At the previous 20s this was 50s — one bad beat away from the endpoint being dropped from
+ * routing, which presents to the sender as "their local agent is not running".
+ */
+const DEFAULT_HEARTBEAT_MS = 10_000;
+
 export interface BridgeOptions {
   transport: HttpMessageTransport;
   spool: BridgeSpool;
@@ -273,7 +283,7 @@ export class RuntimeBridge {
 
   private async runHeartbeat(): Promise<void> {
     while (!this.#controller.signal.aborted) {
-      await delay(this.options.heartbeatMs ?? 20_000, this.#controller.signal);
+      await delay(this.options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, this.#controller.signal);
       if (this.#controller.signal.aborted) return;
       try {
         await this.options.transport.heartbeatEndpoint(this.requireEndpoint());
@@ -313,7 +323,7 @@ export class RuntimeBridge {
   private async runPendingDelegations(): Promise<void> {
     while (!this.#controller.signal.aborted) {
       await this.retryPendingDelegations();
-      await delay(this.options.heartbeatMs ?? 20_000, this.#controller.signal);
+      await delay(this.options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, this.#controller.signal);
     }
   }
 
