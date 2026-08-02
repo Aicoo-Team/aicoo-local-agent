@@ -1,10 +1,27 @@
 {
   "name": "@aicoo/dm-agent",
   "version": "0.1.0",
-  "description": "Chat-rails local agent for Aicoo: your peers DM you, your local agent answers — every tool call approved by you. No bridge, no grants, no parallel realtime stack.",
+  "description": "Let a teammate ask your local agent. They DM you on Aicoo, a Claude Code session on your machine answers, and every file it opens is approved by you, one call at a time.",
+  "keywords": [
+    "aicoo",
+    "agent",
+    "agent-to-agent",
+    "claude-code",
+    "local-agent",
+    "approval"
+  ],
+  "homepage": "https://github.com/Aicoo-Team/aicoo-local-agent/tree/main/dm-agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aicoo-Team/aicoo-local-agent.git",
+    "directory": "dm-agent"
+  },
+  "bugs": {
+    "url": "https://github.com/Aicoo-Team/aicoo-local-agent/issues"
+  },
   "type": "module",
   "bin": {
-    "aicoo-dm-agent": "./src/cli.js"
+    "aicoo-dm-agent": "src/cli.js"
   },
   "files": [
     "src",
@@ -18,6 +35,9 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.211"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "license": "Apache-2.0"
 }
