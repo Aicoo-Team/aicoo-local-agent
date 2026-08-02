@@ -321,3 +321,105 @@ function inbound(
     ...overrides,
   };
 }
+
+describe("CodeAdapter just-in-time tool approval", () => {
+  const cleanups: Array<() => Promise<void> | void> = [];
+  afterEach(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  });
+
+  function permissionContext() {
+    return { signal: new AbortController().signal, toolUseID: "t1", requestId: "r1" };
+  }
+
+  /** Records what the owner would have been shown, and answers with `decision`. */
+  function gateway(decision: "allow" | "deny") {
+    const asked: Array<{ toolName: string; toolInputSummary: string; communicationSessionId: string }> = [];
+    return {
+      asked,
+      async requestToolApproval(input: {
+        toolName: string;
+        toolInputSummary: string;
+        communicationSessionId: string;
+      }) {
+        asked.push(input);
+        return { approvalId: `appr_${asked.length}`, status: decision, decision };
+      },
+      async getToolApproval() {
+        return { status: decision, decision } as { status: string; decision: "allow" | "deny" | null };
+      },
+    };
+  }
+
+  /** A relationship with no tools: policy denies everything, so every call reaches the gateway. */
+  function chatOnlyPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-appr-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{ principalId: "prn_a", deviceId: "device-a1", tools: [], folders: [] }],
+    }));
+    return policyFile;
+  }
+
+  async function startedAdapter(approvalGateway?: ReturnType<typeof gateway>) {
+    const driver = new FakeClaudeAgentDriver();
+    // canUseTool fires mid-turn; hold the turn open so the active message (and its
+    // communicationSessionId) is still there, as it is in a real session.
+    driver.resultDelayMs = 5_000;
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: process.cwd(),
+      relationshipPolicyFile: chatOnlyPolicyFile(),
+      driver,
+      turnAckTimeoutMs: 500,
+      ...(approvalGateway ? { approvalGateway } : {}),
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    await adapter.deliverToSession("claude-managed-1", inbound("msg_appr"), "new_turn");
+    return driver.starts[0]!.options;
+  }
+
+  it("still denies outright when no approval gateway is wired", async () => {
+    // Regression guard: the ask-the-owner path must be additive, never a new way to say yes.
+    const options = await startedAdapter();
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
+      .toMatchObject({ behavior: "deny" });
+  });
+
+  it("asks the owner when policy does not cover the call, and allows on approval", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g);
+
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/secret.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "allow" });
+    // The owner sees one line, so it has to name the file — "Read" alone is not decidable.
+    expect(g.asked).toHaveLength(1);
+    expect(g.asked[0]!.toolInputSummary).toBe("Read /srv/secret.ts");
+    expect(g.asked[0]!.communicationSessionId).toBe("comm_1");
+  });
+
+  it("denies when the owner declines", async () => {
+    const g = gateway("deny");
+    const options = await startedAdapter(g);
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/secret.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "deny", interrupt: false });
+    // Must be a deny the owner chose, not the old deny-before-asking path.
+    expect(g.asked).toHaveLength(1);
+  });
+
+  it("does not re-prompt for the same call twice in one turn", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g);
+
+    await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
+    await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
+    expect(g.asked).toHaveLength(1);
+
+    // A different file is a different decision and must ask again.
+    await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
+    expect(g.asked).toHaveLength(2);
+  });
+});
