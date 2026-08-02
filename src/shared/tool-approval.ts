@@ -31,8 +31,9 @@ export interface AwaitToolApprovalOptions {
   /** How often to re-check a pending approval. */
   pollMs?: number;
   /**
-   * Give up waiting after this long. Must stay under the control plane's own approval TTL
-   * (10 minutes) — waiting past it just turns into an expiry we could have reported sooner.
+   * Give up waiting after this long. Deliberately equal to the control plane's approval TTL, so
+   * neither side keeps waiting on a decision the other has already written off. Both ends of that
+   * race are a deny, and the owner is told their late answer missed.
    */
   timeoutMs?: number;
   log?: (line: string) => void;

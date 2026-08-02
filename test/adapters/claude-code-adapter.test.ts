@@ -363,7 +363,14 @@ describe("CodeAdapter just-in-time tool approval", () => {
     return policyFile;
   }
 
-  async function startedAdapter(approvalGateway?: ReturnType<typeof gateway>) {
+  /** The state a brand-new user is in: nobody has written a policy file yet. */
+  function missingPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-nopolicy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    return join(directory, "relationships.json");
+  }
+
+  async function startedAdapter(approvalGateway?: ReturnType<typeof gateway>, policyFile?: string) {
     const driver = new FakeClaudeAgentDriver();
     // canUseTool fires mid-turn; hold the turn open so the active message (and its
     // communicationSessionId) is still there, as it is in a real session.
@@ -371,7 +378,7 @@ describe("CodeAdapter just-in-time tool approval", () => {
     const adapter = new ClaudeCodeAdapter({
       stateFile: ":memory:",
       cwd: process.cwd(),
-      relationshipPolicyFile: chatOnlyPolicyFile(),
+      relationshipPolicyFile: policyFile ?? chatOnlyPolicyFile(),
       driver,
       turnAckTimeoutMs: 500,
       ...(approvalGateway ? { approvalGateway } : {}),
@@ -421,5 +428,33 @@ describe("CodeAdapter just-in-time tool approval", () => {
     // A different file is a different decision and must ask again.
     await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
     expect(g.asked).toHaveLength(2);
+  });
+
+  it("asks the owner even before any policy file exists", async () => {
+    // The state every new install is in. If a missing file threw instead of yielding an empty
+    // policy, the catch below would deny before reaching the gateway and nobody would ever be
+    // asked — the feature would be dead for exactly the users who need it most.
+    const g = gateway("allow");
+    const options = await startedAdapter(g, missingPolicyFile());
+
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "allow" });
+    expect(g.asked).toHaveLength(1);
+  });
+
+  it("denies without asking when the policy file is present but corrupt", async () => {
+    // A broken policy is not an absent one: we cannot tell what the owner authorized, so the
+    // fail-closed path must win and the owner must not be prompted to rubber-stamp it.
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-badpolicy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, "{ not json");
+
+    const g = gateway("allow");
+    const options = await startedAdapter(g, policyFile);
+
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "deny" });
+    expect(g.asked).toHaveLength(0);
   });
 });
