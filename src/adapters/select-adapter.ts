@@ -2,6 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
 import { delimiter, resolve } from "node:path";
 import type { RuntimeKind } from "../shared/contracts.js";
+import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import { ClaudeCodeAdapter } from "./claude-code/claude-code-adapter.js";
 import { CodexAdapter } from "./codex/codex-adapter.js";
 import { FakeRuntimeAdapter } from "./fake/fake-adapter.js";
@@ -22,6 +23,8 @@ export interface RuntimeAdapterSelectionOptions {
   codexPath?: string;
   relationshipPolicyFile?: string;
   model?: string;
+  /** Lets an un-preauthorized tool be put to the owner instead of refused. Claude Code only for now. */
+  approvalGateway?: ToolApprovalGateway;
   log?: (line: string) => void;
 }
 
@@ -111,6 +114,7 @@ export async function selectRuntimeAdapter(
     sessionCount: options.sessions,
     ...(configuredPath ? { pathToClaudeCodeExecutable: configuredPath } : {}),
     ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
+    ...(options.approvalGateway ? { approvalGateway: options.approvalGateway } : {}),
     ...(options.model ? { model: options.model } : {}),
     log: options.log,
   });
