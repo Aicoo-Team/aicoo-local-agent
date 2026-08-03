@@ -94,7 +94,9 @@ async function main() {
   const server = args.server ?? DEFAULT_SERVER;
   const token = process.env.AICOO_TOKEN;
 
-  if (!command || command === "help" || args.help) return usage();
+  // `--help` as the first token lands in `command`, not in `args` — and without this it would
+  // fall through to the token check and greet a first-time user with an error instead of help.
+  if (!command || command === "help" || command === "--help" || command === "-h" || args.help) return usage();
 
   // ── Local-only commands (no token needed) ──
   if (command === "approve" || command === "pending") {
