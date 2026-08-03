@@ -57,6 +57,8 @@ Usage:
                                                                can open your agent and ask it
   aicoo-dm-agent approve <id> --allow|--deny --peer <peer>     resolve a pending tool approval
   aicoo-dm-agent pending --peer <peer>                         list pending tool approvals
+  aicoo-dm-agent grants --peer <peer> [--revoke <key>]         standing capability grants
+                                     [--revoke-all]           (what you already said yes to)
   aicoo-dm-agent start --dry-run-message "…" [options]         one local turn, no network send
 
 Options:
@@ -119,6 +121,33 @@ async function main() {
     if (!id || !decision) throw new Error("usage: approve <id> --allow|--deny --peer <peer>");
     const record = resolveApproval({ approvalsDir: dir, id, decision });
     console.log(`approval ${record.id} → ${decision}`);
+    return;
+  }
+
+  // ── grants: what this peer has been permanently allowed, and taking it back ──
+  // A standing grant the owner cannot see is worse than no grant: they consented once, months
+  // ago, to a sentence they no longer remember. Listing and revoking is the other half of
+  // "ask once".
+  if (command === "grants") {
+    const peer = args.peer;
+    if (!peer) throw new Error("--peer is required (grants are per relationship)");
+    const dir = stateDirFor({ server, me: args.me ?? "me", peer, override: args["state-dir"] });
+    const state = new AgentState(join(dir, "state.json"));
+    if (args.revoke === true) throw new Error('--revoke needs a key, or use --revoke-all');
+    if (args["revoke-all"]) {
+      state.clearGrants();
+      console.log(`revoked every standing grant for @${peer}. They will be asked again next time.`);
+      return;
+    }
+    if (args.revoke) {
+      state.clearGrants(String(args.revoke));
+      console.log(`revoked ${args.revoke} for @${peer}.`);
+      return;
+    }
+    const grants = state.listGrants();
+    if (!grants.length) return console.log(`@${peer} has no standing grants — everything still asks.`);
+    for (const g of grants) console.log(`${g.decision === "allow" ? "allow" : "DENY "}  ${g.key}   (decided ${String(g.at).slice(0, 10)})`);
+    console.log(`\nrevoke one with: aicoo-dm-agent grants --peer ${peer} --revoke "<key>"`);
     return;
   }
 

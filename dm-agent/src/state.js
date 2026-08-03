@@ -12,12 +12,40 @@ import { dirname } from "node:path";
 export class AgentState {
   constructor(file) {
     this.file = file;
-    this.data = { sessionId: null, cursors: {}, failures: {} };
+    this.data = { sessionId: null, cursors: {}, failures: {}, grants: {} };
     try {
-      this.data = { sessionId: null, cursors: {}, failures: {}, ...JSON.parse(readFileSync(file, "utf8")) };
+      this.data = { sessionId: null, cursors: {}, failures: {}, grants: {}, ...JSON.parse(readFileSync(file, "utf8")) };
     } catch {
       /* first run */
     }
+  }
+
+  /**
+   * Standing decisions for this peer, keyed by what was actually decided about — a skill by
+   * name, an MCP tool by server and tool, a shell command by its exact text. Asking once per
+   * distinct capability is the point; asking every time is how a gate becomes a formality the
+   * owner clicks through.
+   *
+   * Denials are remembered too. Re-asking something the owner already refused is how a peer
+   * wears them down, and it is the same question either way.
+   */
+  grant(key) {
+    return this.data.grants[key] ?? null;
+  }
+
+  setGrant(key, decision) {
+    this.data.grants[key] = { decision, at: new Date().toISOString() };
+    this.save();
+  }
+
+  listGrants() {
+    return Object.entries(this.data.grants).map(([key, v]) => ({ key, ...v }));
+  }
+
+  clearGrants(key) {
+    if (key) delete this.data.grants[key];
+    else this.data.grants = {};
+    this.save();
   }
 
   save() {

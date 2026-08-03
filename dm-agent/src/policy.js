@@ -68,17 +68,56 @@ function parseCommands(raw, log) {
   return commands;
 }
 
+/**
+ * Capability classes this relationship may use. Deliberately classes and not a list of
+ * specific skills or MCP tools: an owner does not know the name of every skill on their
+ * machine, so naming them in advance is precision they cannot actually supply. They pick
+ * "this peer may use skills"; which skill, on the day, is a question at the moment of use.
+ */
+export const CAPABILITIES = {
+  skills: "the skills installed on this machine (each one asks the first time)",
+  mcp: "the MCP servers configured on this machine (each tool asks the first time)",
+  bash: "shell commands (each distinct command asks — a remembered one is that exact text)",
+  web: "fetching URLs (each host asks the first time)",
+};
+
+function parseCapabilities(raw, log) {
+  if (raw === undefined || raw === null) return new Set();
+  if (!Array.isArray(raw) || !raw.every((c) => typeof c === "string")) {
+    throw new PolicyError(`"capabilities" must be an array of strings, e.g. ["skills", "mcp"] — known: ${Object.keys(CAPABILITIES).join(", ")}`);
+  }
+  const chosen = new Set();
+  for (const name of raw) {
+    const key = name.trim().toLowerCase();
+    if (!(key in CAPABILITIES)) {
+      throw new PolicyError(`unknown capability "${name}" — known: ${Object.keys(CAPABILITIES).join(", ")}`);
+    }
+    chosen.add(key);
+  }
+  // Shell is the one that is not bounded by anything the owner wrote down. Every other class
+  // is a menu someone curated; this one is the machine.
+  if (chosen.has("bash")) {
+    log?.(`[policy] note: "bash" lets a peer propose ANY shell command. Each distinct one still stops for your approval, but nothing limits what can be proposed.`);
+  }
+  return chosen;
+}
+
 export class Policy {
-  /** @param {{folders: string[], commands: Map<string, object>, source?: string}} input */
-  constructor({ folders, commands, source }) {
+  /** @param {{folders: string[], commands: Map<string, object>, capabilities: Set<string>, source?: string}} input */
+  constructor({ folders, commands, capabilities, source }) {
     this.folders = folders;
     this.commands = commands;
+    this.capabilities = capabilities ?? new Set();
     this.source = source;
   }
 
-  /** No policy file: one folder, read-only, no commands. */
+  /** No policy file: one folder, read-only, no commands, no capabilities. */
   static readOnly(workspace, log) {
-    return new Policy({ folders: [resolveFolder(workspace, log)], commands: new Map() });
+    return new Policy({ folders: [resolveFolder(workspace, log)], commands: new Map(), capabilities: new Set() });
+  }
+
+  can(capability) {
+    return this.capabilities.has(capability);
   }
 
   static fromFile(file, workspace, log) {
@@ -95,7 +134,8 @@ export class Policy {
       ? raw.folders.map((folder) => resolveFolder(folder, log))
       : [resolveFolder(workspace, log)];
     const commands = parseCommands(raw.commands, log);
-    return new Policy({ folders, commands, source: file });
+    const capabilities = parseCapabilities(raw.capabilities, log);
+    return new Policy({ folders, commands, capabilities, source: file });
   }
 
   get commandNames() {
@@ -110,6 +150,7 @@ export class Policy {
   describe() {
     const folders = this.folders.map((f) => f.replace(homedir(), "~")).join(", ");
     const commands = this.commandNames.length ? this.commandNames.join(", ") : "none";
-    return `folders: ${folders} · commands: ${commands}`;
+    const caps = this.capabilities.size ? [...this.capabilities].join(", ") : "none";
+    return `folders: ${folders} · commands: ${commands} · capabilities: ${caps}`;
   }
 }
