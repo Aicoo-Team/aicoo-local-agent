@@ -12,6 +12,9 @@ import { AuditLog } from "./audit.js";
 import { collectSecrets, redact } from "./redact.js";
 
 const DEFAULT_SERVER = "https://www.aicoo.io";
+// After this many failed turns a message is answered with an honest failure and left behind.
+// Retrying forever is worse than giving up: it burns a turn every poll and blocks the queue.
+const MAX_MESSAGE_ATTEMPTS = 3;
 
 function log(line) {
   console.log(`[${new Date().toISOString()}] ${line}`);
@@ -257,6 +260,51 @@ async function main() {
     ? `watching direct DMs AND the agent thread — expect the cloud agent to answer there too`
     : `watching direct DMs only (pass --watch-agent-thread to also answer in the agent thread)`);
 
+  /**
+   * One inbound message, end to end: run a turn, redact, send, advance the cursor.
+   * Throws on failure so the caller can count attempts — the retry policy is a property of
+   * the loop, not of this step.
+   */
+  async function handleMessage(message, conv) {
+    const preview = String(message.content).slice(0, 120).replace(/\s+/g, " ");
+    // Spell out that the sender is a person: the bare conversation type reads as "an agent
+    // sent this", and only senderType === "human" rows get this far.
+    log(`inbound #${message.id} (from a human, conv ${conv.conversationId}, type=${conv.type}): ${preview}`);
+
+    const inbound = {
+      text: String(message.content),
+      from: message.senderLabel ?? `@${peer}`,
+      conversationId: conv.conversationId,
+      createdAt: message.createdAt,
+    };
+    const reply = responder === "echo"
+      ? `[transport-test echo] received #${message.id}: "${String(message.content).slice(0, 200)}"`
+      : responder === "codex"
+        ? await codex.runTurn(inbound)
+        : await agent.runTurn(inbound);
+
+    // Redact before logging, not after: the preview the owner sees should be what was
+    // actually sent, and a redirected stdout should not become the one place a withheld
+    // value does land on disk.
+    const { text: safe, redacted } = redact(reply, collectSecrets(policy.folders, { extra: ownSecrets }));
+    log(`reply for #${message.id}: ${safe.slice(0, 120).replace(/\s+/g, " ")}`);
+    if (redacted.length) {
+      log(`[redact] withheld ${redacted.length} value(s) from the reply (${redacted.map((r) => r.source).join(", ")})`);
+    }
+
+    // The peer's thread also receives answers from Aicoo's cloud agent, which replies to the
+    // same message within seconds and cannot see this machine. Tag ours so the two are never
+    // confused in the app.
+    const tagged = args["no-tag"] ? safe : `${args.tag ?? "🖥️ [本地 agent]"} ${safe}`;
+    await api.withRetry(() => api.sendHuman(peer, tagged, `dm-agent:${me.userId}:${message.id}`));
+    state.setCursor(conv.conversationId, Number(message.id));
+    state.clearFailures(message.id);
+    log(`reply sent for #${message.id}`);
+  }
+
+  // Watched on every reply regardless of where a value came from.
+  const ownSecrets = { "your Aicoo key": token };
+
   let stopping = false;
   let runtimeHintShown = false;
   process.on("SIGINT", () => { stopping = true; log("stopping…"); });
@@ -290,36 +338,28 @@ async function main() {
           continue;
         }
         for (const message of fresh) {
-          const preview = String(message.content).slice(0, 120).replace(/\s+/g, " ");
-          // Spell out that the sender is a person: the bare conversation type reads as
-          // "an agent sent this", and only senderType === 'human' rows get this far.
-          log(`inbound #${message.id} (from a human, conv ${conv.conversationId}, type=${conv.type}): ${preview}`);
-          const inbound = {
-            text: String(message.content),
-            from: message.senderLabel ?? `@${peer}`,
-            conversationId: conv.conversationId,
-            createdAt: message.createdAt,
-          };
-          const reply = responder === "echo"
-            ? `[transport-test echo] 已收到你的消息(#${message.id}): "${String(message.content).slice(0, 200)}" — 本地 runtime 等 owner 重新 claude /login 后切换真实 agent 模式。`
-            : responder === "codex"
-              ? await codex.runTurn(inbound)
-              : await agent.runTurn(inbound);
-          // Redact before logging, not after: the preview the owner sees should be what was
-          // actually sent, and a redirected stdout should not become the one place the value
-          // does land on disk.
-          const { text: safe, redacted } = redact(reply, collectSecrets(policy.folders));
-          log(`reply for #${message.id}: ${safe.slice(0, 120).replace(/\s+/g, " ")}`);
-          // The peer's thread also receives answers from Aicoo's cloud agent, which replies to
-          // the same message within seconds and has no access to this machine. Prefix ours so
-          // the two are never confused in the app.
-          if (redacted.length) {
-            log(`[redact] withheld ${redacted.length} value(s) from the reply (${redacted.map((r) => r.source).join(", ")})`);
+          // Each message succeeds or fails on its own. Letting one throw out of this loop
+          // leaves its cursor un-advanced, so the next poll fetches it again — forever — and
+          // every message behind it waits on a turn that is never going to work. That is
+          // head-of-line blocking, and it is what an unreachable runtime looked like in
+          // practice: the same message reprocessed every few seconds indefinitely.
+          try {
+            await handleMessage(message, conv);
+          } catch (error) {
+            const attempts = state.recordFailure(message.id);
+            const reason = String(error.message ?? error).slice(0, 200);
+            log(`reply FAILED for #${message.id} (attempt ${attempts}/${MAX_MESSAGE_ATTEMPTS}): ${reason}`);
+            if (attempts < MAX_MESSAGE_ATTEMPTS) break; // leave the cursor; try this one again
+            // Out of attempts: say so and move on, rather than retrying in silence forever.
+            log(`giving up on #${message.id}; moving past it`);
+            await api.withRetry(() => api.sendHuman(
+              peer,
+              `${args.tag ?? "🖥️ [本地 agent]"} I could not answer that one — my local runtime kept failing (${reason}). Ask again, or ping the owner.`,
+              `dm-agent-failed:${me.userId}:${message.id}`,
+            )).catch((sendError) => log(`could not report the failure: ${String(sendError.message ?? sendError)}`));
+            state.setCursor(conv.conversationId, Number(message.id));
+            state.clearFailures(message.id);
           }
-          const tagged = args["no-tag"] ? safe : `${args.tag ?? "🖥️ [本地 agent]"} ${safe}`;
-          await api.withRetry(() => api.sendHuman(peer, tagged, `dm-agent:${me.userId}:${message.id}`));
-          state.setCursor(conv.conversationId, Number(message.id));
-          log(`reply sent for #${message.id}`);
         }
         state.setCursor(conv.conversationId, maxId);
       }

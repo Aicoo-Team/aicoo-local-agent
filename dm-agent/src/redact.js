@@ -38,8 +38,14 @@ function unquote(value) {
 }
 
 /** Values assigned in env-shaped files under the granted folders. */
-export function collectSecrets(folders, { log } = {}) {
-  const secrets = new Map(); // value -> the file it came from
+export function collectSecrets(folders, { log, extra } = {}) {
+  const secrets = new Map(); // value -> where it came from
+  // Values we hold ourselves — the owner's Aicoo key above all — never belong in a reply,
+  // whatever route they took to get there. Watching them here covers paths the file scan
+  // cannot see, such as a command that printed its environment.
+  for (const [label, value] of Object.entries(extra ?? {})) {
+    if (typeof value === "string" && value.length >= MIN_SECRET_LENGTH) secrets.set(value, label);
+  }
   for (const folder of folders) {
     let matches = [];
     try {

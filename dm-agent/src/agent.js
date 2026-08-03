@@ -143,7 +143,13 @@ export class LocalDmAgent {
 
     const decision = await this.#evaluate(toolName, input);
     const ttl = toolName === RUN_COMMAND_TOOL ? EXEC_MEMO_MS : DECISION_MEMO_MS;
-    this.#decisions.set(key, { decision, expiresAt: Date.now() + ttl });
+    // Expiry alone never removes anything — it is only consulted on read — so a long-lived
+    // daemon would accumulate one entry per distinct call forever. Sweep on write.
+    const now = Date.now();
+    for (const [staleKey, entry] of this.#decisions) {
+      if (entry.expiresAt <= now) this.#decisions.delete(staleKey);
+    }
+    this.#decisions.set(key, { decision, expiresAt: now + ttl });
     this.audit?.record({
       peer: this.peerLabel,
       tool: toolName,
@@ -176,8 +182,13 @@ export class LocalDmAgent {
       this.log(`[gate] path outside shared folders denied: ${toolName} ${target}`);
       return { allow: false, reason: "Path is outside the shared folders.", rule: "path-wall", target: String(target) };
     }
-    if (typeof input.pattern === "string" && input.pattern.includes("..")) {
-      return { allow: false, reason: "Pattern traversal is not allowed.", rule: "pattern-traversal", target: input.pattern };
+    // Traversal belongs to the path-shaped fields, and which field that is depends on the
+    // tool: Glob's `pattern` is a path pattern, but Grep's `pattern` is a regex where `..`
+    // means "any two characters" — refusing it would break ordinary searches. Grep's
+    // path-shaped field is `glob`.
+    const traversable = toolName === "Glob" ? input.pattern : input.glob;
+    if (typeof traversable === "string" && traversable.includes("..")) {
+      return { allow: false, reason: "Pattern traversal is not allowed.", rule: "pattern-traversal", target: traversable };
     }
     const summary = `${toolName}(${JSON.stringify(input).slice(0, 160)}) in ${folder}`;
     const allowed = await this.approvals.ask({ toolName, summary, kind: "read" });

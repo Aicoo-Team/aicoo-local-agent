@@ -19,12 +19,20 @@ function expandHome(target) {
   return target.startsWith("~/") ? path.join(homedir(), target.slice(2)) : target;
 }
 
-/** Resolve to a real path so the wall compares canonical paths, as insideWorkspace does. */
-function resolveFolder(folder) {
+/**
+ * Resolve to a real path, because the wall compares canonical paths.
+ *
+ * A folder that does not exist cannot be canonicalised, and the unresolved path it falls back
+ * to will not match anything the wall later resolves — on macOS `/tmp/x` and `/private/tmp/x`
+ * are the same directory and different strings. Failing closed is right; failing closed in
+ * silence, with every read denied for a reason nobody can see, is its own bug. Say it here.
+ */
+function resolveFolder(folder, log) {
   const expanded = path.resolve(expandHome(String(folder)));
   try {
     return realpathSync(expanded);
   } catch {
+    log?.(`[policy] WARNING: ${expanded} does not exist. Reads there will be denied until it does.`);
     return expanded;
   }
 }
@@ -69,12 +77,12 @@ export class Policy {
   }
 
   /** No policy file: one folder, read-only, no commands. */
-  static readOnly(workspace) {
-    return new Policy({ folders: [resolveFolder(workspace)], commands: new Map() });
+  static readOnly(workspace, log) {
+    return new Policy({ folders: [resolveFolder(workspace, log)], commands: new Map() });
   }
 
   static fromFile(file, workspace, log) {
-    if (!existsSync(file)) return Policy.readOnly(workspace);
+    if (!existsSync(file)) return Policy.readOnly(workspace, log);
 
     let raw;
     try {
@@ -84,8 +92,8 @@ export class Policy {
     }
 
     const folders = Array.isArray(raw.folders) && raw.folders.length
-      ? raw.folders.map(resolveFolder)
-      : [resolveFolder(workspace)];
+      ? raw.folders.map((folder) => resolveFolder(folder, log))
+      : [resolveFolder(workspace, log)];
     const commands = parseCommands(raw.commands, log);
     return new Policy({ folders, commands, source: file });
   }

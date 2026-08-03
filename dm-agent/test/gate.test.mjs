@@ -40,12 +40,25 @@ for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   check(`${tool} did not prompt owner`, asked.length === 0);
 }
 
-// 3. Traversal patterns rejected before prompting.
+// 3. Traversal is checked on the path-shaped field, and which field that is per tool.
 {
   const { agent, asked } = makeAgent(true);
-  const d = await agent.decide("Glob", { pattern: "../../**" });
-  check("traversal pattern denied", d.allow === false);
-  check("traversal pattern did not prompt owner", asked.length === 0);
+  const globbed = await agent.decide("Glob", { pattern: "../../**" });
+  check("Glob: a traversing pattern is denied", globbed.allow === false);
+  check("Glob traversal does not prompt", asked.length === 0);
+}
+{
+  const { agent, asked } = makeAgent(true);
+  // Grep's pattern is a regex: `..` means "any two characters", not a parent directory.
+  const grepped = await agent.decide("Grep", { pattern: "foo..bar", path: ws });
+  check("Grep: a regex containing .. is NOT mistaken for traversal", grepped.allow === true);
+  check("Grep: the regex still went to the owner for approval", asked.length === 1);
+}
+{
+  const { agent, asked } = makeAgent(true);
+  const grepGlob = await agent.decide("Grep", { pattern: "safe", glob: "../*.env", path: ws });
+  check("Grep: a traversing glob filter is denied", grepGlob.allow === false);
+  check("Grep traversal does not prompt", asked.length === 0);
 }
 
 // 4. In-workspace read DOES ask the owner, and honours "allow".

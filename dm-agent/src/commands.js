@@ -11,6 +11,12 @@ const OUTPUT_LIMIT = 20_000;
 // the buffer well above the limit we actually enforce and do the truncation ourselves.
 const MAX_BUFFER = 4 * 1024 * 1024;
 
+/** Our own secrets, removed. Everything else the command may legitimately need. */
+export function childEnv(source = process.env) {
+  const { AICOO_TOKEN, ...rest } = source;
+  return rest;
+}
+
 function clip(text) {
   if (text.length <= OUTPUT_LIMIT) return text;
   return `${text.slice(0, OUTPUT_LIMIT)}\n…[truncated at ${OUTPUT_LIMIT} characters]`;
@@ -29,8 +35,17 @@ export function runDeclaredCommand(entry, { cwd, log }) {
     execFile(
       file,
       args,
-      // SIGTERM is ignorable and a wedged child would hold the turn open; escalate.
-      { cwd, timeout, killSignal: "SIGKILL", maxBuffer: MAX_BUFFER, env: process.env },
+      {
+        cwd,
+        timeout,
+        // SIGTERM is ignorable and a wedged child would hold the turn open; escalate.
+        killSignal: "SIGKILL",
+        maxBuffer: MAX_BUFFER,
+        // A declared command has no business seeing our credentials. Inheriting the whole
+        // environment hands the owner's Aicoo key to anything that prints its env on failure
+        // — plenty of tools do — and from there it is one model quote away from the peer.
+        env: childEnv(),
+      },
       (error, stdout, stderr) => {
         const elapsedMs = Date.now() - startedAt;
         const output = clip([stdout, stderr].filter(Boolean).join("").trimEnd());

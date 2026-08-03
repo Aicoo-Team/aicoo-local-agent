@@ -2,7 +2,7 @@ import { realpathSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Policy, PolicyError } from "../src/policy.js";
-import { runDeclaredCommand, RUN_COMMAND_TOOL } from "../src/commands.js";
+import { runDeclaredCommand, childEnv, RUN_COMMAND_TOOL } from "../src/commands.js";
 import { LocalDmAgent } from "../src/agent.js";
 import { collectSecrets, redact } from "../src/redact.js";
 
@@ -161,6 +161,19 @@ const policy = Policy.fromFile(
     { cwd: ws },
   );
   check("shell metacharacters arrive as a literal argument", injected.output.includes("; rm -rf /tmp/nope"));
+}
+
+// ── what a declared command inherits ─────────────────────────────────────────
+{
+  const env = childEnv({ AICOO_TOKEN: "aicoo_sk_live_secret", PATH: "/usr/bin", HOME: "/home/x" });
+  check("our own token is not handed to the command", env.AICOO_TOKEN === undefined);
+  check("everything else the command needs survives", env.PATH === "/usr/bin" && env.HOME === "/home/x");
+
+  // Belt and braces: even if a value reaches the reply by some other route, it is watched.
+  const watched = collectSecrets([], { extra: { "your Aicoo key": "aicoo_sk_live_secret" } });
+  const out = redact("the key is aicoo_sk_live_secret", watched);
+  check("a value we hold ourselves is redacted whatever route it took", !out.text.includes("aicoo_sk_live_secret"));
+  check("and it is attributed, not silently dropped", out.text.includes("[redacted: value from your Aicoo key]"));
 }
 
 // ── redaction ─────────────────────────────────────────────────────────────────
