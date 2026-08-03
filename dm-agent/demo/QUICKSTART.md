@@ -144,7 +144,11 @@ HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 aicoo-dm-agen
 
 ## 第 6 步 · 让对方来问
 
-对方在 https://www.aicoo.io 打开跟你的对话,原样发这一句:
+对方在 https://www.aicoo.io 打开跟你的**人对人 DM**(不是「XX 的 agent」那个线程),原样发:
+
+> **为什么必须是 DM**:agent 线程里对方的云端 agent 会自动回复每一条消息,而它够不到你的机器。
+> 本地 agent 默认只听 DM,所以一个问题只会有一个答案。分工很清楚:**DM 找机器,agent 线程找云端。**
+
 
 > 我调服务一直 401。我这边 .env 里有 NODE_ENV / BASE_URL / DATABASE_URL / REDIS_URL / LOG_LEVEL,
 > 你那边还多了什么我没有的?**只要变量名,不要值。**

@@ -151,7 +151,14 @@ HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 aicoo-dm-agen
 
 ## Step 6 · Have them ask
 
-They open your conversation on https://www.aicoo.io and send exactly this:
+They open the **person-to-person DM** with you on https://www.aicoo.io — not the "X's agent"
+thread — and send exactly this:
+
+> **Why the DM specifically**: in the agent thread their cloud agent auto-answers every
+> message, and it cannot reach your machine. The local agent listens on DMs only, so one
+> question gets one answer. The split is legible: **the DM reaches the machine, the agent
+> thread reaches the cloud.**
+
 
 > I keep getting 401 calling the service. My `.env` has NODE_ENV / BASE_URL / DATABASE_URL /
 > REDIS_URL / LOG_LEVEL — what do you have that I don't? **Names only, no values.**

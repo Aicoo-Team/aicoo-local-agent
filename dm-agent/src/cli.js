@@ -59,6 +59,8 @@ Options:
   --auto-allow-read        skip approval prompts for in-workspace reads (demo only)
   --reachout "<text>"      send this DM to --peer once at startup
   --model <model>          model override for the local session
+  --watch-agent-thread     also answer in the peer's agent thread (their cloud agent
+                           answers there too, so expect two replies per question)
   --state-dir <dir>        override state directory
 `);
 }
@@ -193,6 +195,11 @@ async function main() {
     log(`reachout sent → conversation ${res.conversationId} (recipient: ${res.recipientName})`);
   }
 
+  const watchAgentThread = Boolean(args["watch-agent-thread"]);
+  log(watchAgentThread
+    ? `watching direct DMs AND the agent thread — expect the cloud agent to answer there too`
+    : `watching direct DMs only (pass --watch-agent-thread to also answer in the agent thread)`);
+
   let stopping = false;
   let runtimeHintShown = false;
   process.on("SIGINT", () => { stopping = true; log("stopping…"); });
@@ -201,7 +208,11 @@ async function main() {
   while (!stopping) {
     try {
       const conversations = (await api.conversations({ view: "all", contact: peer, limit: 50 }))
-        .filter((c) => c.type !== "group");
+        // Direct DMs only, by default. In the peer's *agent* thread their cloud agent
+        // already answers every message, so listening there too means one question gets
+        // two different answers. Keeping to the DM makes the split legible: the DM
+        // reaches the machine, the agent thread reaches the cloud.
+        .filter((c) => (watchAgentThread ? c.type !== "group" : c.type === "direct"));
       for (const conv of conversations) {
         const cursor = state.cursor(conv.conversationId);
         const messages = (conv.messages ?? []).filter((m) => m.id != null);
