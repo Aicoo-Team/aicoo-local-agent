@@ -7,6 +7,9 @@ import { LocalDmAgent } from "./agent.js";
 import { CodexResponder } from "./codex.js";
 import { ApprovalBroker, resolveApproval, listApprovals } from "./approval.js";
 import { AgentState } from "./state.js";
+import { Policy, PolicyError } from "./policy.js";
+import { AuditLog } from "./audit.js";
+import { collectSecrets, redact } from "./redact.js";
 
 const DEFAULT_SERVER = "https://www.aicoo.io";
 
@@ -61,8 +64,24 @@ Options:
   --model <model>          model override for the local session
   --watch-agent-thread     also answer in the peer's agent thread (their cloud agent
                            answers there too, so expect two replies per question)
+  --policy <file>          declared commands + folders (default: <state-dir>/policy.json)
+  --no-sandbox             run the model's file tools unsandboxed (only if the platform
+                           cannot start one — the default is to fail rather than pretend)
   --state-dir <dir>        override state directory
 `);
+}
+
+/** Load the policy, turning a bad file into an actionable line rather than a stack trace. */
+function loadPolicy(file, workspace) {
+  try {
+    return Policy.fromFile(file, workspace, log);
+  } catch (error) {
+    if (error instanceof PolicyError) {
+      log(`FATAL: ${file}: ${error.message}`);
+      process.exit(1);
+    }
+    throw error;
+  }
 }
 
 async function main() {
@@ -105,23 +124,31 @@ async function main() {
       autoAllowRead: Boolean(args["auto-allow-read"]),
       log,
     });
+    const policy = loadPolicy(args.policy ?? join(stateDir, "policy.json"), workspace);
     const agent = new LocalDmAgent({
       workspace,
       state,
       approvals,
+      policy,
+      audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
+      sandbox: args["no-sandbox"] ? false : undefined,
       ownerLabel: args["owner-label"] ?? "the owner",
       peerLabel: args.peer ?? "a peer",
       model: args.model,
       log,
     });
-    log(`dry run in ${workspace}`);
+    log(`dry run in ${workspace} · ${policy.describe()}`);
     const reply = await agent.runTurn({
       text: String(args["dry-run-message"]),
       from: args.peer ?? "dry-run-peer",
       conversationId: "dry",
       createdAt: new Date().toISOString(),
     });
-    console.log(`\n────── reply ──────\n${reply}\n───────────────────`);
+    // Same egress filter as the live path: a dry run must show exactly what would be sent,
+    // or it is a rehearsal of different behaviour.
+    const { text: safe, redacted } = redact(reply, collectSecrets(policy.folders, { log }));
+    if (redacted.length) log(`[redact] withheld ${redacted.length} value(s) (${redacted.map((r) => r.source).join(", ")})`);
+    console.log(`\n────── reply ──────\n${safe}\n───────────────────`);
     return;
   }
 
@@ -163,15 +190,20 @@ async function main() {
     autoAllowRead: Boolean(args["auto-allow-read"]),
     log,
   });
+  const policy = loadPolicy(args.policy ?? join(stateDir, "policy.json"), workspace);
   const agent = new LocalDmAgent({
     workspace,
     state,
     approvals,
+    policy,
+    audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
+    sandbox: args["no-sandbox"] ? false : undefined,
     ownerLabel: `@${me.username}`,
     peerLabel: `@${peer}`,
     model: args.model,
     log,
   });
+  log(`[policy] ${policy.describe()}${policy.source ? ` (${policy.source})` : " (no policy file)"}`);
   // --responder: "agent" (Claude SDK, per-call owner approval), "codex" (codex exec,
   // read-only sandbox as the wall — no per-call approval hook), or "echo" (transport
   // smoke test, no LLM — for machines whose local runtime is not logged in).
@@ -187,7 +219,15 @@ async function main() {
         log,
       })
     : null;
-  if (codex) log(`[codex] containment = read-only sandbox in ${workspace}; per-call owner approval NOT wired on this runtime`);
+  if (codex) {
+    log(`[codex] containment = read-only sandbox in ${workspace}; per-call owner approval NOT wired on this runtime`);
+    // `codex exec` exposes no approval callback, so there is no way to ask the owner before
+    // a command runs. Exec without a way to ask is not a weaker version of this feature —
+    // it is a different and worse one, so it is simply off here.
+    if (policy.commandNames.length) {
+      log(`[codex] declared commands are DISABLED on this runtime (${policy.commandNames.length} in policy): no approval hook exists in codex exec`);
+    }
+  }
   log(`state: ${stateDir}  responder=${responder}`);
 
   if (args.reachout) {
@@ -252,7 +292,13 @@ async function main() {
           // The peer's thread also receives answers from Aicoo's cloud agent, which
           // replies to the same message within seconds and has no access to this
           // machine. Prefix ours so the two are never confused in the app.
-          const tagged = args["no-tag"] ? reply : `${args.tag ?? "🖥️ [本地 agent]"} ${reply}`;
+          // Last thing before it leaves the machine. Collected per turn, because a command
+          // may have just written a value into a file the model then quoted.
+          const { text: safe, redacted } = redact(reply, collectSecrets(policy.folders));
+          if (redacted.length) {
+            log(`[redact] withheld ${redacted.length} value(s) from the reply (${redacted.map((r) => r.source).join(", ")})`);
+          }
+          const tagged = args["no-tag"] ? safe : `${args.tag ?? "🖥️ [本地 agent]"} ${safe}`;
           await api.withRetry(() => api.sendHuman(peer, tagged, `dm-agent:${me.userId}:${message.id}`));
           state.setCursor(conv.conversationId, Number(message.id));
           log(`reply sent for #${message.id}`);
