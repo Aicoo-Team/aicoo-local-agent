@@ -42,21 +42,53 @@ the system worked.
 
 *Effort: 1–2 days including tests. Nothing else should ship before it.*
 
-### 0.2 An OS sandbox for dm-agent · **it has none**
+### 0.2 Compile the relationship into a runtime access profile
 
-c2c's adapter passes a `sandbox` block (`allowWrite`, `denyRead`, `denyWrite`,
-`allowUnsandboxedCommands: false`). **dm-agent passes none** — containment is the tool
-allowlist plus `insideWorkspace()`, one function of mine, with 11 tests behind it.
+**We do not build a sandbox. Both runtimes already have one, at the OS level, and we relay
+into it.** Claude Code's SDK takes:
 
-For read-only that is defensible. For write or exec it is one bug away from the whole
-machine, and it means a prompt-injection that reaches a tool call has no second line of
-defence.
+```
+filesystem: allowWrite / denyWrite / denyRead
+network:    allowedDomains / deniedDomains / strictAllowlist / allowLocalBinding
+exec:       autoAllowBashIfSandboxed / allowUnsandboxedCommands / failIfUnavailable
+```
 
-Build: adopt the same sandbox block in `agent.js#options`, with the workspace as the only
-writable root and the usual sensitive paths on `denyRead`. Free — the config already exists
-next door and is proven.
+and Codex takes `--sandbox read-only | workspace-write` with
+`sandbox_workspace_write.writable_roots`. That is seatbelt/landlock enforcement — nothing we
+write in JavaScript competes with it.
 
-*Effort: half a day. Do it whether or not exec ever ships.*
+So the artifact is not a sandbox. It is a **profile per relationship**, compiled into
+whichever runtime is answering:
+
+| Profile (ours) | Claude Code | Codex |
+| --- | --- | --- |
+| tools allowed | `tools` + `disallowedTools` | (implicit in sandbox mode) |
+| readable / writable paths | `sandbox.filesystem`, `additionalDirectories` | `--sandbox`, `writable_roots` |
+| network | `sandbox.network.allowedDomains` + `strictAllowlist` | `tools.web_search=false` |
+| approval mode | `PreToolUse` hook + `canUseTool` | — *(no hook in `codex exec`)* |
+
+**What dm-agent is missing today is the relay, not the sandbox**: it passes no `sandbox`
+block at all, so containment rests entirely on the tool allowlist and `insideWorkspace()` —
+one function of mine with 11 tests behind it. c2c already passes one; copying it over is
+half a day.
+
+Set `failIfUnavailable: true`. Without it, an unsupported platform silently runs
+unsandboxed, which is the worst possible outcome: the profile says confined and nothing is.
+
+#### What relaying does *not* cover
+
+The sandbox is a **static boundary fixed when the session starts**. Three things sit outside
+it, permanently, and they are the only parts that have to be ours:
+
+1. **Who gets which profile.** The runtime enforces a boundary; it has no idea there is a
+   relationship, or that this peer is different from that one. That mapping is the product.
+2. **Asking a human mid-turn.** A sandbox cannot pause and ask. Only `canUseTool` / the
+   `PreToolUse` hook can — which is exactly the layer that was silently dead in c2c until
+   this week.
+3. **What the reply is allowed to contain.** A sandbox governs what the process may *touch*,
+   never what the model may *say*. An agent legitimately reading an allowed file and pasting
+   its contents into the DM is, to the sandbox, a completely normal read. This is why 0.1
+   cannot be delegated to the runtime and stays the hardest problem here.
 
 ### 0.3 Standing grants, with TTL and revoke
 
@@ -145,7 +177,15 @@ are typed and validated, never interpolated into a shell string.
 That turns "arbitrary code execution" into "a menu the owner wrote", which is the only
 version of this that survives a security review.
 
-Raw Bash, if ever, comes later: sandboxed, network disabled, and off by default.
+Raw Bash, if ever, comes later — and the runtime makes it less unthinkable than it sounds.
+`sandbox.network.allowedDomains` with `strictAllowlist` means a command can run with **no
+route out**: no `curl … | sh`, no exfil by POST, no package install pulling arbitrary code.
+Combined with `allowWrite` scoped to the workspace, "run something" stops being "reach the
+internet from inside a colleague's network."
+
+That does not make raw Bash safe enough to demo — the approval line is still an unreadable
+command string — but it does mean the eventual answer is *declared commands for the prompt,
+network-denied sandbox for the blast radius*, not one or the other.
 
 *Effort: 3–5 days for declared commands, most of it in the policy format and the approval
 UX. The runtime piece is small.*
@@ -167,7 +207,7 @@ capability.
 | # | Item | Effort | Why here |
 | --- | --- | --- | --- |
 | 1 | Outbound sanitising | 1–2d | Blocks everything; already the weakest claim we make |
-| 2 | OS sandbox | 0.5d | dm-agent has none; free, proven next door |
+| 2 | Relay a sandbox profile to the runtime | 0.5d | dm-agent passes none today; the runtime already enforces it |
 | 3 | Audit log | 0.5d | Cheap, and required before grants stop being per-call |
 | 4 | Standing grants + TTL + revoke | 2–3d | Makes the recurring use case possible at all |
 | 5 | Multiple scopes | 1d | Falls out of 4 |
