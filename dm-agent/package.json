@@ -1,0 +1,44 @@
+{
+  "name": "@aicoo/dm-agent",
+  "version": "0.2.1",
+  "description": "Let a teammate ask your local agent. They DM you on Aicoo, a Claude Code session on your machine answers, and every file it opens is approved by you, one call at a time.",
+  "keywords": [
+    "aicoo",
+    "agent",
+    "agent-to-agent",
+    "claude-code",
+    "local-agent",
+    "approval"
+  ],
+  "homepage": "https://github.com/Aicoo-Team/aicoo-local-agent/tree/main/dm-agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aicoo-Team/aicoo-local-agent.git",
+    "directory": "dm-agent"
+  },
+  "bugs": {
+    "url": "https://github.com/Aicoo-Team/aicoo-local-agent/issues"
+  },
+  "type": "module",
+  "bin": {
+    "aicoo-dm-agent": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "node test/wall.test.mjs && node test/gate.test.mjs && node test/filter.test.mjs && node test/commands.test.mjs && node test/codex.test.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.211",
+    "zod": "^4.4.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0"
+}
