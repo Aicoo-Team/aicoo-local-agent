@@ -79,6 +79,7 @@ export const CAPABILITIES = {
   mcp: "the MCP servers configured on this machine (each tool asks the first time)",
   bash: "shell commands (each distinct command asks — a remembered one is that exact text)",
   web: "fetching URLs (each host asks the first time)",
+  write: "creating and editing files INSIDE the shared folders only (each file asks the first time)",
 };
 
 function parseCapabilities(raw, log) {
@@ -98,6 +99,12 @@ function parseCapabilities(raw, log) {
   // is a menu someone curated; this one is the machine.
   if (chosen.has("bash")) {
     log?.(`[policy] note: "bash" lets a peer propose ANY shell command. Each distinct one still stops for your approval, but nothing limits what can be proposed.`);
+  }
+  // Writing is the first capability that changes the machine rather than reporting on it, and
+  // a write inside a project folder is execution in disguise — .git/hooks, package.json
+  // scripts, a Makefile. Worth saying out loud even though it is bounded by the folders.
+  if (chosen.has("write")) {
+    log?.(`[policy] note: "write" lets a peer change files in the shared folders. In a code folder that is close to execution (.git/hooks, package.json scripts), so share a folder where that is acceptable.`);
   }
   return chosen;
 }

@@ -82,6 +82,83 @@ const check = (label, cond) => { checks.push([label, cond]); };
   check("the disguising name is not what they approve", !(asked[0]?.summary ?? "").includes("looks-innocent"));
 }
 
+// 1f. Capabilities: enabling a class means "ask me once about each thing", and the identity
+//     of "each thing" differs by class — a skill is the capability, a shell command's text IS
+//     the payload, a file is what a write is about.
+{
+  const { Policy } = await import("../src/policy.js");
+  const { AgentState } = await import("../src/state.js");
+  const outside = join(root, "outside");
+  const policy = new Policy({
+    folders: [ws], commands: new Map(),
+    capabilities: new Set(["skills", "bash", "write", "mcp"]),
+  });
+  const state = new AgentState(join(root, `grants-${Math.random().toString(36).slice(2)}.json`));
+  const asked = [];
+  const agent = new LocalDmAgent({
+    workspace: ws, policy, state, audit: { record() {} },
+    approvals: { ask: async (r) => { asked.push(r); return true; } },
+    ownerLabel: "@owner", peerLabel: "@peer", log: () => {},
+  });
+
+  const n = () => asked.length;
+  let before = n();
+  await agent.decide("Bash", { command: "git status" });
+  check("a first shell command asks", n() === before + 1);
+  before = n();
+  await agent.decide("Bash", { command: "git status" });
+  check("the same command does not ask again", n() === before);
+  await agent.decide("Bash", { command: "rm -rf /" });
+  check("a DIFFERENT command is a new question", n() === before + 1);
+
+  before = n();
+  await agent.decide("Skill", { skill: "pdf" });
+  await agent.decide("Skill", { skill: "pdf" });
+  check("a skill asks once, then is remembered", n() === before + 1);
+
+  before = n();
+  await agent.decide("Write", { file_path: join(ws, "a.md"), content: "x" });
+  await agent.decide("Edit", { file_path: join(ws, "a.md"), old_string: "x", new_string: "y" });
+  check("write asks once per file, not per edit", n() === before + 1);
+  before = n();
+  await agent.decide("Write", { file_path: join(ws, "b.md"), content: "x" });
+  check("a different file is a new question", n() === before + 1);
+
+  // Reads may escalate outside the folders; writes may not. Changing a file outside what was
+  // shared is not recoverable the way reading one is, so there is no question to ask.
+  before = n();
+  const out = await agent.decide("Write", { file_path: join(outside, "c.md"), content: "x" });
+  check("write outside the shared folders is denied", out.allow === false);
+  check("...by rule, not by asking", out.rule === "write-outside-folders" && n() === before);
+
+  // A capability the owner did NOT enable is refused, and says which one is missing.
+  const bare = new LocalDmAgent({
+    workspace: ws, policy: new Policy({ folders: [ws], commands: new Map(), capabilities: new Set() }),
+    state, audit: { record() {} },
+    approvals: { ask: async () => { asked.push({}); return true; } },
+    ownerLabel: "@owner", peerLabel: "@peer", log: () => {},
+  });
+  before = n();
+  const off = await bare.decide("Bash", { command: "ls" });
+  check("a capability that was never enabled is denied", off.allow === false && off.rule === "capability-not-enabled");
+  check("...without asking the owner", n() === before);
+
+  // A remembered refusal stays refused: re-asking is how a peer wears an owner down.
+  const denier = new LocalDmAgent({
+    workspace: ws, policy, state: new AgentState(join(root, `d-${Math.random().toString(36).slice(2)}.json`)),
+    audit: { record() {} },
+    approvals: { ask: async () => { asked.push({}); return false; } },
+    ownerLabel: "@owner", peerLabel: "@peer", log: () => {},
+  });
+  await denier.decide("Skill", { skill: "nope" });
+  before = n();
+  // Different input shape, same skill: the short-lived decision memo cannot match this, so a
+  // second refusal here proves the PERSISTED grant is doing the remembering, not the cache.
+  const again = await denier.decide("Skill", { skill: "nope", args: "second attempt" });
+  check("a refusal is remembered too", again.allow === false && again.rule === "grant-remembered-deny");
+  check("...and is not asked a second time", n() === before);
+}
+
 // 2. Non-read tools are denied before any prompt.
 for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   const { agent, asked } = makeAgent(true);

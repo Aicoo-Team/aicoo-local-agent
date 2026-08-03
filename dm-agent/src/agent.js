@@ -6,6 +6,7 @@ import { createCommandServer, MCP_SERVER_NAME, RUN_COMMAND_TOOL } from "./comman
 import { Policy, CAPABILITIES } from "./policy.js";
 
 const READ_TOOLS = ["Read", "Glob", "Grep"];
+const WRITE_TOOLS = ["Write", "Edit", "NotebookEdit"];
 // Mounting an MCP server makes the runtime offer ToolSearch so the model can look up tool
 // schemas. It reads nothing and touches nothing; denying it just stalls every turn.
 const FREE_TOOLS = ["ToolSearch"];
@@ -146,9 +147,22 @@ function capabilityFor(toolName) {
   if (toolName === "Skill") return "skills";
   if (toolName === "Bash") return "bash";
   if (toolName === "WebFetch" || toolName === "WebSearch") return "web";
+  if (WRITE_TOOLS.includes(toolName)) return "write";
   // Our own declared-command server is handled before this and never reaches here.
   if (toolName.startsWith("mcp__")) return "mcp";
   return null;
+}
+
+/** A one-line, non-scrolling impression of what a write would do. */
+function describeWrite(toolName, input) {
+  if (toolName === "Edit") {
+    const from = String(input?.old_string ?? "").split("\n")[0];
+    const to = String(input?.new_string ?? "").split("\n")[0];
+    return `replace "${from.slice(0, 60)}" with "${to.slice(0, 60)}"`;
+  }
+  const content = String(input?.content ?? "");
+  const lines = content ? content.split("\n").length : 0;
+  return `write ${content.length} bytes / ${lines} line(s), starting "${content.split("\n")[0].slice(0, 60)}"`;
 }
 
 /**
@@ -172,6 +186,17 @@ function grantIdentity(capability, toolName, input) {
     const [, server = "?", ...rest] = toolName.split("__");
     const tool = rest.join("__") || "?";
     return { key: `mcp:${server}:${tool}`, summary: `call ${server} / ${tool} — and any later call to it`, scope: "this MCP tool" };
+  }
+  if (capability === "write") {
+    // Keyed on the file, because the file is what the owner is agreeing to let this person
+    // change. Content is not part of the key: remembering "this exact content" would ask
+    // again for every keystroke of a follow-up edit, which is the fatigue this exists to avoid.
+    const target = String(input?.file_path ?? input?.notebook_path ?? "?");
+    return {
+      key: `write:${target}`,
+      summary: `CHANGE a file — and any later change to it\n   file: ${target}\n   now: ${describeWrite(toolName, input)}`,
+      scope: "this file",
+    };
   }
   if (capability === "web") {
     let host = "?";
@@ -283,6 +308,22 @@ export class LocalDmAgent {
     if (toolName === RUN_COMMAND_TOOL) return this.#evaluateCommand(input);
     if (!READ_TOOLS.includes(toolName)) {
       const capability = capabilityFor(toolName);
+      // A read outside the folders can be escalated to the owner; a write cannot. Reading the
+      // wrong file is recoverable and visible; writing one is neither, and "may I change
+      // something outside what you shared" is not a question worth having an answer to.
+      if (capability === "write" && this.policy.can("write")) {
+        const target = input?.file_path ?? input?.notebook_path;
+        if (!target || !this.#folderFor(target)) {
+          const real = target ? resolveReal(target, this.workspace) : null;
+          this.log(`[gate] write outside the shared folders refused: ${printableSafe(real ?? String(target))}`);
+          return {
+            allow: false,
+            reason: "Writing is limited to the shared folders, and that path is outside them.",
+            rule: "write-outside-folders",
+            target: String(real ?? target),
+          };
+        }
+      }
       if (capability && this.policy.can(capability)) return this.#evaluateCapability(capability, toolName, input);
       return {
         allow: false,
@@ -480,7 +521,13 @@ export class LocalDmAgent {
           failIfUnavailable: true,
           autoAllowBashIfSandboxed: false,
           allowUnsandboxedCommands: false,
-          filesystem: { denyRead: SENSITIVE_PATHS },
+          // Without allowWrite the sandbox refuses the write AFTER the owner approved it —
+          // consent that changes nothing, and an error the peer cannot make sense of. The
+          // list is exactly the shared folders, which is also the gate's own boundary.
+          filesystem: {
+            denyRead: SENSITIVE_PATHS,
+            ...(this.policy.can("write") ? { allowWrite: [...this.policy.folders] } : {}),
+          },
         },
       }),
       // NOT "dontAsk": that mode resolves every permission itself (auto-allowing
