@@ -100,9 +100,10 @@ function describeWho(peerLabel, policy) {
   if (!policy.isGuest) return `${peerLabel}, an authenticated Aicoo user`;
   // Saying this plainly matters: the model should not reason as though it knows who it is
   // helping, and should not offer to remember anything across the conversation.
-  return `${peerLabel} — an anonymous visitor holding a one-time share link. Nobody has verified
-who they are. Nothing is remembered between calls, so do not promise continuity, and keep to
-what is in the shared folder`;
+  return `${peerLabel} — someone holding a one-time share link the owner sent out. Their identity
+is not verified, and nothing is remembered between calls, so do not promise continuity. You may
+still ask the owner for a file just outside the shared folders when the question genuinely needs
+one; they see the real path and decide each time`;
 }
 
 function buildSystemPrompt({ ownerLabel, peerLabel, policy }) {
@@ -508,17 +509,6 @@ export class LocalDmAgent {
       this.log(`[gate] credential path refused without asking: ${printableSafe(real)}`);
       return { allow: false, reason: "That path holds credentials and is never readable.", rule: "path-wall-sensitive", target: real };
     }
-    // Escalation asks the owner to widen access for a particular person. For an anonymous link
-    // holder there is no particular person to widen it for, so there is no question to put.
-    if (this.policy.isGuest) {
-      this.log(`[gate] guest asked outside the shared folders — refused without asking: ${printableSafe(real)}`);
-      return {
-        allow: false,
-        reason: "That path is outside the shared folder, and a shared link cannot reach past it.",
-        rule: "guest-no-escalation",
-        target: real,
-      };
-    }
     if (this.#escalations >= MAX_ESCALATIONS_PER_TURN) {
       this.log(`[gate] escalation budget spent (${MAX_ESCALATIONS_PER_TURN}/turn); refusing without asking: ${printableSafe(real)}`);
       return { allow: false, reason: "Too many out-of-folder requests in one turn.", rule: "escalation-budget", target: real };
@@ -527,7 +517,11 @@ export class LocalDmAgent {
     this.log(`[gate] OUTSIDE the shared folders — asking the owner: ${printableSafe(real)}`);
     const allowed = await this.approvals.ask({
       toolName,
-      summary: `OUTSIDE the folders you shared\n   path: ${printableSafe(real)}`,
+      // Who is asking belongs in the line, not just what for. A one-time link with a password
+      // means the owner sent it to someone specific, so this is a real decision about a real
+      // intended recipient — but they cannot verify the holder IS that person, and the prompt
+      // should not read as though they can.
+      summary: `OUTSIDE the folders you shared\n   path: ${printableSafe(real)}\n   asked by: ${this.peerLabel}${this.policy.isGuest ? " — identity not verified" : ""}`,
       kind: "escalation",
     });
     return allowed

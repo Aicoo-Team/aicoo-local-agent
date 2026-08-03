@@ -73,11 +73,26 @@ Options:
   --dm-only                answer only in the plain DM thread. Replies still land in the
                            agent thread (the API cannot post into a DM), so the asker sees
                            the answer somewhere other than where they typed. Rarely wanted.
-  --policy <file>          declared commands + folders (default: <state-dir>/policy.json)
+  --policy <file>          folders, commands, capabilities, trust (default: <state-dir>/policy.json)
+  --link-label <name>      for a guest policy: which share link this is, so the approval
+                           prompt says which one you are answering for
   --no-sandbox             run the model's file tools unsandboxed (only if the platform
                            cannot start one — the default is to fail rather than pretend)
   --state-dir <dir>        override state directory
 `);
+}
+
+/**
+ * How the person on the other end is named in the approval prompt and to the model.
+ *
+ * A named peer is a username. A guest is not — they are whoever opened a particular link, so
+ * the useful identifier is WHICH link. With several out at once, "a peer" tells the owner
+ * nothing about what they are approving, and the label is the only thing distinguishing
+ * "someone from the investor link" from "someone from the contractor link".
+ */
+function peerLabelFor(peer, policy, linkLabel) {
+  if (!policy.isGuest) return `@${peer}`;
+  return linkLabel ? `a visitor via your "${linkLabel}" link` : `a visitor via your share link`;
 }
 
 /** Load the policy, turning a bad file into an actionable line rather than a stack trace. */
@@ -171,7 +186,7 @@ async function main() {
       policy,
       audit,
       ownerLabel: args["owner-label"] ?? "the owner",
-      peerLabel: args.peer ?? "a peer",
+      peerLabel: peerLabelFor(args.peer ?? "a peer", policy, args["link-label"]),
       log,
     };
     // A dry run has to exercise the runtime the flag names. Silently running the Claude path
@@ -290,7 +305,7 @@ async function main() {
     audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
     sandbox: args["no-sandbox"] ? false : undefined,
     ownerLabel: `@${me.username}`,
-    peerLabel: `@${peer}`,
+    peerLabel: peerLabelFor(peer, policy, args["link-label"]),
     model: args.model,
     log,
   });
@@ -307,7 +322,7 @@ async function main() {
         policy,
         audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
         ownerLabel: `@${me.username}`,
-        peerLabel: `@${peer}`,
+        peerLabel: peerLabelFor(peer, policy, args["link-label"]),
         codexPath: args["codex-path"],
         log,
       })

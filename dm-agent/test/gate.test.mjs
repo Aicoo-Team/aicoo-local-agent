@@ -234,11 +234,21 @@ const check = (label, cond) => { checks.push([label, cond]); };
   check("the prompt says 'this once'", /this once/.test(asked[0]?.summary ?? ""));
   check("the prompt does not promise later calls", !/any later/.test(asked[0]?.summary ?? ""));
 
-  // Escalation asks the owner to widen access for a particular person. There isn't one.
+  // A guest CAN ask for a file just outside the folders: a one-time link with a password was
+  // sent to someone specific, so it is a real decision. What the prompt must not do is let the
+  // owner think the holder's identity was verified.
   const before = asked.length;
   const out = await agent.decide("Read", { file_path: "/etc/hosts" });
-  check("a guest cannot escalate outside the shared folder", out.allow === false);
-  check("...and is refused by rule, without asking", out.rule === "guest-no-escalation" && asked.length === before);
+  check("a guest may escalate outside the shared folder", out.allow === true);
+  check("...and the owner is actually asked", asked.length === before + 1);
+  const esc = asked[asked.length - 1];
+  check("the escalation prompt names the path", (esc?.summary ?? "").includes("/etc/hosts"));
+  check("...says the identity is not verified", /not verified/.test(esc?.summary ?? ""));
+  check("...and is still a one-off, nothing persisted", state.listGrants().length === 0);
+
+  // The hard refusals stay hard for a guest too — a link is not a way around them.
+  const cred = await agent.decide("Read", { file_path: join(homedir(), ".ssh", "id_rsa") });
+  check("a guest still cannot reach credential stores", cred.allow === false && cred.rule === "path-wall-sensitive");
 
   // A named peer in the same situation still gets the remembering behaviour.
   const named = new LocalDmAgent({
