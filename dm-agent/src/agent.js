@@ -10,8 +10,22 @@ const WRITE_TOOLS = ["Write", "Edit", "NotebookEdit"];
 // Mounting an MCP server makes the runtime offer ToolSearch so the model can look up tool
 // schemas. It reads nothing and touches nothing; denying it just stalls every turn.
 const FREE_TOOLS = ["ToolSearch"];
-// Credential stores the model has no business reading even if a folder grant overlaps them.
-const SENSITIVE_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud", "~/.kube", "~/.npmrc", "~/.netrc"];
+// Credential stores, and this agent's own control plane. Never readable, whatever folder the
+// owner shared — someone who shares their home directory has been careless, not consenting.
+// The state dir is here because it holds the grants themselves: a peer able to write it could
+// approve itself for everything, turning one "may I write this file?" into every future yes.
+const SENSITIVE_PATHS = [
+  "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud", "~/.kube", "~/.npmrc", "~/.netrc",
+  "~/.aicoo-dm-agent",
+];
+// Additionally never WRITABLE: files whose contents get executed later, where a write is
+// remote code execution on a delay rather than a document change. ~/.claude is in here
+// because its settings and hooks configure the runtime this agent is running inside.
+const NEVER_WRITE_PATHS = [
+  ...SENSITIVE_PATHS,
+  "~/.claude", "~/.codex", "~/.zshrc", "~/.bashrc", "~/.bash_profile", "~/.profile",
+  "~/.zshenv", "~/.config/fish", "~/Library/LaunchAgents",
+];
 // How many times one message may ask the owner to look outside the shared folders. A wall
 // protects attention as much as files: a peer able to ring the terminal indefinitely gets a
 // `y` eventually, out of fatigue rather than judgement.
@@ -209,11 +223,27 @@ function grantIdentity(capability, toolName, input) {
 }
 
 /** Paths that stay refused even with the owner watching — see #evaluate. */
-function isSensitivePath(real) {
-  return SENSITIVE_PATHS.some((entry) => {
+function matchesAny(real, entries) {
+  return entries.some((entry) => {
     const abs = entry.startsWith("~/") ? path.join(homedir(), entry.slice(2)) : entry;
     return real === abs || real.startsWith(abs + path.sep);
   });
+}
+
+function isSensitivePath(real) {
+  return matchesAny(real, SENSITIVE_PATHS);
+}
+
+/**
+ * Paths that must never be written even when they sit inside a shared folder. `.git/hooks` is
+ * matched by shape rather than location, since it is execution-on-next-commit in whichever
+ * repository the owner happened to share.
+ */
+function isNeverWritePath(real) {
+  if (matchesAny(real, NEVER_WRITE_PATHS)) return true;
+  const parts = real.split(path.sep);
+  const git = parts.indexOf(".git");
+  return git !== -1 && parts[git + 1] === "hooks";
 }
 
 /**
@@ -306,6 +336,29 @@ export class LocalDmAgent {
       return { allow: true, reason: "Tool discovery reads no data.", rule: "free-tool" };
     }
     if (toolName === RUN_COMMAND_TOOL) return this.#evaluateCommand(input);
+
+    // Credential stores and execute-on-next-run files are refused BEFORE anything else looks
+    // at folders. Checking them only outside the shared folders was the bug: share ~ and
+    // ~/.ssh/authorized_keys became an ordinary approval, which is remote persistence, and the
+    // agent's own state file became writable, which is one yes turning into every future yes.
+    // A folder grant is consent to the work in it, never to the machine's keys.
+    const pathish = input.file_path ?? input.notebook_path ?? input.path;
+    if (pathish) {
+      const real = resolveReal(pathish, this.workspace);
+      const writing = WRITE_TOOLS.includes(toolName);
+      if (real && (isSensitivePath(real) || (writing && isNeverWritePath(real)))) {
+        this.log(`[gate] refused without asking — ${writing ? "never writable" : "credential path"}: ${printableSafe(real)}`);
+        return {
+          allow: false,
+          reason: writing
+            ? "That path is never writable — it holds credentials, or its contents get executed."
+            : "That path holds credentials and is never readable.",
+          rule: writing ? "path-never-writable" : "path-wall-sensitive",
+          target: real,
+        };
+      }
+    }
+
     if (!READ_TOOLS.includes(toolName)) {
       const capability = capabilityFor(toolName);
       // A read outside the folders can be escalated to the owner; a write cannot. Reading the

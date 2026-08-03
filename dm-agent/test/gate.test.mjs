@@ -159,6 +159,49 @@ const check = (label, cond) => { checks.push([label, cond]); };
   check("...and is not asked a second time", n() === before);
 }
 
+// 1g. Sharing a folder is consent to the work inside it, never to the machine's keys. These
+//     all sit INSIDE the shared folder when someone shares their home directory, which is
+//     careless rather than consenting — and the check used to run only outside the folders,
+//     so each of these was one ordinary approval away.
+{
+  const { Policy } = await import("../src/policy.js");
+  const { AgentState } = await import("../src/state.js");
+  const { homedir } = await import("node:os");
+  const H = homedir();
+  const policy = new Policy({
+    folders: [H], commands: new Map(), capabilities: new Set(["write"]),
+  });
+  const state = new AgentState(join(root, `s-${Math.random().toString(36).slice(2)}.json`));
+  let woken = 0;
+  const agent = new LocalDmAgent({
+    workspace: H, policy, state, audit: { record() {} },
+    approvals: { ask: async () => { woken += 1; return true; } }, // would say yes if asked
+    ownerLabel: "@owner", peerLabel: "@peer", log: () => {},
+  });
+
+  const refuses = [
+    ["Read", join(H, ".ssh", "id_rsa"), "reading a private key"],
+    ["Write", join(H, ".ssh", "authorized_keys"), "writing authorized_keys is remote persistence"],
+    ["Write", join(H, ".aws", "credentials"), "writing cloud credentials"],
+    ["Write", join(H, ".zshrc"), "a shell rc file runs on next login"],
+    ["Write", join(H, ".claude", "settings.json"), "settings configure the runtime this agent runs in"],
+    ["Write", join(H, "p", ".git", "hooks", "pre-commit"), "a git hook runs on next commit"],
+    // The agent's own grants: one "may I write this file?" would become every future yes.
+    ["Write", join(H, ".aicoo-dm-agent", "x", "state.json"), "writing its own grants file"],
+    ["Read", join(H, ".aicoo-dm-agent", "x", "state.json"), "reading its own grants file"],
+  ];
+  for (const [tool, target, why] of refuses) {
+    const before = woken;
+    const d = await agent.decide(tool, { file_path: target, content: "x" });
+    check(`refused inside a shared folder: ${why}`, d.allow === false);
+    check(`...without asking the owner: ${why}`, woken === before);
+  }
+
+  // …and none of that blocks the ordinary case it exists to protect.
+  const ok = await agent.decide("Write", { file_path: join(H, "p", "README.md"), content: "x" });
+  check("an ordinary file in the shared folder is still just an approval", ok.allow === true);
+}
+
 // 2. Non-read tools are denied before any prompt.
 for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   const { agent, asked } = makeAgent(true);

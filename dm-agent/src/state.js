@@ -48,10 +48,15 @@ export class AgentState {
     this.save();
   }
 
+  /**
+   * 0600, and 0700 on the directory: this file holds the standing grants and the provider
+   * session id. World-readable was wrong — anything else on the machine could read which
+   * capabilities a peer already has, and the session token for the conversation.
+   */
   save() {
-    mkdirSync(dirname(this.file), { recursive: true });
+    mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
     const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+    writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
     renameSync(tmp, this.file);
   }
 
