@@ -39,26 +39,29 @@ export class ApprovalBroker {
    *   what it is asking about can never accidentally inherit the read shortcut.
    */
   async ask({ toolName, summary, kind = "exec" }) {
-    // --auto-allow-read means reads, and only reads. Running a command on someone's machine
-    // is a different risk class from opening a file in a folder they already shared, and a
-    // flag whose help text says "reads" must not quietly also mean "and execution".
+    // --auto-allow-read means reads, and only reads, *inside the shared folders*. Neither a
+    // command nor a step outside those folders is what the owner agreed to when they said
+    // "don't ask me about the folder I shared" — kind "escalation" deliberately misses here.
     if (this.autoAllowRead && kind === "read") {
       this.log(`[approval] auto-allowed (--auto-allow-read): ${toolName} ${summary}`);
       return true;
     }
     if (process.stdin.isTTY && process.stdout.isTTY) {
-      return this.#askTty({ toolName, summary });
+      return this.#askTty({ toolName, summary, kind });
     }
-    return this.#askFile({ toolName, summary });
+    return this.#askFile({ toolName, summary, kind });
   }
 
-  async #askTty({ toolName, summary }) {
+  async #askTty({ toolName, summary, kind }) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const timeoutController = new AbortController();
     try {
       process.stdout.write(""); // bell
       const answer = await Promise.race([
-        rl.question(`\n== OWNER APPROVAL REQUIRED ==\n   tool: ${toolName}\n   ${summary}\n   allow? [y/N] (${this.timeoutSec}s, default deny) `),
+        // An out-of-folder read is the one decision the owner must not make on autopilot, so
+        // it gets its own banner rather than looking like the reads they have been waving
+        // through all session.
+        rl.question(`\n== ${kind === "escalation" ? "OUTSIDE YOUR SHARED FOLDERS" : "OWNER APPROVAL REQUIRED"} ==\n   tool: ${toolName}\n   ${summary}\n   allow? [y/N] (${this.timeoutSec}s, default deny) `),
         delay(this.timeoutSec * 1000, "__timeout__", { signal: timeoutController.signal }).catch(() => "__aborted__"),
       ]);
       if (answer === "__timeout__") {
@@ -72,12 +75,12 @@ export class ApprovalBroker {
     }
   }
 
-  async #askFile({ toolName, summary }) {
+  async #askFile({ toolName, summary, kind }) {
     const id = randomUUID().slice(0, 8);
     const file = join(this.approvalsDir, `${id}.json`);
     const expiresAt = Date.now() + this.timeoutSec * 1000;
-    writeFileSync(file, JSON.stringify({ id, toolName, summary, createdAt: new Date().toISOString(), expiresAt, decision: null }, null, 2));
-    this.log(`[approval] PENDING ${id}: ${toolName} ${summary}`);
+    writeFileSync(file, JSON.stringify({ id, toolName, summary, kind, createdAt: new Date().toISOString(), expiresAt, decision: null }, null, 2));
+    this.log(`[approval] PENDING ${id}${kind === "escalation" ? " (OUTSIDE your shared folders)" : ""}: ${toolName} ${summary}`);
     this.log(`[approval]   resolve with: aicoo-dm-agent approve ${id} --allow   (or --deny)`);
     try {
       while (Date.now() < expiresAt) {

@@ -1,5 +1,5 @@
-import { realpathSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { realpathSync, mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { LocalDmAgent } from "../src/agent.js";
 
@@ -24,12 +24,62 @@ function makeAgent(answer) {
 const checks = [];
 const check = (label, cond) => { checks.push([label, cond]); };
 
-// 1. Out-of-workspace read is denied BY THE WALL, without ever waking the owner.
+// 1. A read outside the shared folders is the owner's call, not an automatic refusal —
+//    "the file is one directory up" is ordinary, and a wall that deletes the capability is
+//    not safety. But it must arrive marked as an escalation, carrying the resolved path.
+{
+  const { agent, asked } = makeAgent(true);
+  const d = await agent.decide("Read", { file_path: "/etc/hosts" });
+  check("out-of-folder read asks the owner", asked.length === 1);
+  check("it is marked as an escalation, not an ordinary read", asked[0]?.kind === "escalation");
+  check("the prompt says it is outside the shared folders", /OUTSIDE/.test(asked[0]?.summary ?? ""));
+  check("the prompt carries the resolved path", (asked[0]?.summary ?? "").includes("/etc/hosts"));
+  check("owner allow means allow", d.allow === true);
+  check("and it is recorded as an escalation", d.rule === "owner-escalated");
+}
+
+// 1b. …and an owner who says no is obeyed.
+{
+  const { agent, asked } = makeAgent(false);
+  const d = await agent.decide("Read", { file_path: "/etc/hosts" });
+  check("owner deny means deny", d.allow === false);
+  check("declined escalation is recorded as such", d.rule === "owner-declined-escalation");
+  check("the owner was asked exactly once", asked.length === 1);
+}
+
+// 1c. Credential stores are refused WITHOUT asking. There is no legitimate version of this
+//     request, and a prompt for one is just an invitation to fat-finger `y`.
 {
   const { agent, asked } = makeAgent(true); // broker would say yes if consulted
-  const d = await agent.decide("Read", { file_path: "/etc/hosts" });
-  check("out-of-workspace read denied", d.allow === false);
-  check("owner NOT asked for out-of-workspace read", asked.length === 0);
+  const d = await agent.decide("Read", { file_path: join(homedir(), ".ssh", "id_rsa") });
+  check("credential path denied", d.allow === false);
+  check("credential path denied by rule, not by the owner", d.rule === "path-wall-sensitive");
+  check("owner NOT asked about a credential path", asked.length === 0);
+}
+
+// 1d. The escalation budget is what keeps the wall protecting attention as well as files:
+//     a peer who can ring the terminal indefinitely eventually gets a `y` out of fatigue.
+{
+  const { agent, asked } = makeAgent(true);
+  for (let i = 0; i < 5; i++) await agent.decide("Read", { file_path: `/etc/hosts${i}` });
+  check("escalations are capped per turn", asked.length === 3);
+  const last = await agent.decide("Read", { file_path: "/etc/passwd" });
+  check("past the cap it denies", last.allow === false);
+  check("past the cap it does not ask", last.rule === "escalation-budget");
+}
+
+// 1e. A symlink must be shown to the owner as where it actually lands, or the prompt is
+//     asking them to consent to a fiction.
+{
+  const outside = join(root, "outside");
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(outside, "secret.md"), "x");
+  symlinkSync(outside, join(ws, "looks-innocent"));
+  const { agent, asked } = makeAgent(false);
+  await agent.decide("Read", { file_path: join(ws, "looks-innocent", "secret.md") });
+  check("symlinked path still reaches the owner", asked.length === 1);
+  check("the owner is shown the real destination, not the symlink", (asked[0]?.summary ?? "").includes(realpathSync(outside)));
+  check("the disguising name is not what they approve", !(asked[0]?.summary ?? "").includes("looks-innocent"));
 }
 
 // 2. Non-read tools are denied before any prompt.
