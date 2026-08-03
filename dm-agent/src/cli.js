@@ -53,6 +53,8 @@ Usage:
   AICOO_TOKEN=aicoo_sk_… aicoo-dm-agent start --peer <username|userId> [options]
   aicoo-dm-agent send --peer <username|userId> --text "…"      one-shot DM (reachout)
   aicoo-dm-agent whoami                                        identity of AICOO_TOKEN
+  aicoo-dm-agent connect --peer <username>                     friend-request them, so they
+                                                               can open your agent and ask it
   aicoo-dm-agent approve <id> --allow|--deny --peer <peer>     resolve a pending tool approval
   aicoo-dm-agent pending --peer <peer>                         list pending tool approvals
   aicoo-dm-agent start --dry-run-message "…" [options]         one local turn, no network send
@@ -66,8 +68,9 @@ Options:
                            declared commands still ask every time
   --reachout "<text>"      send this DM to --peer once at startup
   --model <model>          model override for the local session
-  --watch-agent-thread     also answer in the peer's agent thread (their cloud agent
-                           answers there too, so expect two replies per question)
+  --dm-only                answer only in the plain DM thread. Replies still land in the
+                           agent thread (the API cannot post into a DM), so the asker sees
+                           the answer somewhere other than where they typed. Rarely wanted.
   --policy <file>          declared commands + folders (default: <state-dir>/policy.json)
   --no-sandbox             run the model's file tools unsandboxed (only if the platform
                            cannot start one — the default is to fail rather than pretend)
@@ -179,6 +182,41 @@ async function main() {
     return;
   }
 
+  // ── connect: make sure the peer can actually reach this agent ──
+  // Someone who is not a contact has no way to open your agent in the app, so the loop would
+  // sit online answering nothing. Checking first, and saying plainly whose move it is, beats
+  // discovering it during a demo.
+  if (command === "connect") {
+    if (!args.peer) throw new Error("usage: connect --peer <their Aicoo username>");
+    const peer = String(args.peer).replace(/^@/, "");
+    const contacts = await api.contacts();
+    if (contacts.some((c) => c.username?.toLowerCase() === peer.toLowerCase())) {
+      console.log(`@${peer} is already connected — they can open your agent and ask it anything.`);
+      return;
+    }
+    let res;
+    try {
+      res = await api.requestFriend(peer);
+    } catch (error) {
+      // The predictable wrong answer here is an email address, because that is how people
+      // refer to each other. Naming that specifically saves a round of confusion.
+      if (error.code === "not_found") {
+        const hint = peer.includes("@") || peer.includes(".")
+          ? `That looks like an email. Aicoo wants their *username* — they can read it off their own profile.`
+          : `Check the spelling — Aicoo wants their username, which is not always their display name.`;
+        throw new Error(`No Aicoo user named "${peer}". ${hint}`);
+      }
+      throw error;
+    }
+    if (res.already === "pending") {
+      console.log(`A request to @${peer} is already waiting. Nothing more to send — they have to accept it in Aicoo.`);
+    } else {
+      console.log(`Friend request sent to @${peer}.`);
+    }
+    console.log(`Next: ask them to accept it at https://www.aicoo.io, then open your agent and type a question.`);
+    return;
+  }
+
   if (command !== "start") {
     usage();
     throw new Error(`unknown command: ${command}`);
@@ -192,6 +230,19 @@ async function main() {
 
   const me = await api.identity();
   log(`agent online as @${me.username} (${me.userId}), peer=${peer}, workspace=${workspace}`);
+
+  // An agent that is online but unreachable looks identical to one that is working, right up
+  // until the person you are demoing to types and nothing happens. Say it at startup instead.
+  try {
+    const contacts = await api.contacts();
+    const bare = String(peer).replace(/^@/, "").toLowerCase();
+    if (!contacts.some((c) => c.username?.toLowerCase() === bare)) {
+      log(`WARNING: @${peer} is not a contact yet, so they cannot open your agent in Aicoo.`);
+      log(`         Run: aicoo-dm-agent connect --peer ${peer}   (then they accept it in the app)`);
+    }
+  } catch (error) {
+    log(`[network] could not check whether @${peer} is a contact: ${error.message}`);
+  }
 
   const stateDir = stateDirFor({ server, me: me.username, peer, override: args["state-dir"] });
   const state = new AgentState(join(stateDir, "state.json"));
@@ -257,10 +308,18 @@ async function main() {
     log(`reachout sent → conversation ${res.conversationId} (recipient: ${res.recipientName})`);
   }
 
-  const watchAgentThread = Boolean(args["watch-agent-thread"]);
-  log(watchAgentThread
-    ? `watching direct DMs AND the agent thread — expect the cloud agent to answer there too`
-    : `watching direct DMs only (pass --watch-agent-thread to also answer in the agent thread)`);
+  // Replies can only be written to the agent thread: POST /api/v1/agent/message takes a
+  // username, a userId or group:N, and always lands in the shared_agent conversation. There
+  // is no way to post into a `direct` DM. Watching direct-only therefore read the question
+  // in one thread and answered in another — the asker saw silence where they had typed.
+  // So the agent thread is the default, and it is also where a peer naturally goes to talk
+  // to someone's agent. The cost is that the cloud agent answers there too; the 🖥️ tag on
+  // our reply is what tells the two apart.
+  const dmOnly = Boolean(args["dm-only"]);
+  const watchAgentThread = !dmOnly;
+  log(dmOnly
+    ? `watching direct DMs only (--dm-only) — note replies still land in the agent thread`
+    : `watching the agent thread and direct DMs; replies land in the agent thread, tagged 🖥️`);
 
   /**
    * One inbound message, end to end: run a turn, redact, send, advance the cursor.

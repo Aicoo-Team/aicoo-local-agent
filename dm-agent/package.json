@@ -1,6 +1,6 @@
 {
   "name": "@aicoo/dm-agent",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Let a teammate ask your local agent. They DM you on Aicoo, a Claude Code session on your machine answers, and every file it opens is approved by you, one call at a time.",
   "keywords": [
     "aicoo",

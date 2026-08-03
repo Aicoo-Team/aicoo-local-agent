@@ -80,6 +80,28 @@ export class AicooApi {
     });
   }
 
+  /** Contacts this key's account is connected to. */
+  async contacts() {
+    const res = await this.request("/api/v1/network");
+    return res.network?.contacts ?? [];
+  }
+
+  /**
+   * Send a plain friend request (a `_coo` suffix would ask for agent access instead, which is
+   * a different and much larger grant — we never want it here).
+   * Returns { ok } or, for the two states that are not failures, { already: "connected"|"pending" }.
+   */
+  async requestFriend(username) {
+    try {
+      await this.request("/api/v1/network/request", { method: "POST", body: { to: username } });
+      return { ok: true };
+    } catch (error) {
+      if (error.code === "already_connected") return { ok: true, already: "connected" };
+      if (error.code === "already_pending") return { ok: true, already: "pending" };
+      throw error;
+    }
+  }
+
   /** Retry helper for transient failures (5xx / network). 4xx are rethrown immediately. */
   async withRetry(fn, { attempts = 3, baseDelayMs = 1000 } = {}) {
     let lastError;
