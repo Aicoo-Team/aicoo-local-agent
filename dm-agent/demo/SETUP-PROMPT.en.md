@@ -37,17 +37,26 @@ do not skip ahead:
    Keys on https://www.aicoo.io) and confirm both work:
    `AICOO_TOKEN=<my key> aicoo-dm-agent whoami` should print my Aicoo identity.
 
-4. Create a demo folder with a FAKE .env — the values must be fake, never my real secrets:
-   mkdir -p ~/aicoo-demo and write six variables into ~/aicoo-demo/.env:
-   NODE_ENV / BASE_URL / DATABASE_URL / SERVICE_API_TOKEN / REDIS_URL / LOG_LEVEL,
-   with made-up values.
+4. Make sure they can actually reach me — until we are connected in Aicoo they cannot open
+   my agent at all, and it would sit online answering nothing. Ask me for their Aicoo
+   username (their username, not their email), then:
 
-5. Do NOT start the agent for me, and do not background it with nohup or &. Fill in the
-   username below and hand me this command to run in a terminal I can see. Explain that the
-   approval prompt appears in that terminal and I have to press y to allow each call, and
-   that closing the terminal takes the agent offline.
+   `AICOO_TOKEN=<my key> aicoo-dm-agent connect --peer <their Aicoo username>`
 
-   AICOO_TOKEN=<my key> aicoo-dm-agent start --peer <their Aicoo username> --workspace ~/aicoo-demo
+   If a request was sent, tell me they must accept it at https://www.aicoo.io first.
+
+5. Ask me which folder on this machine they should be able to ask about. Do NOT create one
+   and do NOT guess — it should already have something worth asking about. Then hand me
+   this command to run in a terminal I can see; do not run it yourself and do not background
+   it with nohup or &. Explain that the approval prompt appears in that terminal and I press
+   y to allow each read, and that closing the terminal takes the agent offline.
+
+   AICOO_TOKEN=<my key> aicoo-dm-agent start --peer <their Aicoo username> --workspace <the folder I name>
+
+6. Finally, tell me what to send them: they open MY AGENT in Aicoo — not a plain DM — and
+   ask about that folder. Replies can only be written to the agent thread, so a plain DM
+   leaves them watching silence. My cloud agent answers there too; the reply from this
+   machine is the one tagged 🖥️.
 ```
 
 ---

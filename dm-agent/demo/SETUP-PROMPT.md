@@ -32,15 +32,23 @@
    (我去 https://www.aicoo.io → Settings → API Keys 拿),
    用 `AICOO_TOKEN=<我的key> aicoo-dm-agent whoami` 确认命令和 key 都没问题。
 
-4. 建演示目录和一份**假的** .env(值必须是假的,绝对不要用我真实的密钥):
-   mkdir -p ~/aicoo-demo,写入 NODE_ENV / BASE_URL / DATABASE_URL /
-   SERVICE_API_TOKEN / REDIS_URL / LOG_LEVEL 六个变量,值随便编。
+4. 先确认对方真能找到我——没连上之前他根本打不开我的 agent,agent 会在线但一句
+   也收不到。问我要对方的 Aicoo **用户名**(是用户名,不是邮箱),然后:
 
-5. 最后**不要**替我启动 agent,也不要用 nohup 或 & 放后台。把下面这条命令
-   填好用户名后交给我,让我自己在一个能看见的终端里跑,并解释清楚:
-   审批提示会出现在那个终端,我要按 y 才会放行;关掉终端 agent 就下线。
+   `AICOO_TOKEN=<我的key> aicoo-dm-agent connect --peer <对方的Aicoo用户名>`
 
-   AICOO_TOKEN=<我的key> aicoo-dm-agent start --peer <对方的Aicoo用户名> --workspace ~/aicoo-demo
+   如果显示请求已发出,告诉我要对方先去 https://www.aicoo.io 接受。
+
+5. 问我要共享这台机器上的**哪个目录**。不要自己建,也不要猜——应该是一个本来就
+   有东西可问的目录。然后把下面这条命令交给我,让我自己在一个能看见的终端里跑;
+   你不要替我跑,也不要用 nohup 或 & 放后台。并解释清楚:审批提示会出现在那个
+   终端,我要按 y 才会放行;关掉终端 agent 就下线。
+
+   AICOO_TOKEN=<我的key> aicoo-dm-agent start --peer <对方的Aicoo用户名> --workspace <我指定的目录>
+
+6. 最后告诉我该跟对方说什么:让他在 Aicoo 里打开**我的 agent**,不是普通私信,
+   然后问那个目录相关的问题。回复只能写进 agent 那条线,发普通私信他会一直等不到。
+   我的云端 agent 也会在同一条线里回,来自这台机器的那条带 🖥️ 标记。
 ```
 
 ---
