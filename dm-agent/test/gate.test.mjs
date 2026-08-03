@@ -202,6 +202,58 @@ const check = (label, cond) => { checks.push([label, cond]); };
   check("an ordinary file in the shared folder is still just an approval", ok.allow === true);
 }
 
+// 1h. A guest relationship — whoever is holding a one-time share link — keeps no standing
+//     grants. "Remembered for whom?" has no answer when the next holder is a different person
+//     and the only thing telling them apart is a fingerprint they control.
+{
+  const { Policy } = await import("../src/policy.js");
+  const { AgentState } = await import("../src/state.js");
+  const policy = new Policy({
+    folders: [ws], commands: new Map(),
+    capabilities: new Set(["bash", "skills"]), trust: "guest",
+  });
+  const state = new AgentState(join(root, `g-${Math.random().toString(36).slice(2)}.json`));
+  const asked = [];
+  const agent = new LocalDmAgent({
+    workspace: ws, policy, state, audit: { record() {} },
+    approvals: { ask: async (r) => { asked.push(r); return true; } },
+    ownerLabel: "@owner", peerLabel: "a visitor", log: () => {},
+  });
+
+  check("policy exposes the guest tier", policy.isGuest === true);
+
+  await agent.decide("Bash", { command: "ls" });
+  const first = asked.length;
+  // Vary the input so the short-lived decision memo cannot answer, isolating the grant path.
+  const second = await agent.decide("Bash", { command: "ls", timeout: 1 });
+  check("a guest is asked again for the same capability", asked.length > first);
+  check("and it is recorded as a one-off, not a grant", second.rule === "guest-allowed-once");
+  check("nothing was persisted for a guest", state.listGrants().length === 0);
+
+  // The prompt must not promise persistence the relationship will not deliver.
+  check("the prompt says 'this once'", /this once/.test(asked[0]?.summary ?? ""));
+  check("the prompt does not promise later calls", !/any later/.test(asked[0]?.summary ?? ""));
+
+  // Escalation asks the owner to widen access for a particular person. There isn't one.
+  const before = asked.length;
+  const out = await agent.decide("Read", { file_path: "/etc/hosts" });
+  check("a guest cannot escalate outside the shared folder", out.allow === false);
+  check("...and is refused by rule, without asking", out.rule === "guest-no-escalation" && asked.length === before);
+
+  // A named peer in the same situation still gets the remembering behaviour.
+  const named = new LocalDmAgent({
+    workspace: ws,
+    policy: new Policy({ folders: [ws], commands: new Map(), capabilities: new Set(["bash"]) }),
+    state: new AgentState(join(root, `n-${Math.random().toString(36).slice(2)}.json`)),
+    audit: { record() {} },
+    approvals: { ask: async () => true },
+    ownerLabel: "@owner", peerLabel: "@peer", log: () => {},
+  });
+  await named.decide("Bash", { command: "ls" });
+  const namedAgain = await named.decide("Bash", { command: "ls", timeout: 1 });
+  check("a named peer still gets a standing grant", namedAgain.rule === "grant-remembered");
+}
+
 // 2. Non-read tools are denied before any prompt.
 for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   const { agent, asked } = makeAgent(true);

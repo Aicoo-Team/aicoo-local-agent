@@ -11,6 +11,17 @@ import { setTimeout as delay } from "node:timers/promises";
  *    resolves it from any terminal with `aicoo-dm-agent approve <id> --allow|--deny`.
  * No decision within timeoutSec -> deny (fail closed).
  */
+/**
+ * The banner is the part an owner reads at a glance after the tenth prompt, so each kind of
+ * decision gets its own rather than blurring into the reads they have been waving through.
+ */
+const BANNERS = {
+  exec: "OWNER APPROVAL REQUIRED",
+  read: "OWNER APPROVAL REQUIRED",
+  capability: "OWNER APPROVAL REQUIRED",
+  escalation: "OUTSIDE YOUR SHARED FOLDERS",
+};
+
 export class ApprovalBroker {
   constructor({ approvalsDir, timeoutSec = 300, autoAllowRead = false, log = console.log }) {
     this.approvalsDir = approvalsDir;
@@ -61,7 +72,7 @@ export class ApprovalBroker {
         // An out-of-folder read is the one decision the owner must not make on autopilot, so
         // it gets its own banner rather than looking like the reads they have been waving
         // through all session.
-        rl.question(`\n== ${kind === "escalation" ? "OUTSIDE YOUR SHARED FOLDERS" : "OWNER APPROVAL REQUIRED"} ==\n   tool: ${toolName}\n   ${summary}\n   allow? [y/N] (${this.timeoutSec}s, default deny) `),
+        rl.question(`\n== ${BANNERS[kind] ?? BANNERS.exec} ==\n   tool: ${toolName}\n   ${summary}\n   allow? [y/N] (${this.timeoutSec}s, default deny) `),
         delay(this.timeoutSec * 1000, "__timeout__", { signal: timeoutController.signal }).catch(() => "__aborted__"),
       ]);
       if (answer === "__timeout__") {

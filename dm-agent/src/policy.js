@@ -109,12 +109,38 @@ function parseCapabilities(raw, log) {
   return chosen;
 }
 
+/**
+ * Who is on the other end, as far as consent is concerned.
+ *
+ * "named" is an authenticated Aicoo user the owner connected to deliberately. Remembering a
+ * decision about them is meaningful: it is a decision about a person.
+ *
+ * "guest" is whoever is holding a share link. Remembering anything about them is incoherent —
+ * remembered for WHOM? The link is one-time, so the next holder is a different person, and the
+ * only thing distinguishing them is a client-supplied fingerprint that can be forged. So a
+ * guest relationship keeps no standing grants: every call is asked, every time.
+ */
+const TRUST_LEVELS = ["named", "guest"];
+
+function parseTrust(raw, log) {
+  if (raw === undefined || raw === null) return "named";
+  const value = String(raw).trim().toLowerCase();
+  if (!TRUST_LEVELS.includes(value)) {
+    throw new PolicyError(`unknown trust "${raw}" — must be one of: ${TRUST_LEVELS.join(", ")}`);
+  }
+  if (value === "guest") {
+    log?.(`[policy] guest relationship: nothing is remembered. Every single call asks you, every time, and there is no reading outside the shared folders.`);
+  }
+  return value;
+}
+
 export class Policy {
-  /** @param {{folders: string[], commands: Map<string, object>, capabilities: Set<string>, source?: string}} input */
-  constructor({ folders, commands, capabilities, source }) {
+  /** @param {{folders: string[], commands: Map<string, object>, capabilities: Set<string>, trust?: string, source?: string}} input */
+  constructor({ folders, commands, capabilities, trust, source }) {
     this.folders = folders;
     this.commands = commands;
     this.capabilities = capabilities ?? new Set();
+    this.trust = trust ?? "named";
     this.source = source;
   }
 
@@ -125,6 +151,11 @@ export class Policy {
 
   can(capability) {
     return this.capabilities.has(capability);
+  }
+
+  /** Anonymous link holder: nothing is remembered, and nothing outside the folders is offered. */
+  get isGuest() {
+    return this.trust === "guest";
   }
 
   static fromFile(file, workspace, log) {
@@ -142,7 +173,8 @@ export class Policy {
       : [resolveFolder(workspace, log)];
     const commands = parseCommands(raw.commands, log);
     const capabilities = parseCapabilities(raw.capabilities, log);
-    return new Policy({ folders, commands, capabilities, source: file });
+    const trust = parseTrust(raw.trust, log);
+    return new Policy({ folders, commands, capabilities, trust, source: file });
   }
 
   get commandNames() {
