@@ -93,7 +93,7 @@ Compose the reply to send back now.`;
     }
 
     const summary = `run "${declared.name}" (${declared.argv.join(" ")}) in ${this.workspace}`;
-    const allowed = await this.approvals.ask({ toolName: `command:${declared.name}`, summary });
+    const allowed = await this.approvals.ask({ toolName: `command:${declared.name}`, summary, kind: "exec" });
     this.#audit("command", declared.name, allowed ? "allow" : "deny", allowed ? "owner-approved" : "owner-declined");
     return allowed ? "accept" : "decline";
   }

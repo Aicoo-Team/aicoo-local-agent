@@ -59,7 +59,8 @@ Options:
   --server <url>           control plane (default: ${DEFAULT_SERVER} — keep the www host)
   --poll <ms>              poll interval (default: 3000)
   --approve-timeout <s>    owner approval timeout, then deny (default: 300)
-  --auto-allow-read        skip approval prompts for in-workspace reads (demo only)
+  --auto-allow-read        skip approval for in-workspace READS only (demo only);
+                           declared commands still ask every time
   --reachout "<text>"      send this DM to --peer once at startup
   --model <model>          model override for the local session
   --watch-agent-thread     also answer in the peer's agent thread (their cloud agent
@@ -304,13 +305,14 @@ async function main() {
             : responder === "codex"
               ? await codex.runTurn(inbound)
               : await agent.runTurn(inbound);
-          log(`reply for #${message.id}: ${reply.slice(0, 120).replace(/\s+/g, " ")}`);
-          // The peer's thread also receives answers from Aicoo's cloud agent, which
-          // replies to the same message within seconds and has no access to this
-          // machine. Prefix ours so the two are never confused in the app.
-          // Last thing before it leaves the machine. Collected per turn, because a command
-          // may have just written a value into a file the model then quoted.
+          // Redact before logging, not after: the preview the owner sees should be what was
+          // actually sent, and a redirected stdout should not become the one place the value
+          // does land on disk.
           const { text: safe, redacted } = redact(reply, collectSecrets(policy.folders));
+          log(`reply for #${message.id}: ${safe.slice(0, 120).replace(/\s+/g, " ")}`);
+          // The peer's thread also receives answers from Aicoo's cloud agent, which replies to
+          // the same message within seconds and has no access to this machine. Prefix ours so
+          // the two are never confused in the app.
           if (redacted.length) {
             log(`[redact] withheld ${redacted.length} value(s) from the reply (${redacted.map((r) => r.source).join(", ")})`);
           }

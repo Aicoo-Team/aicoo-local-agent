@@ -33,8 +33,16 @@ export class ApprovalBroker {
     }
   }
 
-  async ask({ toolName, summary }) {
-    if (this.autoAllowRead) {
+  /**
+   * @param {{toolName: string, summary: string, kind?: "read"|"exec"}} request
+   *   `kind` defaults to "exec" — the cautious reading — so a caller that forgets to say
+   *   what it is asking about can never accidentally inherit the read shortcut.
+   */
+  async ask({ toolName, summary, kind = "exec" }) {
+    // --auto-allow-read means reads, and only reads. Running a command on someone's machine
+    // is a different risk class from opening a file in a folder they already shared, and a
+    // flag whose help text says "reads" must not quietly also mean "and execution".
+    if (this.autoAllowRead && kind === "read") {
       this.log(`[approval] auto-allowed (--auto-allow-read): ${toolName} ${summary}`);
       return true;
     }

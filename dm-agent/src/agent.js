@@ -180,7 +180,7 @@ export class LocalDmAgent {
       return { allow: false, reason: "Pattern traversal is not allowed.", rule: "pattern-traversal", target: input.pattern };
     }
     const summary = `${toolName}(${JSON.stringify(input).slice(0, 160)}) in ${folder}`;
-    const allowed = await this.approvals.ask({ toolName, summary });
+    const allowed = await this.approvals.ask({ toolName, summary, kind: "read" });
     return allowed
       ? { allow: true, reason: "The owner approved this tool call.", rule: "owner-approved", target: String(target) }
       : { allow: false, reason: "The owner declined this tool call.", rule: "owner-declined", target: String(target) };
@@ -205,7 +205,7 @@ export class LocalDmAgent {
     }
     // Legible on purpose: a name plus the exact argv the owner wrote, never a shell string.
     const summary = `run "${entry.name}" (${entry.argv.join(" ")}) in ${this.workspace}`;
-    const allowed = await this.approvals.ask({ toolName: `command:${entry.name}`, summary });
+    const allowed = await this.approvals.ask({ toolName: `command:${entry.name}`, summary, kind: "exec" });
     return allowed
       ? { allow: true, reason: "The owner approved this command.", rule: "owner-approved", target: entry.name }
       : { allow: false, reason: "The owner declined to run that command.", rule: "owner-declined", target: entry.name };

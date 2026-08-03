@@ -121,6 +121,17 @@ const policy = Policy.fromFile(
   check("the refusal is audited with the deciding rule", audited[0]?.rule === "command-not-declared");
 }
 
+// ── --auto-allow-read is about reads, and only reads ──────────────────────────
+{
+  const { ApprovalBroker } = await import("../src/approval.js");
+  const dir = join(root, "auto-allow");
+  const broker = new ApprovalBroker({ approvalsDir: dir, timeoutSec: 1, autoAllowRead: true, log: () => {} });
+  check("a read is auto-allowed by the flag", (await broker.ask({ toolName: "Read", summary: "x", kind: "read" })) === true);
+  // Would otherwise block for the timeout; 1s is the whole point of the short window here.
+  check("a command is NOT auto-allowed by it", (await broker.ask({ toolName: "command:x", summary: "x", kind: "exec" })) === false);
+  check("an unlabelled request is treated as exec", (await broker.ask({ toolName: "?", summary: "x" })) === false);
+}
+
 // ── the runner ────────────────────────────────────────────────────────────────
 {
   const result = await runDeclaredCommand({ name: "echo", argv: ["node", "-e", "console.log('3 passed')"] }, { cwd: ws });
