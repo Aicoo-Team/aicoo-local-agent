@@ -31,13 +31,38 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(options.settingSources).toEqual([]);
     expect(options.mcpServers).toEqual({});
     expect(options.strictMcpConfig).toBe(true);
-    expect(options.permissionMode).toBe("dontAsk");
+    // "dontAsk" would resolve every permission internally — auto-allowing reads inside cwd
+    // and auto-denying the rest — without ever consulting the hook or canUseTool.
+    expect(options.permissionMode).toBe("default");
     expect(options.extraArgs).toMatchObject({ "safe-mode": null, "replay-user-messages": null });
     expect(await options.canUseTool?.("Bash", { command: "touch /tmp/aicoo-pwned" }, {
       signal: new AbortController().signal,
       toolUseID: "malicious-tool-call",
       requestId: "permission-request",
     })).toMatchObject({ behavior: "deny", interrupt: false });
+
+    // The PreToolUse hook is the only gate the runtime always consults: built-in rules
+    // auto-allow in-cwd reads, so a policy check reachable only via canUseTool is unreachable
+    // for exactly the calls a peer is most likely to make.
+    const preToolUseHook = options.hooks?.PreToolUse?.[0]?.hooks?.[0];
+    expect(preToolUseHook).toBeTypeOf("function");
+    const hookDecision = await preToolUseHook!(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "touch /tmp/aicoo-pwned" },
+        tool_use_id: "malicious-tool-call",
+        session_id: "s",
+        transcript_path: "",
+        cwd: options.cwd ?? "",
+        permission_mode: "default",
+      } as never,
+      "malicious-tool-call",
+      { signal: new AbortController().signal },
+    );
+    expect(hookDecision).toMatchObject({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
+    });
 
     const events = collectEvents(adapter, "claude-managed-1", 2);
     const result = await adapter.deliverToSession("claude-managed-1", inbound("msg_initial"), "new_turn");
