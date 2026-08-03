@@ -380,7 +380,7 @@ program.command("send-to")
         return;
       }
     }
-    const session = await activeSessionForPeer(targetPrincipalId, options.server);
+    const session = await activeSessionForPeer(targetPrincipalId, options.server, options.spool);
     const receipt = await client.sendMessage({
       communicationSessionId: session.id,
       clientMessageId: options.clientId ?? randomUUID(),
@@ -867,8 +867,8 @@ async function acceptConnection(
   return { grant, accessPolicy: { status: "saved", preset: access, policyFile, ...(folder ? { folder } : {}) } };
 }
 
-async function activeSessionForPeer(peerPrincipalId: string, server?: string): Promise<CommunicationSession> {
-  const active = (await makeHostedClient(server).listCommunicationSessions())
+async function activeSessionForPeer(peerPrincipalId: string, server?: string, spool?: string): Promise<CommunicationSession> {
+  const active = (await makeHostedClient(server, spool).listCommunicationSessions())
     .filter((session) =>
       session.status === "active"
       && (session.requester.principalId === peerPrincipalId || session.recipient.principalId === peerPrincipalId))
