@@ -125,19 +125,24 @@ async function main() {
       log,
     });
     const policy = loadPolicy(args.policy ?? join(stateDir, "policy.json"), workspace);
-    const agent = new LocalDmAgent({
+    const audit = new AuditLog(join(stateDir, "audit.jsonl"), { log });
+    const shared = {
       workspace,
       state,
       approvals,
       policy,
-      audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
-      sandbox: args["no-sandbox"] ? false : undefined,
+      audit,
       ownerLabel: args["owner-label"] ?? "the owner",
       peerLabel: args.peer ?? "a peer",
-      model: args.model,
       log,
-    });
-    log(`dry run in ${workspace} · ${policy.describe()}`);
+    };
+    // A dry run has to exercise the runtime the flag names. Silently running the Claude path
+    // while --responder codex is set produces a green result for code that was never called.
+    const dryResponder = args.responder ?? "agent";
+    const agent = dryResponder === "codex"
+      ? new CodexResponder({ ...shared, codexPath: args["codex-path"] })
+      : new LocalDmAgent({ ...shared, model: args.model, sandbox: args["no-sandbox"] ? false : undefined });
+    log(`dry run in ${workspace} · responder=${dryResponder} · ${policy.describe()}`);
     const reply = await agent.runTurn({
       text: String(args["dry-run-message"]),
       from: args.peer ?? "dry-run-peer",
@@ -212,20 +217,31 @@ async function main() {
     ? new CodexResponder({
         workspace,
         state,
+        approvals,
+        policy,
+        audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
         ownerLabel: `@${me.username}`,
         peerLabel: `@${peer}`,
         codexPath: args["codex-path"],
-        model: args.model,
         log,
       })
     : null;
   if (codex) {
-    log(`[codex] containment = read-only sandbox in ${workspace}; per-call owner approval NOT wired on this runtime`);
-    // `codex exec` exposes no approval callback, so there is no way to ask the owner before
-    // a command runs. Exec without a way to ask is not a weaker version of this feature —
-    // it is a different and worse one, so it is simply off here.
+    log(`[codex] app-server: read-only sandbox in ${workspace}, network off, owner asked for anything it cannot serve`);
+    // Not the same granularity as Claude Code, and worth saying plainly: the sandbox answers
+    // reads inside the shared folder without asking, so the prompt is reserved for what it
+    // refuses. Reads are effectively a standing grant on the folder the owner shared.
+    log(`[codex] reads inside the shared folder are served without a prompt; commands and escapes are not`);
     if (policy.commandNames.length) {
-      log(`[codex] declared commands are DISABLED on this runtime (${policy.commandNames.length} in policy): no approval hook exists in codex exec`);
+      const offerable = codex.offerable().map((entry) => entry.name);
+      const skipped = policy.commandNames.filter((name) => !offerable.includes(name));
+      if (offerable.length) log(`[codex] declared commands available: ${offerable.join(", ")}`);
+      // Say which ones are not on offer and why, rather than letting the owner wonder why
+      // a command they declared is never used on this runtime.
+      if (skipped.length) {
+        log(`[codex] NOT offered here (their argv needs shell quoting, which Codex re-quotes unpredictably): ${skipped.join(", ")}`);
+        log(`[codex]   wrap those in a script file and declare the script path instead`);
+      }
     }
   }
   log(`state: ${stateDir}  responder=${responder}`);

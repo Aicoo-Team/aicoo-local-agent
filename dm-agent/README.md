@@ -99,9 +99,31 @@ straight to `execFile` with no shell, so `&&`, pipes and `$(…)` are impossible
 construction — a bare string is rejected at load rather than quietly run through a shell. If
 you need a pipeline, declare a script file.
 
-The peer chooses a name; they cannot pass arguments. Commands are disabled entirely on
-`--responder codex`, because `codex exec` has no approval callback and exec without a way to
-ask is not a weaker version of this feature but a different, worse one.
+The peer chooses a name; they cannot pass arguments.
+
+### Codex works too, through `app-server`
+
+`codex exec` had no way in — anything its sandbox could not satisfy was refused on the spot,
+so the peer was told no on the owner's behalf without the owner hearing about it. Driving
+Codex through `app-server` turns that into a JSON-RPC request we answer, so a human decides
+on this runtime as well. (A turn survives a five-minute hold, so a real round trip fits.)
+
+Two honest differences from the Claude path:
+
+- **Granularity.** Claude asks about every tool call. Codex's sandbox serves reads inside the
+  shared folder silently and asks only about what it cannot serve — closer to a standing
+  grant on the folder, which is defensible since that folder is what the owner shared, but it
+  is not the same promise.
+- **Only quote-free commands are offered.** Codex composes its own shell string and re-quotes
+  whatever the prompt gave it, so a declared command needing embedded quotes cannot be matched
+  reliably in either direction. Those are skipped with a startup line saying so; wrap them in
+  a script file and declare the script path. `npm test`, `pytest -q`, `git status` — the
+  ordinary cases — work unchanged.
+
+The same invariant holds on both runtimes: **a command matching nothing the owner declared is
+refused without a prompt**, so an arbitrary shell string never reaches the owner as a yes/no.
+That is not theoretical — on the first live run, Codex's own memory plugin tried to
+`mkdir … && printf …` into a directory outside the workspace, and the gate refused it silently.
 
 ## Two things that leave the machine, and what stops them
 
