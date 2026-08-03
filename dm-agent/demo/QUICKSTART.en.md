@@ -120,9 +120,9 @@ LOG_LEVEL=debug
 EOF
 ```
 
-> **Fake values only.** The agent is told never to reveal credentials and does refuse — but
-> **the reply is itself an exfiltration channel** and outbound sanitising is not built yet.
-> That guarantee comes from the model today, not from a mechanism. Never demo with real keys.
+> **Fake values only.** Outbound redaction does exist now: a value assigned in an env file
+> here is replaced before the reply leaves the machine. But it matches exactly, so a value
+> the model rewrites — spelled out, base64'd — passes through. Never demo with real keys.
 
 To share your own folder, swap `~/aicoo-demo` in the command below.
 

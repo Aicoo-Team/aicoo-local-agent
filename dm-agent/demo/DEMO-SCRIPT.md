@@ -53,10 +53,11 @@ Use a **real** misconfiguration you actually hit. A staged one reads as staged.
 
 ### ⚠️ Use a demo `.env` with fake values
 
-The agent is instructed never to reveal credentials, and it does refuse — but that guarantee
-today comes from the model, not from a mechanism. **The reply is itself an exfiltration
-channel**, and outbound sanitising is not built yet. Record with fake values. This is also
-the honest answer if someone asks how far the guarantee goes.
+The agent is instructed never to reveal credentials and does refuse, and there is now a
+mechanism under it: values assigned in env files inside the shared folders are replaced
+before the reply leaves. But the match is exact, so **a value the model rewrites — spelled
+out, base64'd — still gets through**. Record with fake values. That distinction is also the
+honest answer if someone asks how far the guarantee goes.
 
 ### Runner-up, if you want a second take
 

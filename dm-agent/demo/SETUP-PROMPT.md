@@ -1,5 +1,9 @@
 # 一段话装好本地 agent
 
+> 真正该用的版本在产品里:**Integrations → Connect your agent → Local agent**,
+> 那里会当场发一把 key 并直接写进提示词。这一页是同一段提示词、key 留空的版本,
+> 用来阅读和改措辞。
+
 不想一步步敲?把下面整段**粘给你自己的 Claude Code 或 Codex**,它会替你做完前四步,
 然后把最后一条命令交还给你,让你在自己的终端里跑。
 
@@ -18,33 +22,32 @@
 
 2. 检查 `claude --version`。没装就 `npm i -g @anthropic-ai/claude-code@latest`。
    然后跑 `claude -p "reply with exactly OK"` 验证登录状态。
-   如果它报 OAuth 相关错误,不要自己反复重试——把 `claude /login` 这条命令原样给我,
-   让我自己在终端跑。先帮我判断需不需要代理:跑
+   如果它报 OAuth 相关错误,不要自己反复重试。先帮我判断需不需要代理:跑
    `curl -s -o /dev/null -w "%{http_code}\n" https://api.anthropic.com/v1/messages`,
-   如果是 403,说明网络层被拦,那么登录和第 6 步启动**都**要带
+   如果是 403,说明网络层被拦,那么登录和第 5 步启动**都**要带
    `HTTPS_PROXY=http://127.0.0.1:<我的代理端口> HTTP_PROXY=同上`。只在登录时加不够。
+   然后把 `claude /login` 这条命令原样给我,让我自己在终端跑。
 
-3. `npm i -g @aicoo/dm-agent`,然后 `which aicoo-dm-agent` 确认命令在 PATH 上。
+3. `npm i -g @aicoo/dm-agent@latest`,然后问我要 Aicoo API key
+   (我去 https://www.aicoo.io → Settings → API Keys 拿),
+   用 `AICOO_TOKEN=<我的key> aicoo-dm-agent whoami` 确认命令和 key 都没问题。
 
 4. 建演示目录和一份**假的** .env(值必须是假的,绝对不要用我真实的密钥):
    mkdir -p ~/aicoo-demo,写入 NODE_ENV / BASE_URL / DATABASE_URL /
    SERVICE_API_TOKEN / REDIS_URL / LOG_LEVEL 六个变量,值随便编。
 
-5. 问我要 Aicoo API key(我去 https://www.aicoo.io → Settings → API Keys 拿),
-   然后用它跑 `AICOO_TOKEN=<key> aicoo-dm-agent whoami` 确认身份正确。
+5. 最后**不要**替我启动 agent,也不要用 nohup 或 & 放后台。把下面这条命令
+   填好用户名后交给我,让我自己在一个能看见的终端里跑,并解释清楚:
+   审批提示会出现在那个终端,我要按 y 才会放行;关掉终端 agent 就下线。
 
-6. 最后**不要**替我启动 agent。把下面这条命令填好用户名后交给我,
-   让我自己在一个能看见的终端里跑,并解释清楚:审批提示会出现在那个终端,
-   我要按 y 才会放行;关掉终端 agent 就下线;不要用 nohup 或 & 放后台。
-
-   AICOO_TOKEN=<key> aicoo-dm-agent start --peer <对方的Aicoo用户名> --workspace ~/aicoo-demo
+   AICOO_TOKEN=<我的key> aicoo-dm-agent start --peer <对方的Aicoo用户名> --workspace ~/aicoo-demo
 ```
 
 ---
 
 ## 跑完之后
 
-你自己在终端里跑第 6 步那条命令,看到 `agent online as @你的用户名` 就通了。
+你自己在终端里跑第 5 步那条命令,看到 `agent online as @你的用户名` 就通了。
 
 然后让对方在 https://www.aicoo.io 给你发:
 
@@ -58,5 +61,12 @@
 
 ## 一个诚实提醒
 
-那条"不吐值"的保证目前来自模型,不是机制:回复本身就是一条外泄通道,出站消毒还没做。
+"不吐值"现在有机制托底了,但要知道它的边界在哪。回复离开这台机器之前,`redact.js`
+会把共享目录里 env 形态文件中赋的值收集起来——变量名看着敏感的(`*TOKEN`、`*KEY`、
+`*SECRET` 等),或者值本身是带账号密码的 URL——再加上你自己的 Aicoo key,
+然后把回复里任何**原样出现**的地方换成 `[redacted: value from .env]`。
+所以逐字引用会被拦住,无论它是从哪条路进来的,包括声明命令打出来的堆栈。
+
+拦不住的是模型**改写过**的值:拼出来、base64、一个字符一个字符地描述。
+精确匹配对这些没有办法,回复本身仍然是一条通道。
 **演示和试用一律用假值的 `.env`,别拿真密钥试。**
