@@ -101,7 +101,7 @@ class CodexAppServerTurn implements CodexTurn {
   async #run(): Promise<void> {
     try {
       await this.#request("initialize", {
-        clientInfo: { name: "aicoo-local-agent", version: "0.3.0", title: "Aicoo Local Agent" },
+        clientInfo: { name: "aicoo-local-agent", version: "0.3.1", title: "Aicoo Local Agent" },
       });
       this.#notify("initialized", {});
 
