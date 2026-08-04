@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
@@ -723,7 +723,11 @@ function loadSavedToken(spoolFile?: string): string | undefined {
 function saveSavedCredentials(credentials: { token: string; userId?: string; deviceId?: string }, spoolFile?: string): void {
   const file = getCredentialsFile(spoolFile);
   ensureParentDirectory(file);
-  writeFileSync(file, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2));
+  const temporaryFile = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporaryFile, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2), {
+    mode: 0o600,
+  });
+  renameSync(temporaryFile, file);
 }
 
 function isHostedUrl(serverUrl: string): boolean {
@@ -751,6 +755,7 @@ function makeClient(options: { hosted?: boolean; server?: string; deviceId?: str
       baseUrl: server,
       token: validToken,
       deviceId: options.deviceId,
+      loadToken: () => loadSavedToken(spoolFile),
       onTokenRefreshed: (newToken) => {
         saveSavedCredentials({ token: newToken, deviceId: options.deviceId }, spoolFile);
       },
