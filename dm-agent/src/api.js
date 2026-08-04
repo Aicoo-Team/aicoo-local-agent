@@ -39,12 +39,28 @@ export class AicooApi {
       }
       if (!response.ok) {
         const code = data && typeof data === "object" && data.error ? data.error : `http_${response.status}`;
-        const err = new Error(`${method} ${path} failed: ${code} ${typeof data === "object" ? JSON.stringify(data).slice(0, 300) : String(data).slice(0, 300)}`);
+        // An HTML body from a JSON API means the route is not there — Next served its 404 page.
+        // Pasting a screenful of markup helps nobody; naming what it actually means does.
+        const isHtml = typeof data === "string" && /^\s*<(!doctype|html)/i.test(data);
+        const detail = isHtml
+          ? `this endpoint does not exist on ${this.baseUrl} (the server may be running an older deploy)`
+          : typeof data === "object" ? JSON.stringify(data).slice(0, 300) : String(data).slice(0, 300);
+        const err = new Error(`${method} ${path} failed: ${code} — ${detail}`);
+      err.path = path;
         err.status = response.status;
         err.code = code;
         throw err;
       }
       return data;
+    } catch (error) {
+      // AbortError's own message says only "This operation was aborted", which reads as a bug
+      // in the agent rather than a slow backend. Say which call, and how long we waited.
+      if (error?.name === "AbortError") {
+        const err = new Error(`${method} ${path} timed out after ${this.timeoutMs / 1000}s — raise it with --api-timeout <seconds> if the server is just slow`);
+        err.code = "timeout";
+        throw err;
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
@@ -77,6 +93,25 @@ export class AicooApi {
       method: "POST",
       body: { to, message, intent: "inform" },
       idempotencyKey,
+    });
+  }
+
+  /**
+   * Questions waiting on share links this account pointed at this machine.
+   * Returns { links, messages } — messages include our own past replies so the agent can tell
+   * where it left off rather than treating every restart as a backlog.
+   */
+  async guestMessages(since = 0) {
+    const params = new URLSearchParams({ since: String(since) });
+    const res = await this.request(`/api/v1/local-agent/guest-messages?${params}`);
+    return { links: res.links ?? [], messages: res.messages ?? [] };
+  }
+
+  /** Post an answer back into a guest conversation, where the visitor's own UI picks it up. */
+  async replyToGuest(sessionId, content) {
+    return this.request("/api/v1/local-agent/guest-messages/reply", {
+      method: "POST",
+      body: { sessionId, content },
     });
   }
 

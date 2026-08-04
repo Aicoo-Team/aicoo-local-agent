@@ -211,7 +211,10 @@ async function main() {
   }
 
   if (!token) throw new Error("AICOO_TOKEN env var is required");
-  const api = new AicooApi({ baseUrl: server, token, log });
+  // A cold serverless database behind the API can take well over the default 15s, and the
+  // abort message ("This operation was aborted") reads like a bug in the agent rather than a
+  // slow round trip. Configurable, so the answer to a slow backend is not "give up".
+  const api = new AicooApi({ baseUrl: server, token, log, timeoutMs: Number(args["api-timeout"] ?? 15) * 1000 });
 
   if (command === "whoami") {
     const me = await api.identity();
@@ -267,25 +270,31 @@ async function main() {
   }
 
   // ── start: the main loop ──
-  const peer = args.peer;
-  if (!peer) throw new Error("--peer is required");
   const workspace = args.workspace ?? process.cwd();
   const pollMs = Number(args.poll ?? 3000);
+  // The policy has to be read before --peer is validated: a share-link policy answers whoever
+  // holds a link, so there is no named peer to require.
+  const earlyPolicy = loadPolicy(args.policy ?? join(stateDirFor({ server, me: "unknown", peer: args.peer ?? "guest", override: args["state-dir"] }), "policy.json"), workspace);
+  const peer = args.peer ?? (earlyPolicy.isGuest ? "guest" : undefined);
+  if (!peer) throw new Error("--peer is required (or set \"trust\": \"guest\" in the policy to answer share links)");
 
   const me = await api.identity();
-  log(`agent online as @${me.username} (${me.userId}), peer=${peer}, workspace=${workspace}`);
+  log(`agent online as @${me.username} (${me.userId}), ${earlyPolicy.isGuest ? "answering share links" : `peer=${peer}`}, workspace=${workspace}`);
 
   // An agent that is online but unreachable looks identical to one that is working, right up
   // until the person you are demoing to types and nothing happens. Say it at startup instead.
-  try {
-    const contacts = await api.contacts();
-    const bare = String(peer).replace(/^@/, "").toLowerCase();
-    if (!contacts.some((c) => c.username?.toLowerCase() === bare)) {
-      log(`WARNING: @${peer} is not a contact yet, so they cannot open your agent in Aicoo.`);
-      log(`         Run: aicoo-dm-agent connect --peer ${peer}   (then they accept it in the app)`);
+  // A share link needs no contact — that is the whole point of one.
+  if (!earlyPolicy.isGuest) {
+    try {
+      const contacts = await api.contacts();
+      const bare = String(peer).replace(/^@/, "").toLowerCase();
+      if (!contacts.some((c) => c.username?.toLowerCase() === bare)) {
+        log(`WARNING: @${peer} is not a contact yet, so they cannot open your agent in Aicoo.`);
+        log(`         Run: aicoo-dm-agent connect --peer ${peer}   (then they accept it in the app)`);
+      }
+    } catch (error) {
+      log(`[network] could not check whether @${peer} is a contact: ${error.message}`);
     }
-  } catch (error) {
-    log(`[network] could not check whether @${peer} is a contact: ${error.message}`);
   }
 
   const stateDir = stateDirFor({ server, me: me.username, peer, override: args["state-dir"] });
@@ -361,15 +370,41 @@ async function main() {
   // our reply is what tells the two apart.
   const dmOnly = Boolean(args["dm-only"]);
   const watchAgentThread = !dmOnly;
-  log(dmOnly
-    ? `watching direct DMs only (--dm-only) — note replies still land in the agent thread`
-    : `watching the agent thread and direct DMs; replies land in the agent thread, tagged 🖥️`);
+  if (!policy.isGuest) {
+    log(dmOnly
+      ? `watching direct DMs only (--dm-only) — note replies still land in the agent thread`
+      : `watching the agent thread and direct DMs; replies land in the agent thread, tagged 🖥️`);
+  }
 
   /**
    * One inbound message, end to end: run a turn, redact, send, advance the cursor.
    * Throws on failure so the caller can count attempts — the retry policy is a property of
    * the loop, not of this step.
    */
+  /**
+   * Run one turn and produce exactly the text that will leave the machine.
+   *
+   * Shared by the DM path and the share-link path so the egress filter cannot end up applied
+   * on one and forgotten on the other — a redactor that covers most of the exits is not a
+   * redactor. Redaction happens before the log line too: the owner's preview should be what
+   * was actually sent, and a redirected stdout should not become the one place a withheld
+   * value lands on disk.
+   */
+  async function composeReply(inbound, id) {
+    const reply = responder === "echo"
+      ? `[transport-test echo] received #${id}: "${inbound.text.slice(0, 200)}"`
+      : responder === "codex"
+        ? await codex.runTurn(inbound)
+        : await agent.runTurn(inbound);
+
+    const { text: safe, redacted } = redact(reply, collectSecrets(policy.folders, { extra: ownSecrets }));
+    log(`reply for #${id}: ${safe.slice(0, 120).replace(/\s+/g, " ")}`);
+    if (redacted.length) {
+      log(`[redact] withheld ${redacted.length} value(s) from the reply (${redacted.map((r) => r.source).join(", ")})`);
+    }
+    return safe;
+  }
+
   async function handleMessage(message, conv) {
     const preview = String(message.content).slice(0, 120).replace(/\s+/g, " ");
     // Spell out that the sender is a person: the bare conversation type reads as "an agent
@@ -382,20 +417,7 @@ async function main() {
       conversationId: conv.conversationId,
       createdAt: message.createdAt,
     };
-    const reply = responder === "echo"
-      ? `[transport-test echo] received #${message.id}: "${String(message.content).slice(0, 200)}"`
-      : responder === "codex"
-        ? await codex.runTurn(inbound)
-        : await agent.runTurn(inbound);
-
-    // Redact before logging, not after: the preview the owner sees should be what was
-    // actually sent, and a redirected stdout should not become the one place a withheld
-    // value does land on disk.
-    const { text: safe, redacted } = redact(reply, collectSecrets(policy.folders, { extra: ownSecrets }));
-    log(`reply for #${message.id}: ${safe.slice(0, 120).replace(/\s+/g, " ")}`);
-    if (redacted.length) {
-      log(`[redact] withheld ${redacted.length} value(s) from the reply (${redacted.map((r) => r.source).join(", ")})`);
-    }
+    const safe = await composeReply(inbound, message.id);
 
     // The peer's thread also receives answers from Aicoo's cloud agent, which replies to the
     // same message within seconds and cannot see this machine. Tag ours so the two are never
@@ -414,6 +436,66 @@ async function main() {
   let runtimeHintShown = false;
   process.on("SIGINT", () => { stopping = true; log("stopping…"); });
   process.on("SIGTERM", () => { stopping = true; });
+
+  // ── Share-link mode ──
+  // A guest policy means this machine is answering visitors on a link rather than one named
+  // person, so it polls the guest queue instead of conversations. Same turn, same gate, same
+  // egress filter; only the transport differs.
+  if (policy.isGuest) {
+    log(`share-link mode: answering visitors on links you pointed at this machine`);
+    let announced = false;
+    while (!stopping) {
+      try {
+        const cursor = state.cursor("guest") ?? 0;
+        const { links, messages } = await api.guestMessages(cursor);
+        if (!announced) {
+          announced = true;
+          log(links.length
+            ? `links routed here: ${links.map((l) => l.label ?? l.shareToken).join(", ")}`
+            : `no links point here yet — create one in Aicoo and set it to answer from this machine`);
+        }
+        // Only questions. Assistant rows are our own past replies, returned so a restart can
+        // advance past them rather than treating the whole history as a backlog.
+        const fresh = messages
+          .filter((m) => m.role === "user")
+          .sort((a, b) => Number(a.id) - Number(b.id));
+        const maxId = messages.length ? Math.max(...messages.map((m) => Number(m.id))) : cursor;
+
+        for (const message of fresh) {
+          try {
+            const who = message.linkLabel ? `"${message.linkLabel}" link` : "a share link";
+            log(`inbound guest #${message.id} (via ${who}): ${String(message.content).slice(0, 100).replace(/\s+/g, " ")}`);
+            const safe = await composeReply({
+              text: String(message.content),
+              from: `a visitor via your ${who}`,
+              conversationId: message.sessionId,
+              createdAt: message.createdAt,
+            }, message.id);
+            await api.withRetry(() => api.replyToGuest(message.sessionId, safe));
+            state.setCursor("guest", Number(message.id));
+            state.clearFailures(message.id);
+            log(`reply sent for guest #${message.id}`);
+          } catch (error) {
+            const attempts = state.recordFailure(message.id);
+            if (attempts < MAX_MESSAGE_ATTEMPTS) break; // leave the cursor; try again
+            log(`giving up on guest #${message.id}; moving past it`);
+            await api.withRetry(() => api.replyToGuest(
+              message.sessionId,
+              "I could not answer that one — the agent on this machine kept failing. Try again, or ask the owner directly.",
+            )).catch(() => {});
+            state.setCursor("guest", Number(message.id));
+            state.clearFailures(message.id);
+          }
+        }
+        // Nothing to answer: still move past our own replies so they are not re-fetched.
+        if (!fresh.length && maxId > cursor) state.setCursor("guest", maxId);
+      } catch (error) {
+        log(`[poll] ${String(error.message ?? error)}`);
+      }
+      await delay(pollMs);
+    }
+    return;
+  }
 
   while (!stopping) {
     try {
