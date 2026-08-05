@@ -121,7 +121,7 @@ EOF
 
 ---
 
-## 第 5 步 · 启动(要用能看见的终端)
+## 第 5 步 · 启动
 
 把 `对方用户名` 换成要跟你协作的人的 Aicoo username:
 
@@ -137,8 +137,11 @@ HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 aicoo-dm-agen
 
 看到 `agent online as @你的用户名` 就是通了。
 
-> **别用 `nohup` 或 `&` 放后台** —— 审批提示要出现在这个终端里,你才能按 y。
-> 关掉终端 = agent 下线。
+> **放后台是可以的** —— 每个审批同时进这个终端和一个文件,哪边先答都算。
+> 用 `nohup … &` 的话记得带 `--state-dir <目录>`,然后用
+> `aicoo-dm-agent approve <id> --allow --state-dir <目录>` 答复;
+> `aicoo-dm-agent pending --state-dir <目录>` 列出待批的,日志在 `<目录>/agent.log`。
+> 前台跑的话,关掉终端还是 = agent 下线。
 
 ---
 
