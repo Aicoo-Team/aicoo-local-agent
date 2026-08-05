@@ -5,12 +5,13 @@
 > page is the same prompt with the key left blank, for reading and for editing the wording.
 
 Don't want to type each step? Paste the block below **into your own Claude Code or Codex**.
-It does the first steps for you and then hands the last command back, for you to run in
-your own terminal.
+It sets everything up, starts the agent, and then watches it for you.
 
-> **Why the last step has to be yours**: the approval prompt `allow? [y/N]` appears in
-> whichever terminal started the agent. If an assistant starts it in the background, nobody
-> can see the prompt and nobody can answer it — which disables the entire feature.
+> **Why it can watch instead of you**: an approval used to appear only in the terminal that
+> started the agent, so backgrounding it left nobody able to answer. Since 0.4.3 every
+> question is also written to a file, and either channel can answer it. So the agent that set
+> this up can put each decision in front of you wherever you already are — and you never have
+> to keep a terminal in view.
 
 ---
 
@@ -46,14 +47,30 @@ do not skip ahead:
    If a request was sent, tell me they must accept it at https://www.aicoo.io first.
 
 5. Ask me which folder on this machine they should be able to ask about. Do NOT create one
-   and do NOT guess — it should already have something worth asking about. Then hand me
-   this command to run in a terminal I can see; do not run it yourself and do not background
-   it with nohup or &. Explain that the approval prompt appears in that terminal and I press
-   y to allow each read, and that closing the terminal takes the agent offline.
+   and do NOT guess — it should already have something worth asking about. Then start it in
+   the background; it keeps its own log, so there is no window for me to keep in view:
 
-   AICOO_TOKEN=<my key> aicoo-dm-agent start --peer <their Aicoo username> --workspace <the folder I name>
+   AICOO_TOKEN=<my key> nohup aicoo-dm-agent start --peer <their Aicoo username> --workspace <the folder I name> --state-dir ~/.aicoo-dm-agent/<their Aicoo username> --approve-timeout 900 > /dev/null 2>&1 &
 
-6. Finally, tell me what to send them: they open MY AGENT in Aicoo — not a plain DM — and
+   Read the end of ~/.aicoo-dm-agent/<their Aicoo username>/agent.log and tell me whether it
+   reached `api.anthropic.com reachable` and `agent online`. If it refused to start, the log
+   says exactly why — tell me what it says, do not work around it. To stop it later I run
+   `kill <pid>`; the pid is in agent.lock next to the log.
+
+6. Then WATCH THAT LOG FOR ME. This is the point of the setup — I should never have to go
+   and read a log myself:
+
+   tail -n 0 -F ~/.aicoo-dm-agent/<their Aicoo username>/agent.log | grep -E --line-buffered "inbound #|inbound guest #|\[approval\] PENDING|^ +path: |^ +asked by: |reply sent|giving up|FATAL:"
+
+   - When a question comes in, tell me what they asked.
+   - When an approval appears, show me the tool, the exact path or command, and whether the
+     line says OUTSIDE my shared folders. Then stop and wait for me.
+   - When I answer, run `aicoo-dm-agent approve <id> --allow` (or `--deny`)
+     `--state-dir ~/.aicoo-dm-agent/<their Aicoo username>`.
+   - NEVER decide one for me and never assume what I would say. If I do not answer it denies
+     itself after fifteen minutes — that is the safe outcome, and a guess is not.
+
+7. Finally, tell me what to send them: they open MY AGENT in Aicoo — not a plain DM — and
    ask about that folder. Replies can only be written to the agent thread, so a plain DM
    leaves them watching silence. My cloud agent answers there too; the reply from this
    machine is the one tagged 🖥️.

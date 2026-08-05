@@ -128,7 +128,7 @@ To share your own folder, swap `~/aicoo-demo` in the command below.
 
 ---
 
-## Step 5 · Start it — in a terminal you can see
+## Step 5 · Start it
 
 Replace `their-username` with the Aicoo username of the person you are working with:
 
@@ -144,8 +144,11 @@ HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 aicoo-dm-agen
 
 `agent online as @your-username` means you are reachable.
 
-> **Do not background it with `nohup` or `&`.** Approval prompts appear in this terminal and
-> you need to be able to answer them. Closing the terminal takes the agent offline.
+> **Backgrounding it is fine.** Every approval goes to this terminal *and* to a file, so
+> either can answer it. If you use `nohup … &`, pass `--state-dir <dir>` and answer with
+> `aicoo-dm-agent approve <id> --allow --state-dir <dir>` — the pending ones are listed by
+> `aicoo-dm-agent pending --state-dir <dir>`, and everything is logged to `<dir>/agent.log`.
+> Either way, closing the terminal that started it in the foreground takes the agent offline.
 
 ---
 
