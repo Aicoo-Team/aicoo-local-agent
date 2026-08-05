@@ -442,17 +442,18 @@ describe("CodeAdapter just-in-time tool approval", () => {
     expect(g.asked).toHaveLength(1);
   });
 
-  it("does not re-prompt for the same call twice in one turn", async () => {
+  it("does not widen Allow once into a local turn-wide permission", async () => {
     const g = gateway("allow");
     const options = await startedAdapter(g);
 
     await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
     await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
-    expect(g.asked).toHaveLength(1);
-
-    // A different file is a different decision and must ask again.
-    await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
     expect(g.asked).toHaveLength(2);
+
+    // Pulse decides whether either request can auto-resolve from a collaboration-scoped
+    // allowance. The bridge must not silently broaden a one-time decision by itself.
+    await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
+    expect(g.asked).toHaveLength(3);
   });
 
   it("asks the owner even before any policy file exists", async () => {

@@ -207,20 +207,44 @@ export function upsertRelationshipPreset(input: {
     throw new Error(`--folder is required for ${input.preset}`);
   }
 
+  return upsertRelationshipPolicy({
+    file: input.file,
+    principalId: input.principalId,
+    deviceId: input.deviceId,
+    tools: [...PRESET_TOOLS[input.preset]],
+    folders: folder ? [folder] : [],
+  });
+}
+
+/** Persist the server's exact folder boundary and per-tool policy without expanding presets. */
+export function upsertRelationshipPolicy(input: {
+  file: string;
+  principalId: string;
+  deviceId: string;
+  tools: readonly string[];
+  folders: readonly string[];
+}): RelationshipPolicyDocument {
+  const unsupported = input.tools.find((tool) => !POLICY_SUPPORTED_TOOL_SET.has(tool));
+  if (unsupported) throw new Error(`Unsupported relationship tool ${unsupported}`);
+
   const existing = readPolicyDocument(input.file);
-  const canonicalFolder = folder ? canonicalPath(folder) : undefined;
-  if (
-    canonicalFolder
-    && canonicalFolder !== normalizeCase(parse(canonicalFolder).root)
-    && isWithin(canonicalFolder, canonicalPath(input.file))
-  ) {
-    throw new Error("Relationship policy must be stored outside the granted folder");
+  const canonicalFolders = [...new Set(input.folders
+    .map((folder) => folder.trim())
+    .filter(Boolean)
+    .map(canonicalPath))];
+  for (const canonicalFolder of canonicalFolders) {
+    if (
+      canonicalFolder !== normalizeCase(parse(canonicalFolder).root)
+      && isWithin(canonicalFolder, canonicalPath(input.file))
+    ) {
+      throw new Error("Relationship policy must be stored outside the granted folder");
+    }
   }
   const nextRelationship: RelationshipPolicyDocument["relationships"][number] = {
     principalId: input.principalId,
     deviceId: input.deviceId,
-    tools: [...PRESET_TOOLS[input.preset]],
-    folders: canonicalFolder ? [canonicalFolder] : [],
+    tools: [...new Set(input.tools)].sort(),
+    folders: canonicalFolders.sort(),
   };
   const relationships = existing.relationships.filter((relationship) =>
     relationship.principalId !== input.principalId || relationship.deviceId !== input.deviceId);
