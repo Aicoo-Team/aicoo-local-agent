@@ -31,13 +31,38 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(options.settingSources).toEqual([]);
     expect(options.mcpServers).toEqual({});
     expect(options.strictMcpConfig).toBe(true);
-    expect(options.permissionMode).toBe("dontAsk");
+    // "dontAsk" would resolve every permission internally — auto-allowing reads inside cwd
+    // and auto-denying the rest — without ever consulting the hook or canUseTool.
+    expect(options.permissionMode).toBe("default");
     expect(options.extraArgs).toMatchObject({ "safe-mode": null, "replay-user-messages": null });
     expect(await options.canUseTool?.("Bash", { command: "touch /tmp/aicoo-pwned" }, {
       signal: new AbortController().signal,
       toolUseID: "malicious-tool-call",
       requestId: "permission-request",
     })).toMatchObject({ behavior: "deny", interrupt: false });
+
+    // The PreToolUse hook is the only gate the runtime always consults: built-in rules
+    // auto-allow in-cwd reads, so a policy check reachable only via canUseTool is unreachable
+    // for exactly the calls a peer is most likely to make.
+    const preToolUseHook = options.hooks?.PreToolUse?.[0]?.hooks?.[0];
+    expect(preToolUseHook).toBeTypeOf("function");
+    const hookDecision = await preToolUseHook!(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "touch /tmp/aicoo-pwned" },
+        tool_use_id: "malicious-tool-call",
+        session_id: "s",
+        transcript_path: "",
+        cwd: options.cwd ?? "",
+        permission_mode: "default",
+      } as never,
+      "malicious-tool-call",
+      { signal: new AbortController().signal },
+    );
+    expect(hookDecision).toMatchObject({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
+    });
 
     const events = collectEvents(adapter, "claude-managed-1", 2);
     const result = await adapter.deliverToSession("claude-managed-1", inbound("msg_initial"), "new_turn");
@@ -321,3 +346,140 @@ function inbound(
     ...overrides,
   };
 }
+
+describe("CodeAdapter just-in-time tool approval", () => {
+  const cleanups: Array<() => Promise<void> | void> = [];
+  afterEach(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  });
+
+  function permissionContext() {
+    return { signal: new AbortController().signal, toolUseID: "t1", requestId: "r1" };
+  }
+
+  /** Records what the owner would have been shown, and answers with `decision`. */
+  function gateway(decision: "allow" | "deny") {
+    const asked: Array<{ toolName: string; toolInputSummary: string; communicationSessionId: string }> = [];
+    return {
+      asked,
+      async requestToolApproval(input: {
+        toolName: string;
+        toolInputSummary: string;
+        communicationSessionId: string;
+      }) {
+        asked.push(input);
+        return { approvalId: `appr_${asked.length}`, status: decision, decision };
+      },
+      async getToolApproval() {
+        return { status: decision, decision } as { status: string; decision: "allow" | "deny" | null };
+      },
+    };
+  }
+
+  /** A relationship with no tools: policy denies everything, so every call reaches the gateway. */
+  function chatOnlyPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-appr-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{ principalId: "prn_a", deviceId: "device-a1", tools: [], folders: [] }],
+    }));
+    return policyFile;
+  }
+
+  /** The state a brand-new user is in: nobody has written a policy file yet. */
+  function missingPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-nopolicy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    return join(directory, "relationships.json");
+  }
+
+  async function startedAdapter(approvalGateway?: ReturnType<typeof gateway>, policyFile?: string) {
+    const driver = new FakeClaudeAgentDriver();
+    // canUseTool fires mid-turn; hold the turn open so the active message (and its
+    // communicationSessionId) is still there, as it is in a real session.
+    driver.resultDelayMs = 5_000;
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: process.cwd(),
+      relationshipPolicyFile: policyFile ?? chatOnlyPolicyFile(),
+      driver,
+      turnAckTimeoutMs: 500,
+      ...(approvalGateway ? { approvalGateway } : {}),
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    await adapter.deliverToSession("claude-managed-1", inbound("msg_appr"), "new_turn");
+    return driver.starts[0]!.options;
+  }
+
+  it("still denies outright when no approval gateway is wired", async () => {
+    // Regression guard: the ask-the-owner path must be additive, never a new way to say yes.
+    const options = await startedAdapter();
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
+      .toMatchObject({ behavior: "deny" });
+  });
+
+  it("asks the owner when policy does not cover the call, and allows on approval", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g);
+
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/secret.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "allow" });
+    // The owner sees one line, so it has to name the file — "Read" alone is not decidable.
+    expect(g.asked).toHaveLength(1);
+    expect(g.asked[0]!.toolInputSummary).toBe("Read /srv/secret.ts");
+    expect(g.asked[0]!.communicationSessionId).toBe("comm_1");
+  });
+
+  it("denies when the owner declines", async () => {
+    const g = gateway("deny");
+    const options = await startedAdapter(g);
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/secret.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "deny", interrupt: false });
+    // Must be a deny the owner chose, not the old deny-before-asking path.
+    expect(g.asked).toHaveLength(1);
+  });
+
+  it("does not re-prompt for the same call twice in one turn", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g);
+
+    await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
+    await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
+    expect(g.asked).toHaveLength(1);
+
+    // A different file is a different decision and must ask again.
+    await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
+    expect(g.asked).toHaveLength(2);
+  });
+
+  it("asks the owner even before any policy file exists", async () => {
+    // The state every new install is in. If a missing file threw instead of yielding an empty
+    // policy, the catch below would deny before reaching the gateway and nobody would ever be
+    // asked — the feature would be dead for exactly the users who need it most.
+    const g = gateway("allow");
+    const options = await startedAdapter(g, missingPolicyFile());
+
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "allow" });
+    expect(g.asked).toHaveLength(1);
+  });
+
+  it("denies without asking when the policy file is present but corrupt", async () => {
+    // A broken policy is not an absent one: we cannot tell what the owner authorized, so the
+    // fail-closed path must win and the owner must not be prompted to rubber-stamp it.
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-badpolicy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, "{ not json");
+
+    const g = gateway("allow");
+    const options = await startedAdapter(g, policyFile);
+
+    expect(await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext()))
+      .toMatchObject({ behavior: "deny" });
+    expect(g.asked).toHaveLength(0);
+  });
+});

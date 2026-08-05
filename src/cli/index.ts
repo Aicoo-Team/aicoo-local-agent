@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
@@ -10,6 +10,7 @@ import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
+import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import {
   DEFAULT_RELATIONSHIP_POLICY_FILE,
   upsertRelationshipPreset,
@@ -124,6 +125,7 @@ program.command("bridge")
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
   .option("--no-local-helper", "disable the localhost folder/file picker helper")
@@ -144,6 +146,7 @@ program.command("start")
   .option("--sessions <count>", "managed session count", "2")
   .option("--workspace <dir>", "managed-session workspace", process.cwd())
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
+  .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
@@ -377,7 +380,7 @@ program.command("send-to")
         return;
       }
     }
-    const session = await activeSessionForPeer(targetPrincipalId, options.server);
+    const session = await activeSessionForPeer(targetPrincipalId, options.server, options.spool);
     const receipt = await client.sendMessage({
       communicationSessionId: session.id,
       clientMessageId: options.clientId ?? randomUUID(),
@@ -490,8 +493,12 @@ program.command("audit")
 program.command("doctor")
   .description("check whether this machine is ready for text-only c2c")
   .option("--spool <file>", "bridge spool to inspect")
+  .option("--server <url>", "control-plane URL")
   .action(async (options) => {
-    const client = makeClient();
+    // Resolve the hosted control plane the way login and start do. Inheriting the root --server
+    // default sent doctor at http://127.0.0.1:7790, which only `ccd serve` hosts — so on a machine
+    // running `ccd start` every check failed and the advice was to start what was already running.
+    const client = makeHostedClient(options.server, options.spool);
     const checks: Array<{ name: string; ok: boolean; detail?: unknown; next?: string }> = [];
 
     try {
@@ -505,8 +512,11 @@ program.command("doctor")
       });
     }
 
+    let endpointId: string | undefined;
     try {
-      checks.push({ name: "defaultRoute", ok: true, detail: await client.getDefaultRoute() });
+      const route = await client.getDefaultRoute();
+      endpointId = route.endpointId;
+      checks.push({ name: "defaultRoute", ok: true, detail: route });
     } catch (error) {
       checks.push({
         name: "defaultRoute",
@@ -514,6 +524,31 @@ program.command("doctor")
         detail: errorMessage(error),
         next: "Start the bridge and wait for the '[bridge] default route -> ...' log.",
       });
+    }
+
+    // Every check above is a GET. In the field a machine has reported all of them green while
+    // every write — heartbeat, default-route, message ack — timed out at the cap, which is the
+    // failure that actually stops messages being delivered. So exercise one write too. Heartbeat
+    // is the cheapest and is idempotent, so probing costs a `lastSeenAt` bump and nothing else.
+    if (endpointId) {
+      const startedAt = Date.now();
+      try {
+        await client.heartbeatEndpoint(endpointId);
+        checks.push({
+          name: "controlPlaneWrite",
+          ok: true,
+          detail: { endpointId, method: "POST heartbeat", elapsedMs: Date.now() - startedAt },
+        });
+      } catch (error) {
+        checks.push({
+          name: "controlPlaneWrite",
+          ok: false,
+          detail: { endpointId, method: "POST heartbeat", elapsedMs: Date.now() - startedAt, error: errorMessage(error) },
+          next: "Reads work but writes do not, so this machine cannot ack messages. Compare a direct "
+            + "POST (curl reaches the same route) against this one: if curl is fast, the difference is "
+            + "Node's fetch ignoring your proxy settings — retry with NODE_USE_ENV_PROXY=1 on Node 24+.",
+        });
+      }
     }
 
     if (options.spool) {
@@ -575,6 +610,7 @@ async function startBridge(options: {
   claudePath?: string;
   codexState?: string;
   codexPath?: string;
+  codexAppServer?: boolean;
   localHelper?: boolean;
   localHelperPort?: string;
   localHelperHost?: string;
@@ -585,6 +621,13 @@ async function startBridge(options: {
   json?: boolean;
 }): Promise<void> {
   ensureParentDirectory(options.spool);
+  const deviceId = resolveDeviceId(undefined, options.spool);
+  const transport = makeClient({ hosted: options.hosted, server: options.server, deviceId, spool: options.spool });
+  // Only the hosted transport can reach the approval endpoints; a self-hosted mock cannot, and
+  // wiring it anyway would turn every un-preauthorized tool into a confusing runtime error.
+  const approvalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
+    ? (transport as unknown as ToolApprovalGateway)
+    : undefined;
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
     sessions: Number.parseInt(options.sessions, 10),
@@ -596,16 +639,18 @@ async function startBridge(options: {
     codexStateFile: options.codexState,
     codexPath: options.codexPath,
     relationshipPolicyFile: options.relationshipPolicy ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    ...(approvalGateway ? { approvalGateway } : {}),
+    // Opt-in: drives Codex through app-server so the owner can be asked mid-turn.
+    ...(options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1" ? { codexAppServer: true } : {}),
     model: options.model,
     log: console.log,
   });
   if (selected.runtime === "codex") {
     ensureCodexSkill({ log: options.json ? undefined : console.log });
   }
-  const deviceId = resolveDeviceId(undefined, options.spool);
   const spool = new BridgeSpool(options.spool);
   const bridge = new RuntimeBridge({
-    transport: makeClient({ hosted: options.hosted, server: options.server, deviceId, spool: options.spool }),
+    transport,
     spool,
     adapter: selected.adapter,
     adapterVersion: selected.adapterVersion,
@@ -678,7 +723,11 @@ function loadSavedToken(spoolFile?: string): string | undefined {
 function saveSavedCredentials(credentials: { token: string; userId?: string; deviceId?: string }, spoolFile?: string): void {
   const file = getCredentialsFile(spoolFile);
   ensureParentDirectory(file);
-  writeFileSync(file, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2));
+  const temporaryFile = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporaryFile, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2), {
+    mode: 0o600,
+  });
+  renameSync(temporaryFile, file);
 }
 
 function isHostedUrl(serverUrl: string): boolean {
@@ -706,6 +755,7 @@ function makeClient(options: { hosted?: boolean; server?: string; deviceId?: str
       baseUrl: server,
       token: validToken,
       deviceId: options.deviceId,
+      loadToken: () => loadSavedToken(spoolFile),
       onTokenRefreshed: (newToken) => {
         saveSavedCredentials({ token: newToken, deviceId: options.deviceId }, spoolFile);
       },
@@ -822,8 +872,8 @@ async function acceptConnection(
   return { grant, accessPolicy: { status: "saved", preset: access, policyFile, ...(folder ? { folder } : {}) } };
 }
 
-async function activeSessionForPeer(peerPrincipalId: string, server?: string): Promise<CommunicationSession> {
-  const active = (await makeHostedClient(server).listCommunicationSessions())
+async function activeSessionForPeer(peerPrincipalId: string, server?: string, spool?: string): Promise<CommunicationSession> {
+  const active = (await makeHostedClient(server, spool).listCommunicationSessions())
     .filter((session) =>
       session.status === "active"
       && (session.requester.principalId === peerPrincipalId || session.recipient.principalId === peerPrincipalId))

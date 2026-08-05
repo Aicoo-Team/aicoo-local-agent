@@ -2,6 +2,8 @@ import {
   HttpMessageTransport,
   ApiError,
   normalizeBearerToken,
+  parseResolvedPersonResponse,
+  type AuthenticationRecoveryResult,
   type HttpTransportOptions,
   type PairStatusResponse,
   type ResolvedPersonResponse,
@@ -41,6 +43,7 @@ const LR = "/api/v1/local-realtime";
  * recovered request for the endpoint being declared unreachable, which is strictly worse.
  */
 const DEFAULT_ATTEMPTS = 2;
+const AUTHENTICATION_RECOVERY_GRACE_MS = 1_000;
 
 /**
  * Real Aicoo transport. Implements the same surface as HttpMessageTransport but
@@ -58,8 +61,12 @@ export class AicooTransport extends HttpMessageTransport {
   readonly #fetch: typeof fetch;
   readonly #deviceId: string;
   readonly #onTokenRefreshed?: (token: string) => void;
+  readonly #loadToken?: () => string | undefined;
   #deviceToken?: string;
   #endpoint?: string;
+  #registrationInput?: RegisterEndpointInput;
+  #authenticationRecovery?: Promise<AuthenticationRecoveryResult>;
+  #lastAuthenticationRecovery?: { at: number; result: AuthenticationRecoveryResult };
 
   constructor(options: HttpTransportOptions) {
     super(options);
@@ -69,6 +76,7 @@ export class AicooTransport extends HttpMessageTransport {
     this.#fetch = options.fetchImpl ?? fetch;
     this.#deviceId = options.deviceId?.trim() ?? "";
     this.#onTokenRefreshed = options.onTokenRefreshed;
+    this.#loadToken = options.loadToken;
     startEventLoopMonitor();
   }
 
@@ -112,6 +120,7 @@ export class AicooTransport extends HttpMessageTransport {
     timeoutMs: number,
     attempt: number,
     attempts: number,
+    authToken = this.#authToken(),
   ): Promise<T> {
     const method = options.method ?? "GET";
     const controller = new AbortController();
@@ -134,7 +143,7 @@ export class AicooTransport extends HttpMessageTransport {
       const response = await this.#fetch(`${this.#base}${path}`, {
         method,
         headers: {
-          authorization: `Bearer ${this.#authToken()}`,
+          authorization: `Bearer ${authToken}`,
           ...(options.body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
@@ -179,17 +188,92 @@ export class AicooTransport extends HttpMessageTransport {
     if (!this.#deviceId) {
       throw new ApiError(400, "invalid_request", "deviceId is required (set CCD_DEVICE_ID or --device-id)");
     }
-    const { endpoint, deviceToken } = await this.requestJson<{ endpoint: Endpoint; deviceToken: string }>(
-      `${LA}/endpoints`,
-      { method: "POST", body: { ...input, deviceId: this.#deviceId } },
-    );
+    const { endpoint, deviceToken } = await this.#registerWithToken(input, this.#authToken());
+    this.#registrationInput = { ...input, capabilities: [...input.capabilities] };
+    this.#applyRegistration(endpoint, deviceToken);
+    return endpoint;
+  }
+
+  override async recoverAuthentication(): Promise<AuthenticationRecoveryResult> {
+    if (this.#authenticationRecovery) return this.#authenticationRecovery;
+    if (
+      this.#lastAuthenticationRecovery?.result.recovered
+      && Date.now() - this.#lastAuthenticationRecovery.at < AUTHENTICATION_RECOVERY_GRACE_MS
+    ) {
+      return this.#lastAuthenticationRecovery.result;
+    }
+    this.#authenticationRecovery = this.#recoverAuthentication();
+    try {
+      const result = await this.#authenticationRecovery;
+      this.#lastAuthenticationRecovery = { at: Date.now(), result };
+      return result;
+    } finally {
+      this.#authenticationRecovery = undefined;
+    }
+  }
+
+  async #recoverAuthentication(): Promise<AuthenticationRecoveryResult> {
+    let reloadFailure: string | undefined;
+    try {
+      const persistedToken = this.#loadToken?.();
+      if (persistedToken) {
+        const normalized = normalizeBearerToken(persistedToken);
+        if (normalized !== this.#authToken()) {
+          this.#deviceToken = normalized;
+          return { recovered: true, source: "credentials" };
+        }
+      }
+    } catch (error) {
+      reloadFailure = `could not reload credentials: ${String(error)}`;
+    }
+
+    // An explicit user/API token remains valid when a device token is revoked. If the
+    // process started with only the old device token, wait for another process to persist
+    // its replacement instead of repeatedly rotating the shared identity.
+    if (!this.#registrationInput || this.#userToken === this.#deviceToken) {
+      return {
+        recovered: false,
+        reason: reloadFailure ?? "no newer persisted token or registration credential is available",
+      };
+    }
+    try {
+      const { endpoint, deviceToken } = await this.#registerWithToken(this.#registrationInput, this.#userToken);
+      if (this.#endpoint && endpoint.endpointId !== this.#endpoint) {
+        return {
+          recovered: false,
+          reason: `re-registration changed endpoint from ${this.#endpoint} to ${endpoint.endpointId}`,
+        };
+      }
+      this.#applyRegistration(endpoint, deviceToken);
+      return { recovered: true, source: "registration" };
+    } catch (error) {
+      return { recovered: false, reason: `re-registration failed: ${String(error)}` };
+    }
+  }
+
+  async #registerWithToken(
+    input: RegisterEndpointInput,
+    token: string,
+  ): Promise<{ endpoint: Endpoint; deviceToken: string }> {
+    const path = `${LA}/endpoints`;
+    const options = { method: "POST", body: { ...input, deviceId: this.#deviceId } };
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= DEFAULT_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.#attempt(path, options, this.#timeoutMs, attempt, DEFAULT_ATTEMPTS, token);
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  #applyRegistration(endpoint: Endpoint, deviceToken: string): void {
     this.#deviceToken = normalizeBearerToken(deviceToken);
     this.#endpoint = endpoint.endpointId;
     this.setEndpointId(endpoint.endpointId);
-    if (this.#onTokenRefreshed) {
-      this.#onTokenRefreshed(deviceToken);
-    }
-    return endpoint;
+    this.#onTokenRefreshed?.(deviceToken);
   }
 
   override async heartbeatEndpoint(endpointId: string): Promise<void> {
@@ -358,7 +442,8 @@ export class AicooTransport extends HttpMessageTransport {
   }
 
   override async resolvePerson(query: string): Promise<ResolvedPersonResponse> {
-    return this.requestJson<ResolvedPersonResponse>(`${LA}/resolve-person?q=${encodeURIComponent(query)}`);
+    const response = await this.requestJson<unknown>(`${LA}/resolve-person?q=${encodeURIComponent(query)}`);
+    return parseResolvedPersonResponse(query, response);
   }
 
   override async startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse> {

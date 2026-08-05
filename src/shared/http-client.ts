@@ -43,6 +43,19 @@ export interface ResolvedPersonResponse {
   hasReachableRuntime?: boolean;
 }
 
+export function parseResolvedPersonResponse(query: string, response: unknown): ResolvedPersonResponse {
+  if (!response || typeof response !== "object") {
+    throw new Error(`Aicoo did not return a usable peer identity for ${JSON.stringify(query)}`);
+  }
+
+  const principalId = (response as Record<string, unknown>).principalId;
+  if (typeof principalId !== "string" || !principalId.trim()) {
+    throw new Error(`Aicoo did not return a usable peer identity for ${JSON.stringify(query)}`);
+  }
+
+  return { ...(response as ResolvedPersonResponse), principalId: principalId.trim() };
+}
+
 export interface StartDeviceCodeInput {
   deviceId: string;
   runtime: "claude-code" | "codex";
@@ -78,7 +91,14 @@ export interface HttpTransportOptions {
    *  to (principal, deviceId). Ignored by the standalone HttpMessageTransport. */
   deviceId?: string;
   onTokenRefreshed?: (token: string) => void;
+  /** Reload the latest persisted device credential after another same-device
+   *  process rotates it. Used only by the hosted Aicoo transport. */
+  loadToken?: () => string | undefined;
 }
+
+export type AuthenticationRecoveryResult =
+  | { recovered: true; source: "credentials" | "registration" }
+  | { recovered: false; reason: string };
 
 /**
  * Remove copy/paste artifacts around a bearer token while refusing to silently
@@ -119,6 +139,10 @@ export class HttpMessageTransport implements MessageTransport {
 
   setEndpointId(endpointId: string): void {
     this.#endpointId = endpointId;
+  }
+
+  async recoverAuthentication(): Promise<AuthenticationRecoveryResult> {
+    return { recovered: false, reason: "transport does not support credential recovery" };
   }
 
   async registerEndpoint(input: RegisterEndpointInput): Promise<Endpoint> {
@@ -283,7 +307,8 @@ export class HttpMessageTransport implements MessageTransport {
   }
 
   async resolvePerson(query: string): Promise<ResolvedPersonResponse> {
-    return this.requestJson(`/api/v1/local-agent/resolve-person?q=${encodeURIComponent(query)}`);
+    const response = await this.requestJson<unknown>(`/api/v1/local-agent/resolve-person?q=${encodeURIComponent(query)}`);
+    return parseResolvedPersonResponse(query, response);
   }
 
   async startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse> {

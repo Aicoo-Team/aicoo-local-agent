@@ -40,6 +40,79 @@ describe("bearer token normalization", () => {
 });
 
 describe("hosted Aicoo transport", () => {
+  it("reloads a device token rotated by another process", async () => {
+    let persistedToken = "aicoo_dev_old";
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST" && String(_input).endsWith("/endpoints")) {
+        return Response.json({
+          endpoint: { endpointId: "ep-1", principalId: "user-1", deviceId: "device-1" },
+          deviceToken: "aicoo_dev_old",
+        });
+      }
+      return new Response(null, { status: 204 });
+    });
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_sk_user",
+      deviceId: "device-1",
+      loadToken: () => persistedToken,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    await transport.registerEndpoint({
+      runtime: "codex",
+      bridgeVersion: "test",
+      adapterVersion: "test",
+      capabilities: [],
+    });
+
+    persistedToken = "aicoo_dev_rotated";
+    await expect(transport.recoverAuthentication()).resolves.toEqual({ recovered: true, source: "credentials" });
+    await transport.heartbeatEndpoint("ep-1");
+
+    expect(fetchMock.mock.calls.at(-1)?.[1]?.headers).toMatchObject({
+      authorization: "Bearer aicoo_dev_rotated",
+    });
+  });
+
+  it("re-registers once with the original credential when no newer token was persisted", async () => {
+    let registrationCount = 0;
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      registrationCount += 1;
+      expect(init?.headers).toMatchObject({ authorization: "Bearer aicoo_sk_user" });
+      return Response.json({
+        endpoint: { endpointId: "ep-1", principalId: "user-1", deviceId: "device-1" },
+        deviceToken: registrationCount === 1 ? "aicoo_dev_old" : "aicoo_dev_new",
+      });
+    });
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_sk_user",
+      deviceId: "device-1",
+      loadToken: () => "aicoo_dev_old",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    await transport.registerEndpoint({
+      runtime: "codex",
+      bridgeVersion: "test",
+      adapterVersion: "test",
+      capabilities: [],
+    });
+
+    const [first, second] = await Promise.all([
+      transport.recoverAuthentication(),
+      transport.recoverAuthentication(),
+    ]);
+
+    expect(first).toEqual({ recovered: true, source: "registration" });
+    expect(second).toEqual(first);
+    expect(registrationCount).toBe(2);
+
+    // A heartbeat already in flight may report the old token's 401 just after the
+    // event stream recovered. It must reuse the result, not rotate the token again.
+    await expect(transport.recoverAuthentication()).resolves.toEqual(first);
+    expect(registrationCount).toBe(2);
+  });
+
   it("uses the local-agent identity endpoint for whoami", async () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       Response.json({ principalId: "user-1", deviceId: "device-1" }));

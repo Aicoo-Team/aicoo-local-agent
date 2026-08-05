@@ -58,6 +58,43 @@ describe("C2C Onboarding Client Integration", () => {
     );
   });
 
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["an object without a principal", { handle: "abhinav" }],
+    ["a blank principal", { principalId: "   ", handle: "abhinav" }],
+  ])("rejects %s resolve-person responses with a useful error", async (_label, responseBody) => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => responseBody,
+    });
+    const client = new AicooTransport({
+      baseUrl: "https://www.aicoo.io",
+      token: "test-token",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    await expect(client.resolvePerson("@abhinavjain2107")).rejects.toThrow(
+      'Aicoo did not return a usable peer identity for "@abhinavjain2107"',
+    );
+  });
+
+  it("normalizes whitespace around the resolved principal ID", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ principalId: "  p-999  ", handle: "abhinav" }),
+    });
+    const client = new AicooTransport({
+      baseUrl: "https://www.aicoo.io",
+      token: "test-token",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    await expect(client.resolvePerson("@abhinav")).resolves.toMatchObject({ principalId: "p-999" });
+  });
+
   it("starts and polls device code flow via AicooTransport", async () => {
     const mockFetch = vi
       .fn()

@@ -2,8 +2,10 @@ import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
 import { delimiter, resolve } from "node:path";
 import type { RuntimeKind } from "../shared/contracts.js";
+import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import { ClaudeCodeAdapter } from "./claude-code/claude-code-adapter.js";
 import { CodexAdapter } from "./codex/codex-adapter.js";
+import { CodexAppServerDriver } from "./codex/app-server-driver.js";
 import { FakeRuntimeAdapter } from "./fake/fake-adapter.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
 import { RelationshipPolicy } from "../security/relationship-policy.js";
@@ -22,6 +24,14 @@ export interface RuntimeAdapterSelectionOptions {
   codexPath?: string;
   relationshipPolicyFile?: string;
   model?: string;
+  /** Lets an un-preauthorized tool be put to the owner instead of refused, on either runtime. */
+  approvalGateway?: ToolApprovalGateway;
+  /**
+   * Drive Codex through `app-server` instead of `codex exec`. This is what lets a Codex peer be
+   * asked mid-turn rather than refused outright, but it is a different execution path from the
+   * one that has been in production, so it stays opt-in until it has real mileage.
+   */
+  codexAppServer?: boolean;
   log?: (line: string) => void;
 }
 
@@ -70,8 +80,16 @@ export async function selectRuntimeAdapter(
         options.log?.(`relationship policy could not be loaded; continuing text-only: ${String(error)}`);
       }
     }
+    const useAppServer = options.codexAppServer ?? false;
+    if (useAppServer && !options.approvalGateway) {
+      // Without a gateway the app-server driver refuses every approval, which is strictly worse
+      // than exec: same refusals, extra moving parts. Say so rather than quietly degrading.
+      options.log?.("codex app-server requested without an approval route; every approval will be refused");
+    }
     const adapter = new CodexAdapter({
       stateFile: resolve(options.codexStateFile ?? `${options.spoolFile}.codex.db`),
+      ...(useAppServer ? { driver: new CodexAppServerDriver({ ...(options.log ? { log: options.log } : {}) }) } : {}),
+      ...(useAppServer && options.approvalGateway ? { approvalGateway: options.approvalGateway } : {}),
       cwd: resolve(options.workspace),
       sessionCount: options.sessions,
       codexPath: configuredPath,
@@ -111,6 +129,7 @@ export async function selectRuntimeAdapter(
     sessionCount: options.sessions,
     ...(configuredPath ? { pathToClaudeCodeExecutable: configuredPath } : {}),
     ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
+    ...(options.approvalGateway ? { approvalGateway: options.approvalGateway } : {}),
     ...(options.model ? { model: options.model } : {}),
     log: options.log,
   });
