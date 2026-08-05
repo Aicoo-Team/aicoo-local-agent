@@ -1,6 +1,10 @@
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
 import { FakeRuntimeAdapter } from "../adapters/fake/fake-adapter.js";
-import { upsertRelationshipPreset, type RelationshipAccessPreset } from "../security/relationship-policy.js";
+import {
+  upsertRelationshipPolicy,
+  upsertRelationshipPreset,
+  type RelationshipAccessPreset,
+} from "../security/relationship-policy.js";
 import type { LocalAgentDelegationInput, LocalAgentDelegationResponse, RuntimeEvent } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
@@ -302,19 +306,41 @@ export class RuntimeBridge {
     const deviceId = stringField(data, "requesterDeviceId") ?? stringField(data, "deviceId");
     const preset = stringField(data, "access") ?? stringField(data, "preset");
     const folder = stringField(data, "folderPath") ?? stringField(data, "folder");
-    if (!principalId || !deviceId || !isRelationshipAccessPreset(preset)) {
-      this.options.log?.("relationship policy update ignored: missing principalId, deviceId, or valid access preset");
+    const hasExplicitTools = Object.prototype.hasOwnProperty.call(data, "tools");
+    const explicitTools = Array.isArray(data.tools)
+      && data.tools.every((tool) => typeof tool === "string" && tool.trim())
+      ? data.tools.map((tool) => String(tool).trim())
+      : undefined;
+    if (
+      !principalId
+      || !deviceId
+      || (hasExplicitTools ? explicitTools === undefined : !isRelationshipAccessPreset(preset))
+    ) {
+      this.options.log?.("relationship policy update ignored: missing or invalid principal, device, tools, or preset");
       return;
     }
     try {
-      upsertRelationshipPreset({
-        file: this.options.relationshipPolicyFile,
-        principalId,
-        deviceId,
-        preset,
-        ...(folder ? { folder } : {}),
-      });
-      this.options.log?.(`relationship policy updated for ${principalId} (${preset})`);
+      if (explicitTools) {
+        upsertRelationshipPolicy({
+          file: this.options.relationshipPolicyFile,
+          principalId,
+          deviceId,
+          tools: explicitTools,
+          folders: folder ? [folder] : [],
+        });
+        this.options.log?.(
+          `relationship policy updated for ${principalId} (tools: ${explicitTools.join(", ") || "none"})`,
+        );
+      } else {
+        upsertRelationshipPreset({
+          file: this.options.relationshipPolicyFile,
+          principalId,
+          deviceId,
+          preset: preset as RelationshipAccessPreset,
+          ...(folder ? { folder } : {}),
+        });
+        this.options.log?.(`relationship policy updated for ${principalId} (${preset})`);
+      }
     } catch (error) {
       this.options.log?.(`relationship policy update failed: ${String(error)}`);
     }
@@ -521,16 +547,20 @@ export async function requestRuntimeDelegation(input: {
   correlationId?: string;
   requestedTtlMinutes?: number;
   timeoutMs?: number;
+  requestTimeoutMs?: number;
 }): Promise<LocalAgentDelegationResponse> {
   const expiresAt = new Date(Date.now() + (input.timeoutMs ?? 30 * 60_000)).toISOString();
-  const result = await input.transport.delegateLocalAgentTask({
+  const delegation = {
     target: input.target,
     task: input.task,
     sessionHandle: input.sessionHandle,
     clientMessageId: input.clientMessageId,
     ...(input.correlationId ? { correlationId: input.correlationId } : {}),
     ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
-  });
+  };
+  const result = input.requestTimeoutMs === undefined
+    ? await input.transport.delegateLocalAgentTask(delegation)
+    : await input.transport.delegateLocalAgentTask(delegation, { timeoutMs: input.requestTimeoutMs });
   recordDelegationResult(input.spool, result, {
     target: input.target,
     task: input.task,

@@ -19,6 +19,7 @@ import {
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
+import { selectLocalSessionForPeer } from "./active-session.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
@@ -404,6 +405,8 @@ program.command("delegate")
   .option("--correlation-id <id>", "stable id used to correlate the peer reply")
   .option("--ttl <minutes>", "grant TTL", "30")
   .option("--timeout <seconds>", "local pending-delegation timeout", "1800")
+  .option("--request-timeout <seconds>", "delegation HTTP submission timeout", "30")
+  .option("--no-wait", "return after dispatch instead of waiting for the peer reply")
   .option("--server <url>", "control-plane URL")
   .action(async (person, taskParts, options) => {
     const client = makeHostedClient(options.server, options.spool);
@@ -434,16 +437,32 @@ program.command("delegate")
         correlationId,
         requestedTtlMinutes: Number.parseInt(options.ttl, 10),
         timeoutMs: Number.parseInt(options.timeout, 10) * 1000,
+        requestTimeoutMs: Number.parseInt(options.requestTimeout, 10) * 1000,
       });
       if (result.status === "delegated") {
         console.log(`Delegated to ${person}'s local agent.`);
         console.log(`messageId: ${result.receipt.messageId}`);
+      } else if (result.status === "folder_access_requested" || result.approvalKind === "folder") {
+        console.log(`File access approval requested from ${person}. The task will dispatch after they approve.`);
+        if (result.approvalId) console.log(`approvalId: ${result.approvalId}`);
+        console.log(`communicationSessionId: ${result.communicationSession.id}`);
       } else {
-        console.log(`Approval requested from ${person}. The bridge will dispatch after they approve.`);
+        console.log(`Collaboration approval requested from ${person}. The bridge will dispatch after they approve.`);
         console.log(`requestId: ${result.communicationSession.id}`);
       }
       console.log(`clientMessageId: ${result.clientMessageId}`);
       console.log(`correlationId: ${result.correlationId ?? correlationId}`);
+      if (options.wait) {
+        console.log("Waiting for the peer local agent's reply...");
+        const reply = await waitForDelegationReply(
+          spool,
+          result.correlationId ?? correlationId,
+          Number.parseInt(options.timeout, 10) * 1000,
+        );
+        const replyText = reply.envelope.payload.text;
+        console.log("");
+        console.log(typeof replyText === "string" ? replyText : JSON.stringify(reply.envelope.payload));
+      }
     } finally {
       spool.close();
     }
@@ -873,14 +892,29 @@ async function acceptConnection(
 }
 
 async function activeSessionForPeer(peerPrincipalId: string, server?: string, spool?: string): Promise<CommunicationSession> {
-  const active = (await makeHostedClient(server, spool).listCommunicationSessions())
-    .filter((session) =>
-      session.status === "active"
-      && (session.requester.principalId === peerPrincipalId || session.recipient.principalId === peerPrincipalId))
-    .sort((a, b) => Date.parse(b.activatedAt ?? b.requestedAt) - Date.parse(a.activatedAt ?? a.requestedAt));
-  const session = active[0];
-  if (!session) throw new Error(`No active connection found for ${peerPrincipalId}. Run ccd connect ${peerPrincipalId} first.`);
+  const client = makeHostedClient(server, spool);
+  const [identity, sessions] = await Promise.all([client.whoami(), client.listCommunicationSessions()]);
+  const session = selectLocalSessionForPeer(sessions, identity.principalId, peerPrincipalId);
+  if (!session) {
+    throw new Error(
+      `No active local-runtime connection found for ${peerPrincipalId}. Use ccd delegate so Aicoo can establish the correct route.`,
+    );
+  }
   return session;
+}
+
+async function waitForDelegationReply(
+  spool: BridgeSpool,
+  correlationId: string,
+  timeoutMs: number,
+): Promise<ReturnType<BridgeSpool["findReplyByCorrelation"]> & {}> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const reply = spool.findReplyByCorrelation(correlationId);
+    if (reply) return reply;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Timed out waiting for the peer reply (${correlationId})`);
 }
 
 function resolveDeviceId(explicit: string | undefined, spoolFile: string): string {

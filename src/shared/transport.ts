@@ -14,6 +14,10 @@ import type {
   SendMessageInput,
 } from "./contracts.js";
 
+export interface DelegationRequestOptions {
+  timeoutMs?: number;
+}
+
 export interface MessageTransport {
   registerEndpoint(input: RegisterEndpointInput): Promise<Endpoint>;
   heartbeatEndpoint(endpointId: string): Promise<void>;
@@ -23,7 +27,10 @@ export interface MessageTransport {
   declineCommunicationSession(sessionId: string): Promise<void>;
   revokeCommunicationSession(sessionId: string): Promise<void>;
   sendMessage(input: SendMessageInput): Promise<MessageReceipt>;
-  delegateLocalAgentTask(input: LocalAgentDelegationInput): Promise<LocalAgentDelegationResponse>;
+  delegateLocalAgentTask(
+    input: LocalAgentDelegationInput,
+    options?: DelegationRequestOptions,
+  ): Promise<LocalAgentDelegationResponse>;
   subscribeEvents(cursor?: string, signal?: AbortSignal): AsyncIterable<RuntimeEvent>;
   fetchInbox(afterCursor?: string): Promise<RuntimeEvent[]>;
   validateInjection(input: {

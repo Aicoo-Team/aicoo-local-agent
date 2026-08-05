@@ -134,6 +134,41 @@ describe("RuntimeBridge communication session release", () => {
     }]);
   });
 
+  it("keeps HTTP submission and peer-reply timeouts independent", async () => {
+    const delegateLocalAgentTask = vi.fn(async () => ({
+      status: "grant_requested" as const,
+      communicationSession: communicationSession("comm_timeout", "pending"),
+      clientMessageId: "delegate_timeout",
+      correlationId: "corr_timeout",
+      duplicate: false,
+    }));
+    const spool = new BridgeSpool(":memory:");
+    cleanups.push(() => spool.close());
+
+    await requestRuntimeDelegation({
+      transport: transport({ delegateLocalAgentTask }),
+      spool,
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      task: "Create a file",
+      sessionHandle: "server-session",
+      clientMessageId: "delegate_timeout",
+      correlationId: "corr_timeout",
+      timeoutMs: 300_000,
+      requestTimeoutMs: 30_000,
+    });
+
+    expect(delegateLocalAgentTask).toHaveBeenCalledWith({
+      target: { kind: "person_default_runtime", principalId: "prn_b" },
+      task: "Create a file",
+      sessionHandle: "server-session",
+      clientMessageId: "delegate_timeout",
+      correlationId: "corr_timeout",
+    }, { timeoutMs: 30_000 });
+    expect(spool.listPendingDelegations("comm_timeout")[0]?.expiresAt).toBeTruthy();
+    expect(new Date(spool.listPendingDelegations("comm_timeout")[0]!.expiresAt).getTime())
+      .toBeGreaterThan(Date.now() + 250_000);
+  });
+
   it("backs off event stream reconnect failures", async () => {
     vi.useFakeTimers();
     let attempts = 0;
@@ -233,6 +268,38 @@ describe("RuntimeBridge communication session release", () => {
         principalId: "prn_a",
         deviceId: "device-a1",
         tools: ["Read"],
+        folders: [realpathSync.native(folder)],
+      }],
+    });
+  });
+
+  it("does not expand an explicit empty tool list from a folder-boundary update", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-boundary-update-"));
+    const policyFile = join(directory, "relationships.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const { bridge } = setup({ relationshipPolicyFile: policyFile });
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-boundary-1",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        access: "edit-project",
+        tools: [],
+        folderPath: folder,
+      },
+    });
+
+    expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: [],
         folders: [realpathSync.native(folder)],
       }],
     });
