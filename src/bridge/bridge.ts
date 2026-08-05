@@ -39,6 +39,7 @@ export class RuntimeBridge {
   #injector?: Injector;
   #pendingDefaultRoute?: string;
   #publishedDefaultRoute?: string;
+  #beforeExitHandler?: (code: number) => void;
 
   constructor(private readonly options: BridgeOptions) {}
 
@@ -112,6 +113,14 @@ export class RuntimeBridge {
       this.#serverToNative,
       this.options.hooks ?? noOpInjectionHooks,
     );
+    this.#beforeExitHandler = (code) => {
+      if (!this.#controller.signal.aborted) {
+        (this.options.log ?? console.error)(
+          `[bridge] FATAL: event loop drained while bridge was active (beforeExit code=${code})`,
+        );
+      }
+    };
+    process.on("beforeExit", this.#beforeExitHandler);
     this.#loops = [
       this.runEvents(),
       this.runHeartbeat(),
@@ -142,6 +151,10 @@ export class RuntimeBridge {
 
   async stop(): Promise<void> {
     this.#controller.abort();
+    if (this.#beforeExitHandler) {
+      process.off("beforeExit", this.#beforeExitHandler);
+      this.#beforeExitHandler = undefined;
+    }
     await this.options.adapter.close?.();
     await Promise.allSettled(this.#loops);
   }
@@ -158,7 +171,9 @@ export class RuntimeBridge {
     while (!this.#controller.signal.aborted) {
       const cursor = this.options.spool.cursor(serverKey);
       try {
+        let receivedEvent = false;
         for await (const event of this.options.transport.subscribeEvents(cursor, this.#controller.signal)) {
+          receivedEvent = true;
           reconnectDelayMs = 50;
           reconnectFailures = 0;
           try {
@@ -170,13 +185,37 @@ export class RuntimeBridge {
           }
           this.options.spool.saveCursor(serverKey, event.cursor);
         }
+        if (!this.#controller.signal.aborted) {
+          reconnectFailures += 1;
+          if (shouldLogReconnect(reconnectFailures)) {
+            this.options.log?.(
+              `event stream ended unexpectedly${receivedEvent ? " after receiving events" : " without events"}; `
+                + `reconnecting in ${reconnectDelayMs}ms (attempt ${reconnectFailures})`,
+            );
+          }
+          await delay(reconnectDelayMs, this.#controller.signal);
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5_000);
+        }
       } catch (error) {
         if (!this.#controller.signal.aborted) {
           if (error instanceof ApiError && error.status === 401) {
-            this.options.log?.("\n[bridge] Device token revoked or invalid (401 Unauthorized). Stopping bridge.");
-            this.options.log?.("Please run 'ccd login' to re-authenticate this machine.");
-            await this.stop();
-            return;
+            const recovered = await this.options.transport.recoverAuthentication();
+            if (recovered.recovered) {
+              reconnectDelayMs = 50;
+              reconnectFailures = 0;
+              this.options.log?.(`[bridge] Device token refreshed from ${recovered.source}; reconnecting event stream.`);
+              continue;
+            }
+            reconnectFailures += 1;
+            if (shouldLogReconnect(reconnectFailures)) {
+              this.options.log?.(
+                `[bridge] Device token rejected (401); recovery pending: ${recovered.reason}. `
+                  + `Retrying in ${reconnectDelayMs}ms.`,
+              );
+            }
+            await delay(reconnectDelayMs, this.#controller.signal);
+            reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5_000);
+            continue;
           }
           reconnectFailures += 1;
           if (shouldLogReconnect(reconnectFailures)) {
@@ -289,10 +328,13 @@ export class RuntimeBridge {
         await this.options.transport.heartbeatEndpoint(this.requireEndpoint());
       } catch (error) {
         if (error instanceof ApiError && error.status === 401) {
-          this.options.log?.("\n[bridge] Device token revoked or invalid (401 Unauthorized). Stopping bridge.");
-          this.options.log?.("Please run 'ccd login' to re-authenticate this machine.");
-          await this.stop();
-          return;
+          const recovered = await this.options.transport.recoverAuthentication();
+          if (recovered.recovered) {
+            this.options.log?.(`[bridge] Device token refreshed from ${recovered.source}; heartbeat will resume.`);
+          } else {
+            this.options.log?.(`[bridge] Device token rejected (401); recovery pending: ${recovered.reason}.`);
+          }
+          continue;
         }
         this.options.log?.(`heartbeat failed: ${String(error)}`);
       }

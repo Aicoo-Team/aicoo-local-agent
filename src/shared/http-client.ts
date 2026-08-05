@@ -91,7 +91,14 @@ export interface HttpTransportOptions {
    *  to (principal, deviceId). Ignored by the standalone HttpMessageTransport. */
   deviceId?: string;
   onTokenRefreshed?: (token: string) => void;
+  /** Reload the latest persisted device credential after another same-device
+   *  process rotates it. Used only by the hosted Aicoo transport. */
+  loadToken?: () => string | undefined;
 }
+
+export type AuthenticationRecoveryResult =
+  | { recovered: true; source: "credentials" | "registration" }
+  | { recovered: false; reason: string };
 
 /**
  * Remove copy/paste artifacts around a bearer token while refusing to silently
@@ -132,6 +139,10 @@ export class HttpMessageTransport implements MessageTransport {
 
   setEndpointId(endpointId: string): void {
     this.#endpointId = endpointId;
+  }
+
+  async recoverAuthentication(): Promise<AuthenticationRecoveryResult> {
+    return { recovered: false, reason: "transport does not support credential recovery" };
   }
 
   async registerEndpoint(input: RegisterEndpointInput): Promise<Endpoint> {

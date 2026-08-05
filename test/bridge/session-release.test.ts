@@ -6,7 +6,7 @@ import type { RuntimeAdapter } from "../../src/adapters/runtime-adapter.js";
 import { requestRuntimeDelegation, RuntimeBridge } from "../../src/bridge/bridge.js";
 import { BridgeSpool } from "../../src/bridge/spool.js";
 import type { RuntimeEvent } from "../../src/shared/contracts.js";
-import type { HttpMessageTransport } from "../../src/shared/http-client.js";
+import { ApiError, type HttpMessageTransport } from "../../src/shared/http-client.js";
 
 describe("RuntimeBridge communication session release", () => {
   const cleanups: Array<() => void> = [];
@@ -162,6 +162,51 @@ describe("RuntimeBridge communication session release", () => {
     expect(attempts).toBe(4);
   });
 
+  it("recovers a revoked token and re-subscribes instead of stopping", async () => {
+    let attempts = 0;
+    const recoverAuthentication = vi.fn(async () => ({ recovered: true as const, source: "credentials" as const }));
+    const logs: string[] = [];
+    const { bridge } = setup({
+      log: (line) => logs.push(line),
+      transport: transport({
+        recoverAuthentication,
+        subscribeEvents: vi.fn(async function* (_cursor?: string, signal?: AbortSignal) {
+          attempts += 1;
+          if (attempts === 1) throw new ApiError(401, "unauthorized", null);
+          await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+        }),
+      }),
+    });
+    cleanups.push(() => void bridge.stop());
+
+    await bridge.start();
+    await vi.waitFor(() => expect(attempts).toBe(2));
+
+    expect(recoverAuthentication).toHaveBeenCalledTimes(1);
+    expect(logs).toContain("[bridge] Device token refreshed from credentials; reconnecting event stream.");
+  });
+
+  it("logs and backs off when an event stream ends normally", async () => {
+    vi.useFakeTimers();
+    const logs: string[] = [];
+    let attempts = 0;
+    const { bridge } = setup({
+      log: (line) => logs.push(line),
+      transport: transport({
+        subscribeEvents: vi.fn(async function* () {
+          attempts += 1;
+        }),
+      }),
+    });
+    cleanups.push(() => void bridge.stop());
+
+    await bridge.start();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(attempts).toBe(2);
+    expect(logs[0]).toContain("event stream ended unexpectedly without events");
+  });
+
   it("applies relationship policy updates from the app", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-policy-update-"));
     const policyFile = join(directory, "relationships.json");
@@ -197,6 +242,7 @@ describe("RuntimeBridge communication session release", () => {
     sessions?: Awaited<ReturnType<RuntimeAdapter["listSessions"]>>;
     transport?: HttpMessageTransport;
     relationshipPolicyFile?: string;
+    log?: (line: string) => void;
   }): {
     bridge: RuntimeBridge;
     spool: BridgeSpool;
@@ -232,6 +278,7 @@ describe("RuntimeBridge communication session release", () => {
       heartbeatMs: 60_000,
       injectorMs: 60_000,
       relationshipPolicyFile: options?.relationshipPolicyFile,
+      log: options?.log,
     });
     return { bridge, spool, adapter };
   }
