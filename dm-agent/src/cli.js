@@ -9,6 +9,8 @@ import { ApprovalBroker, resolveApproval, listApprovals } from "./approval.js";
 import { AgentState } from "./state.js";
 import { Policy, PolicyError } from "./policy.js";
 import { AuditLog } from "./audit.js";
+import { acquireLock, LockError } from "./lock.js";
+import { checkModelReachable, explainUnreachable } from "./preflight.js";
 import { collectSecrets, redact } from "./redact.js";
 
 const DEFAULT_SERVER = "https://www.aicoo.io";
@@ -78,6 +80,7 @@ Options:
                            prompt says which one you are answering for
   --no-sandbox             run the model's file tools unsandboxed (only if the platform
                            cannot start one — the default is to fail rather than pretend)
+  --skip-preflight         start without checking the model is reachable first
   --state-dir <dir>        override state directory
 `);
 }
@@ -320,6 +323,19 @@ async function main() {
   }
 
   const stateDir = stateDirFor({ server, me: me.username, peer, override: args["state-dir"] });
+
+  // One agent per state directory, claimed before anything else touches it.
+  let releaseLock = () => {};
+  try {
+    releaseLock = acquireLock(stateDir, { log });
+  } catch (error) {
+    if (error instanceof LockError) {
+      log(`FATAL: ${error.message}`);
+      process.exit(1);
+    }
+    throw error;
+  }
+  process.on("exit", () => releaseLock());
   const state = new AgentState(join(stateDir, "state.json"));
   const approvals = new ApprovalBroker({
     approvalsDir: join(stateDir, "approvals"),
@@ -377,6 +393,23 @@ async function main() {
     }
   }
   log(`state: ${stateDir}  responder=${responder}`);
+
+  // Prove the runtime can answer before telling anyone this agent is online. An agent that
+  // prints a healthy banner and then fails every message is indistinguishable from a working
+  // one until someone is already waiting on it — which is exactly how a network block cost
+  // three debugging sessions before anybody could see the cause.
+  if (responder === "agent" && !args["skip-preflight"]) {
+    const reach = await checkModelReachable();
+    if (!reach.ok) {
+      log(`FATAL: ${explainUnreachable(reach)}`);
+      log(`   (start with --skip-preflight to bypass this check)`);
+      releaseLock();
+      process.exit(1);
+    }
+    log(reach.skipped
+      ? `could not run the reachability check (${reach.reason}) — starting anyway`
+      : `api.anthropic.com reachable (HTTP ${reach.status})`);
+  }
 
   if (args.reachout) {
     const res = await api.withRetry(() => api.sendHuman(peer, String(args.reachout), `dm-agent-reachout:${me.userId}:${Date.now()}`));
@@ -456,8 +489,22 @@ async function main() {
 
   let stopping = false;
   let runtimeHintShown = false;
-  process.on("SIGINT", () => { stopping = true; log("stopping…"); });
-  process.on("SIGTERM", () => { stopping = true; });
+  // Ctrl-C has to actually stop it. Setting a flag only ends the loop after the current
+  // iteration, and that iteration may be parked for fifteen minutes waiting on an approval
+  // nobody is going to give — so the first signal also abandons whatever is in flight, and a
+  // second one leaves immediately for anyone who does not want to wait even that long.
+  const stop = (signal) => {
+    if (stopping) {
+      log(`second ${signal} — exiting now`);
+      releaseLock();
+      process.exit(130);
+    }
+    stopping = true;
+    log(`${signal} — stopping (press again to exit immediately)`);
+    agent?.abortInFlight?.();
+  };
+  process.on("SIGINT", () => stop("SIGINT"));
+  process.on("SIGTERM", () => stop("SIGTERM"));
 
   // ── Share-link mode ──
   // A guest policy means this machine is answering visitors on a link rather than one named

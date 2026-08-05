@@ -23,6 +23,21 @@ const BANNERS = {
 };
 
 export class ApprovalBroker {
+  /** Resolvers for questions currently waiting, so Ctrl-C does not have to outlast them. */
+  #waiting = new Set();
+
+  /**
+   * Abandon every open question, denying each. Called when the owner stops the agent: a
+   * pending approval can be a fifteen-minute wait, and nobody expects Ctrl-C to sit through it.
+   */
+  cancelPending() {
+    for (const cancel of this.#waiting) cancel();
+    this.#waiting.clear();
+  }
+
+  #addWaiter(fn) { this.#waiting.add(fn); }
+  #removeWaiter(fn) { this.#waiting.delete(fn); }
+
   constructor({ approvalsDir, timeoutSec = 300, autoAllowRead = false, log = console.log }) {
     this.approvalsDir = approvalsDir;
     this.timeoutSec = timeoutSec;
@@ -66,6 +81,10 @@ export class ApprovalBroker {
   async #askTty({ toolName, summary, kind }) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const timeoutController = new AbortController();
+    // Ctrl-C at a y/N prompt must return control, not wait out the approval window. Closing
+    // the readline interface resolves its question, which is enough to unwind the turn.
+    const cancel = () => { try { rl.close(); } catch { /* already closed */ } };
+    this.#addWaiter(cancel);
     try {
       process.stdout.write(""); // bell
       const answer = await Promise.race([
@@ -81,6 +100,7 @@ export class ApprovalBroker {
       }
       return /^y(es)?$/i.test(String(answer).trim());
     } finally {
+      this.#removeWaiter(cancel);
       timeoutController.abort();
       rl.close();
     }
@@ -93,9 +113,16 @@ export class ApprovalBroker {
     writeFileSync(file, JSON.stringify({ id, toolName, summary, kind, createdAt: new Date().toISOString(), expiresAt, decision: null }, null, 2));
     this.log(`[approval] PENDING ${id}${kind === "escalation" ? " (OUTSIDE your shared folders)" : ""}: ${toolName} ${summary}`);
     this.log(`[approval]   resolve with: aicoo-dm-agent approve ${id} --allow   (or --deny)`);
+    let cancelled = false;
+    const cancel = () => { cancelled = true; };
+    this.#addWaiter(cancel);
     try {
       while (Date.now() < expiresAt) {
         await delay(500);
+        if (cancelled) {
+          this.log(`[approval] ${id} -> cancelled (agent stopping)`);
+          return false;
+        }
         let record;
         try {
           record = JSON.parse(readFileSync(file, "utf8"));
@@ -115,6 +142,7 @@ export class ApprovalBroker {
       this.log(`[approval] ${id} timed out after ${this.timeoutSec}s -> deny`);
       return false;
     } finally {
+      this.#removeWaiter(cancel);
       rmSync(file, { force: true });
     }
   }

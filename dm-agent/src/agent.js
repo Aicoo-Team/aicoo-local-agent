@@ -299,6 +299,8 @@ export class LocalDmAgent {
   #commandServer = null;
   /** Set while a turn is in flight. Paused whenever the owner has a question in front of them. */
   #idle = null;
+  /** The in-flight turn's abort handle, so Ctrl-C can end it rather than wait it out. */
+  #abort = null;
 
   constructor({ workspace, state, approvals, ownerLabel, peerLabel, model, policy, audit, sandbox, log = console.log }) {
     this.workspace = realpathSync(workspace);
@@ -692,8 +694,18 @@ Compose the reply to send back now.`;
     }
   }
 
+  /**
+   * Abandon whatever this turn is doing. Used by Ctrl-C, which otherwise waits for an
+   * approval window that can be fifteen minutes long.
+   */
+  abortInFlight() {
+    this.#abort?.abort();
+    this.approvals?.cancelPending?.();
+  }
+
   async #runOnce(prompt) {
     const abortController = new AbortController();
+    this.#abort = abortController;
     this.#idle = new IdleClock(TURN_IDLE_TIMEOUT_MS, () => abortController.abort());
     this.#idle.start();
     try {
@@ -716,6 +728,7 @@ Compose the reply to send back now.`;
     } finally {
       this.#idle.stop();
       this.#idle = null;
+      this.#abort = null;
     }
   }
 }
