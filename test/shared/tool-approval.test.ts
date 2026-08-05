@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   awaitToolApproval,
-  TurnApprovalCache,
   type ToolApprovalGateway,
 } from "../../src/shared/tool-approval.js";
 import { summarizeToolInput } from "../../src/adapters/claude-code/claude-code-adapter.js";
@@ -25,8 +24,17 @@ function fakeClock() {
 }
 
 function gateway(
-  request: Partial<{ approvalId: string; status: string; decision: string | null }> | Error,
-  polls: Array<{ status: string; decision: "allow" | "deny" | null } | Error> = [],
+  request: Partial<{
+    approvalId: string;
+    status: string;
+    decision: "allow" | "deny" | null;
+    scope: "once" | "session" | null;
+  }> | Error,
+  polls: Array<{
+    status: string;
+    decision: "allow" | "deny" | null;
+    scope?: "once" | "session" | null;
+  } | Error> = [],
 ): ToolApprovalGateway & { pollCount: () => number } {
   let i = 0;
   return {
@@ -48,7 +56,7 @@ describe("just-in-time tool approval", () => {
   it("allows a policy hit without ever asking the owner", async () => {
     const g = gateway({ status: "auto_allow", decision: "allow" });
     const outcome = await awaitToolApproval(g, REQUEST, fakeClock());
-    expect(outcome).toEqual({ behavior: "allow" });
+    expect(outcome).toEqual({ behavior: "allow", scope: "once" });
     // The control plane already decided — polling would be a pointless round trip.
     expect(g.pollCount()).toBe(0);
   });
@@ -60,7 +68,7 @@ describe("just-in-time tool approval", () => {
       { status: "allow", decision: "allow" },
     ]);
     const outcome = await awaitToolApproval(g, REQUEST, fakeClock());
-    expect(outcome).toEqual({ behavior: "allow" });
+    expect(outcome).toEqual({ behavior: "allow", scope: "once" });
     expect(g.pollCount()).toBe(3);
   });
 
@@ -84,7 +92,7 @@ describe("just-in-time tool approval", () => {
       { status: "allow", decision: "allow" },
     ]);
     const outcome = await awaitToolApproval(g, REQUEST, fakeClock());
-    expect(outcome).toEqual({ behavior: "allow" });
+    expect(outcome).toEqual({ behavior: "allow", scope: "once" });
   });
 
   it("denies when the owner never answers", async () => {
@@ -113,20 +121,14 @@ describe("just-in-time tool approval", () => {
     await awaitToolApproval(g, REQUEST, { now: clock.now, sleep, pollMs: 1_000, timeoutMs: 4_000 });
     expect(sleep.mock.calls.length).toBeLessThanOrEqual(5);
   });
-});
-
-describe("per-turn approval cache", () => {
-  it("remembers an approval only for identical calls, and forgets on clear", () => {
-    const cache = new TurnApprovalCache();
-    expect(cache.has("Read", "Read /a.ts")).toBe(false);
-    cache.remember("Read", "Read /a.ts");
-    expect(cache.has("Read", "Read /a.ts")).toBe(true);
-    // A different file, or a different tool on the same file, is a different decision.
-    expect(cache.has("Read", "Read /b.ts")).toBe(false);
-    expect(cache.has("Write", "Read /a.ts")).toBe(false);
-    // Cleared between turns: a grant for this task must not authorize the next one.
-    cache.clear();
-    expect(cache.has("Read", "Read /a.ts")).toBe(false);
+  it("preserves a collaboration-scoped allow returned by Pulse", async () => {
+    const g = gateway({ status: "pending", decision: null }, [
+      { status: "allow", decision: "allow", scope: "session" },
+    ]);
+    await expect(awaitToolApproval(g, REQUEST, fakeClock())).resolves.toEqual({
+      behavior: "allow",
+      scope: "session",
+    });
   });
 });
 

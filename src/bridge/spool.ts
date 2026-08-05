@@ -486,6 +486,16 @@ export class BridgeSpool {
     return row ? mapSpool(row) : undefined;
   }
 
+  findReplyByCorrelation(correlationId: string): SpoolMessage | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM spool_messages
+       WHERE json_extract(envelope_json, '$.correlationId') = ?
+       AND json_extract(envelope_json, '$.replyTo') IS NOT NULL
+       ORDER BY sequence DESC LIMIT 1`,
+    ).get(correlationId) as unknown as SpoolRow | undefined;
+    return row ? mapSpool(row) : undefined;
+  }
+
   count(): number {
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM spool_messages").get() as { count: number };
     return Number(row.count);

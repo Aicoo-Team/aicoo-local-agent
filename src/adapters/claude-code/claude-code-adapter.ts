@@ -11,7 +11,7 @@ import type {
   SyncHookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
 import { RelationshipPolicy } from "../../security/relationship-policy.js";
-import { awaitToolApproval, TurnApprovalCache, type ToolApprovalGateway } from "../../shared/tool-approval.js";
+import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
 import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from "../runtime-adapter.js";
@@ -63,8 +63,6 @@ interface ManagedSession {
   boundCommunicationSessionId?: string;
   acceptedTurns: AcceptedTurn[];
   pendingAcks: Map<string, PendingAck>;
-  /** Approvals granted during the current turn, so one file is not two popups. */
-  approvals: TurnApprovalCache;
 }
 
 interface AcceptedTurn {
@@ -361,7 +359,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         ...(row.bound_comm_session_id ? { boundCommunicationSessionId: row.bound_comm_session_id } : {}),
         acceptedTurns: [],
         pendingAcks: new Map(),
-        approvals: new TurnApprovalCache(),
       });
     }
   }
@@ -399,7 +396,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     }
     session.pendingAcks.clear();
     session.acceptedTurns = [];
-    session.approvals.clear();
     session.accepting = false;
     session.abortController.abort();
     session.queue.close();
@@ -464,11 +460,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         }
 
         const summary = summarizeToolInput(toolName, input);
-        if (session.approvals.has(toolName, summary)) {
-          this.#config.log?.(`claude tool allowed by earlier approval this turn: ${toolName}`);
-          return { behavior: "allow" };
-        }
-
         const outcome = await awaitToolApproval(
           gateway,
           {
@@ -480,10 +471,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           },
           { log: this.#config.log },
         );
-        if (outcome.behavior === "allow") {
-          session.approvals.remember(toolName, summary);
-          return { behavior: "allow" };
-        }
+        if (outcome.behavior === "allow") return { behavior: "allow" };
         return { behavior: "deny", message: outcome.message };
       } catch (error) {
         this.#config.log?.(`claude relationship policy could not be loaded; denying tool ${toolName}: ${String(error)}`);
@@ -531,8 +519,9 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       // built-in rules auto-allow reads inside cwd and never consult canUseTool for them —
       // a peer reading the shared workspace would bypass both the relationship policy and
       // the owner prompt. Hooks fire for every tool call regardless of those rules.
-      // canUseTool stays as a second layer; `session.approvals` keeps the owner from being
-      // asked twice for the same call.
+      // canUseTool stays as a second layer. Every decision is resolved by Pulse so an
+      // Allow-once result cannot widen into a local turn-wide allowance, and revocation of a
+      // collaboration-scoped tool remains effective without restarting the bridge.
       hooks: {
         PreToolUse: [{
           hooks: [async (hookInput: HookInput): Promise<SyncHookJSONOutput> => {

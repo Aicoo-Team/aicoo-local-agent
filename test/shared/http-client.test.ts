@@ -40,6 +40,121 @@ describe("bearer token normalization", () => {
 });
 
 describe("hosted Aicoo transport", () => {
+  it("maps the hosted flat delegated response into the client delegation contract", async () => {
+    // Regression: ccd delegate crashed while reading result.communicationSession.id.
+    const grant = hostedGrant({ status: "active" });
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/local-agent/delegations")) {
+        return Response.json({
+          ok: true,
+          status: "delegated",
+          communicationSessionId: grant.commSessionId,
+          messageId: "msg-1",
+          deliveryId: "del-1",
+          correlationId: "corr-1",
+          duplicate: false,
+          queuedAt: "2026-08-05T10:00:00.000Z",
+        }, { status: 201 });
+      }
+      if (url.endsWith("/api/v1/local-agent/grants")) return Response.json([grant]);
+      throw new Error(`Unexpected request ${url}`);
+    });
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_dev_test",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.delegateLocalAgentTask({
+      target: { kind: "person_default_runtime", principalId: "peer" },
+      task: "Create the file",
+      sessionHandle: "rs-me",
+      clientMessageId: "client-1",
+      correlationId: "corr-1",
+    })).resolves.toMatchObject({
+      status: "delegated",
+      communicationSession: { id: grant.commSessionId, status: "active" },
+      receipt: { messageId: "msg-1", deliveryId: "del-1", status: "queued" },
+      clientMessageId: "client-1",
+      correlationId: "corr-1",
+    });
+  });
+
+  it("maps the hosted flat grant-requested response and preserves the client retry identity", async () => {
+    const grant = hostedGrant({ status: "pending" });
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/local-agent/delegations")) {
+        return Response.json({
+          ok: true,
+          status: "grant_requested",
+          communicationSessionId: grant.commSessionId,
+          targetPrincipalId: "peer",
+          message: "Waiting for approval",
+        }, { status: 202 });
+      }
+      if (url.endsWith("/api/v1/local-agent/grants")) return Response.json([grant]);
+      throw new Error(`Unexpected request ${url}`);
+    });
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_dev_test",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.delegateLocalAgentTask({
+      target: { kind: "person_default_runtime", principalId: "peer" },
+      task: "Create the file",
+      sessionHandle: "rs-me",
+      clientMessageId: "client-1",
+      correlationId: "corr-1",
+    })).resolves.toMatchObject({
+      status: "grant_requested",
+      approvalKind: "collaboration",
+      communicationSession: { id: grant.commSessionId, status: "pending" },
+      clientMessageId: "client-1",
+      correlationId: "corr-1",
+    });
+  });
+
+  it("distinguishes a parked folder approval from a collaboration grant request", async () => {
+    const grant = hostedGrant({ status: "active" });
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/local-agent/delegations")) {
+        return Response.json({
+          ok: true,
+          status: "folder_access_requested",
+          communicationSessionId: grant.commSessionId,
+          approvalId: "facc-1",
+          messageId: "msg-parked",
+          correlationId: "corr-1",
+        }, { status: 202 });
+      }
+      if (url.endsWith("/api/v1/local-agent/grants")) return Response.json([grant]);
+      throw new Error(`Unexpected request ${url}`);
+    });
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_dev_test",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.delegateLocalAgentTask({
+      target: { kind: "person_default_runtime", principalId: "peer" },
+      task: "Create the file",
+      sessionHandle: "rs-me",
+      clientMessageId: "client-1",
+      correlationId: "corr-1",
+    })).resolves.toMatchObject({
+      status: "folder_access_requested",
+      approvalKind: "folder",
+      approvalId: "facc-1",
+      communicationSession: { id: grant.commSessionId, status: "active" },
+    });
+  });
+
   it("reloads a device token rotated by another process", async () => {
     let persistedToken = "aicoo_dev_old";
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -188,3 +303,24 @@ describe("hosted Aicoo transport", () => {
     });
   });
 });
+
+function hostedGrant(input: { status: "pending" | "active" }) {
+  return {
+    commSessionId: `comm-${input.status}`,
+    requesterPrincipalId: "me",
+    requesterDeviceId: "device-me",
+    requesterReplyEndpointId: "ep-me",
+    requesterReplySessionHandle: "rs-me",
+    recipientPrincipalId: "peer",
+    targetKind: "person_default_runtime" as const,
+    targetOfferId: null,
+    frozenEndpointId: input.status === "active" ? "ep-peer" : null,
+    frozenSessionHandle: input.status === "active" ? "rs-peer" : null,
+    status: input.status,
+    requestedAt: "2026-08-05T09:00:00.000Z",
+    requestExpiresAt: "2026-08-05T09:10:00.000Z",
+    activatedAt: input.status === "active" ? "2026-08-05T09:01:00.000Z" : null,
+    grantExpiresAt: input.status === "active" ? "2026-08-05T09:31:00.000Z" : null,
+    revokedAt: null,
+  };
+}

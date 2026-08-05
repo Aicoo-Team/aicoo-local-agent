@@ -15,6 +15,8 @@ describe("Codex skill installer", () => {
     expect(installed).toMatch(/^---\nname: aicoo-c2c\n/s);
     expect(installed).toContain("ccd delegate @username");
     expect(installed).toContain("local Aicoo bridge <-> Aicoo relay");
+    expect(installed).toContain("stays open while approval or execution is pending");
+    expect(installed).toContain("Use `--no-wait` only when the user explicitly wants asynchronous dispatch");
   });
 
   it("can be safely ensured during bridge start", () => {

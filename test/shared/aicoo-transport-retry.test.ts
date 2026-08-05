@@ -21,6 +21,14 @@ function hangingFetch(): typeof fetch {
 }
 
 describe("hosted transport retry", () => {
+  const delegationInput = {
+    target: { kind: "person_default_runtime" as const, principalId: "peer" },
+    task: "Create the file",
+    sessionHandle: "rs-me",
+    clientMessageId: "client-stable",
+    correlationId: "correlation-stable",
+  };
+
   it("recovers when the first attempt times out and the second succeeds", async () => {
     // This is the observed field failure: an attempt aborts at the cap, and the very next
     // request — on the socket the failed attempt just opened — succeeds.
@@ -68,6 +76,51 @@ describe("hosted transport retry", () => {
       }),
     ).rejects.toThrow(/timed out after 20ms \(attempt 1\/1\)/);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows delegation submission to outlive the transport-wide timeout", async () => {
+    // Regression: Pulse can legitimately need more than five seconds for routing,
+    // grant, folder-access, and persistence checks before returning the receipt.
+    const fetchImpl = vi.fn((async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return Response.json({
+        status: "grant_requested",
+        communicationSession: {
+          id: "comm-1",
+          requesterId: "me",
+          recipientId: "peer",
+          target: { kind: "person_default_runtime", principalId: "peer" },
+          replyEndpointId: "ep-me",
+          replySessionHandle: "rs-me",
+          requestedTtlMinutes: 30,
+          status: "pending",
+          requestedAt: new Date().toISOString(),
+          requestExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+        clientMessageId: delegationInput.clientMessageId,
+        correlationId: delegationInput.correlationId,
+        duplicate: false,
+      });
+    }) as unknown as typeof fetch);
+
+    await expect(
+      transport(fetchImpl, 10).delegateLocalAgentTask(delegationInput),
+    ).resolves.toMatchObject({ status: "grant_requested", clientMessageId: "client-stable" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors the delegation-specific submission timeout across idempotent retries", async () => {
+    const fetchImpl = vi.fn(hangingFetch());
+
+    await expect(
+      transport(fetchImpl, 100).delegateLocalAgentTask(delegationInput, { timeoutMs: 20 }),
+    ).rejects.toThrow(/timed out after 20ms \(attempt 2\/2\).*POST .*\/delegations/);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const requestBodies = fetchImpl.mock.calls.map(([, init]) => init?.body);
+    expect(requestBodies).toEqual([
+      JSON.stringify(delegationInput),
+      JSON.stringify(delegationInput),
+    ]);
   });
 
   it("refuses to follow a cross-origin redirect that would strip the bearer token", async () => {

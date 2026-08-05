@@ -17,7 +17,7 @@ import type {
   RuntimeSessionBinding,
   SendMessageInput,
 } from "./contracts.js";
-import type { MessageTransport } from "./transport.js";
+import type { DelegationRequestOptions, MessageTransport } from "./transport.js";
 
 export class ApiError extends Error {
   constructor(
@@ -34,6 +34,8 @@ export interface PairStatusResponse {
   message: string;
   targetReachable?: boolean;
 }
+
+const DEFAULT_DELEGATION_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface ResolvedPersonResponse {
   principalId: string;
@@ -201,8 +203,15 @@ export class HttpMessageTransport implements MessageTransport {
     return this.requestJson("/api/v1/messages", { method: "POST", body: input });
   }
 
-  async delegateLocalAgentTask(input: LocalAgentDelegationInput): Promise<LocalAgentDelegationResponse> {
-    return this.requestJson("/api/v1/local-agent/delegations", { method: "POST", body: input });
+  async delegateLocalAgentTask(
+    input: LocalAgentDelegationInput,
+    options: DelegationRequestOptions = {},
+  ): Promise<LocalAgentDelegationResponse> {
+    return this.requestJson("/api/v1/local-agent/delegations", {
+      method: "POST",
+      body: input,
+      timeoutMs: options.timeoutMs ?? DEFAULT_DELEGATION_REQUEST_TIMEOUT_MS,
+    });
   }
 
   async sendInbox(input: HumanInboxSendMessageInput): Promise<MessageReceipt> {

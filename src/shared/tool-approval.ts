@@ -19,12 +19,21 @@ import type { ToolApprovalRequest } from "./aicoo-transport.js";
 export interface ToolApprovalGateway {
   requestToolApproval(
     input: ToolApprovalRequest,
-  ): Promise<{ approvalId: string; status: string; decision: string | null }>;
-  getToolApproval(approvalId: string): Promise<{ status: string; decision: "allow" | "deny" | null }>;
+  ): Promise<ToolApprovalState & { approvalId: string }>;
+  getToolApproval(approvalId: string): Promise<ToolApprovalState>;
+}
+
+export type ToolApprovalScope = "once" | "session";
+
+export interface ToolApprovalState {
+  approvalId?: string;
+  status: string;
+  decision: "allow" | "deny" | null;
+  scope?: ToolApprovalScope | null;
 }
 
 export type ToolApprovalOutcome =
-  | { behavior: "allow" }
+  | { behavior: "allow"; scope: ToolApprovalScope }
   | { behavior: "deny"; message: string };
 
 export interface AwaitToolApprovalOptions {
@@ -59,14 +68,14 @@ export async function awaitToolApproval(
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = options.now ?? (() => Date.now());
 
-  let requested: { approvalId: string; status: string; decision: string | null };
+  let requested: ToolApprovalState & { approvalId: string };
   try {
     requested = await gateway.requestToolApproval(input);
   } catch (error) {
     return denied(`could not ask ${input.toolName} approval: ${String(error)}`, options.log);
   }
 
-  const initial = decide(requested.status, requested.decision);
+  const initial = decide(requested.status, requested.decision, requested.scope);
   if (initial) {
     options.log?.(
       initial.behavior === "allow"
@@ -80,7 +89,7 @@ export async function awaitToolApproval(
   const deadline = now() + timeoutMs;
   while (now() < deadline) {
     await sleep(pollMs);
-    let current: { status: string; decision: "allow" | "deny" | null };
+    let current: ToolApprovalState;
     try {
       current = await gateway.getToolApproval(requested.approvalId);
     } catch (error) {
@@ -89,7 +98,7 @@ export async function awaitToolApproval(
       options.log?.(`tool approval poll failed, still waiting: ${String(error)}`);
       continue;
     }
-    const resolved = decide(current.status, current.decision);
+    const resolved = decide(current.status, current.decision, current.scope);
     if (resolved) {
       options.log?.(`tool approval ${resolved.behavior} for ${input.toolName} (${current.status})`);
       return resolved;
@@ -100,42 +109,21 @@ export async function awaitToolApproval(
 }
 
 /** Returns undefined while the approval is still pending. */
-function decide(status: string, decision: string | null): ToolApprovalOutcome | undefined {
-  if (decision === "allow") return { behavior: "allow" };
+function decide(
+  status: string,
+  decision: string | null,
+  scope: ToolApprovalScope | null | undefined = "once",
+): ToolApprovalOutcome | undefined {
+  if (decision === "allow") return { behavior: "allow", scope: scope === "session" ? "session" : "once" };
   if (decision === "deny") return { behavior: "deny", message: "the owner declined this tool call" };
   // No decision yet. `pending` is the normal case; anything else terminal (expired, revoked) is a
   // deny — an approval that ended without an allow was never granted.
   if (status === "pending") return undefined;
-  if (status === "auto_allow") return { behavior: "allow" };
+  if (status === "auto_allow") return { behavior: "allow", scope: scope === "session" ? "session" : "once" };
   return { behavior: "deny", message: `approval ended as ${status}` };
 }
 
 function denied(reason: string, log?: (line: string) => void): ToolApprovalOutcome {
   log?.(`tool denied: ${reason}`);
   return { behavior: "deny", message: `Aicoo: ${reason}` };
-}
-
-/**
- * Remembers approvals for the life of one turn, so a peer that reads the same file twice is not
- * two popups. Deliberately not persisted: an approval granted for this task should not silently
- * authorize the next one.
- */
-export class TurnApprovalCache {
-  readonly #allowed = new Set<string>();
-
-  static key(toolName: string, summary: string): string {
-    return `${toolName}\u0000${summary}`;
-  }
-
-  has(toolName: string, summary: string): boolean {
-    return this.#allowed.has(TurnApprovalCache.key(toolName, summary));
-  }
-
-  remember(toolName: string, summary: string): void {
-    this.#allowed.add(TurnApprovalCache.key(toolName, summary));
-  }
-
-  clear(): void {
-    this.#allowed.clear();
-  }
 }
