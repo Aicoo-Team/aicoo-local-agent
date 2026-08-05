@@ -2,6 +2,7 @@ import {
   HttpMessageTransport,
   ApiError,
   normalizeBearerToken,
+  parseResolvedPersonResponse,
   type HttpTransportOptions,
   type PairStatusResponse,
   type ResolvedPersonResponse,
@@ -358,7 +359,8 @@ export class AicooTransport extends HttpMessageTransport {
   }
 
   override async resolvePerson(query: string): Promise<ResolvedPersonResponse> {
-    return this.requestJson<ResolvedPersonResponse>(`${LA}/resolve-person?q=${encodeURIComponent(query)}`);
+    const response = await this.requestJson<unknown>(`${LA}/resolve-person?q=${encodeURIComponent(query)}`);
+    return parseResolvedPersonResponse(query, response);
   }
 
   override async startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse> {
