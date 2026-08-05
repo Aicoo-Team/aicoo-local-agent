@@ -95,6 +95,28 @@ function peerLabelFor(peer, policy, linkLabel) {
   return linkLabel ? `a visitor via your "${linkLabel}" link` : `a visitor via your share link`;
 }
 
+/**
+ * What to tell someone when a message could not be answered.
+ *
+ * "The agent kept failing" was the only thing it ever said, and it was usually a lie: the
+ * common case is a turn that ran out of time while its owner was away from the terminal, or
+ * a machine that cannot reach the model at all. Blaming the agent sends the asker off to
+ * retry something that will fail again the same way, and tells the owner nothing.
+ */
+function describeGiveUp(error) {
+  const message = String(error?.message ?? error ?? "");
+  if (error?.name === "AbortError" || /abort/i.test(message)) {
+    return "I ran out of time on that one before it finished — usually because the owner was away from the terminal where approvals appear. Your question is saved; ask again once they are back.";
+  }
+  if (error?.code === "timeout" || /timed out/i.test(message)) {
+    return "I could not reach my own service in time. Your question is saved — the owner needs to check the machine's connection.";
+  }
+  if (/credit|quota|402/i.test(message)) {
+    return "The owner's account cannot pay for this right now. Your question is saved until they top it up.";
+  }
+  return "I could not answer that one — something on the owner's machine kept failing. Your question is saved; they will need to look at it.";
+}
+
 /** Load the policy, turning a bad file into an actionable line rather than a stack trace. */
 function loadPolicy(file, workspace) {
   try {
@@ -477,11 +499,12 @@ async function main() {
             log(`reply sent for guest #${message.id}`);
           } catch (error) {
             const attempts = state.recordFailure(message.id);
+            log(`guest #${message.id} failed (attempt ${attempts}/${MAX_MESSAGE_ATTEMPTS}): ${String(error.message ?? error)}`);
             if (attempts < MAX_MESSAGE_ATTEMPTS) break; // leave the cursor; try again
             log(`giving up on guest #${message.id}; moving past it`);
             await api.withRetry(() => api.replyToGuest(
               message.sessionId,
-              "I could not answer that one — the agent on this machine kept failing. Try again, or ask the owner directly.",
+              describeGiveUp(error),
             )).catch(() => {});
             state.setCursor("guest", Number(message.id));
             state.clearFailures(message.id);
@@ -541,7 +564,7 @@ async function main() {
             log(`giving up on #${message.id}; moving past it`);
             await api.withRetry(() => api.sendHuman(
               peer,
-              `${args.tag ?? "🖥️ [本地 agent]"} I could not answer that one — my local runtime kept failing (${reason}). Ask again, or ping the owner.`,
+              `${args.tag ?? "🖥️ [本地 agent]"} ${describeGiveUp(error)}`,
               `dm-agent-failed:${me.userId}:${message.id}`,
             )).catch((sendError) => log(`could not report the failure: ${String(sendError.message ?? sendError)}`));
             state.setCursor(conv.conversationId, Number(message.id));

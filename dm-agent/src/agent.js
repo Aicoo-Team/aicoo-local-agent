@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createCommandServer, MCP_SERVER_NAME, RUN_COMMAND_TOOL } from "./commands.js";
 import { Policy, CAPABILITIES } from "./policy.js";
+import { IdleClock } from "./idle.js";
 
 const READ_TOOLS = ["Read", "Glob", "Grep"];
 const WRITE_TOOLS = ["Write", "Edit", "NotebookEdit"];
@@ -296,8 +297,8 @@ export class LocalDmAgent {
   #escalations = 0;
   /** In-process MCP server exposing the owner's declared commands, or null if none. */
   #commandServer = null;
-  /** Set while a turn is in flight; refreshes that turn's idle timer. */
-  #keepAlive = null;
+  /** Set while a turn is in flight. Paused whenever the owner has a question in front of them. */
+  #idle = null;
 
   constructor({ workspace, state, approvals, ownerLabel, peerLabel, model, policy, audit, sandbox, log = console.log }) {
     this.workspace = realpathSync(workspace);
@@ -359,7 +360,7 @@ export class LocalDmAgent {
     });
     // An owner decision — however long it took — is progress: restart the idle clock
     // so a slow approval never causes the turn to be killed mid-flight.
-    this.#keepAlive?.();
+    this.#idle?.refresh();
     return decision;
   }
 
@@ -431,10 +432,25 @@ export class LocalDmAgent {
       return { allow: false, reason: "Pattern traversal is not allowed.", rule: "pattern-traversal", target: traversable };
     }
     const summary = `${toolName}(${JSON.stringify(input).slice(0, 160)}) in ${folder}`;
-    const allowed = await this.approvals.ask({ toolName, summary, kind: "read" });
+    const allowed = await this.#askOwner({ toolName, summary, kind: "read" });
     return allowed
       ? { allow: true, reason: "The owner approved this tool call.", rule: "owner-approved", target: String(target) }
       : { allow: false, reason: "The owner declined this tool call.", rule: "owner-declined", target: String(target) };
+  }
+
+  /**
+   * Every question to the owner goes through here, so none of them can forget to stop the
+   * clock. Waiting on a person is not the turn stalling — treating it as a stall killed the
+   * turn at 240s while the owner was still deciding, and the visitor was told the agent
+   * "kept failing" when it was in fact waiting for them.
+   */
+  async #askOwner(request) {
+    this.#idle?.pause();
+    try {
+      return await this.approvals.ask(request);
+    } finally {
+      this.#idle?.resume();
+    }
   }
 
   /**
@@ -461,7 +477,7 @@ export class LocalDmAgent {
       this.log(`[gate] first time ${this.peerLabel} has asked for this — ${printableSafe(key)}`);
     }
 
-    const allowed = await this.approvals.ask({
+    const allowed = await this.#askOwner({
       toolName,
       // The prompt must not promise persistence a guest relationship will not deliver, and
       // must not imply the owner knows who is asking when they do not.
@@ -515,7 +531,7 @@ export class LocalDmAgent {
     }
     this.#escalations += 1;
     this.log(`[gate] OUTSIDE the shared folders — asking the owner: ${printableSafe(real)}`);
-    const allowed = await this.approvals.ask({
+    const allowed = await this.#askOwner({
       toolName,
       // Who is asking belongs in the line, not just what for. A one-time link with a password
       // means the owner sent it to someone specific, so this is a real decision about a real
@@ -548,7 +564,7 @@ export class LocalDmAgent {
     }
     // Legible on purpose: a name plus the exact argv the owner wrote, never a shell string.
     const summary = `run "${entry.name}" (${entry.argv.join(" ")}) in ${this.workspace}`;
-    const allowed = await this.approvals.ask({ toolName: `command:${entry.name}`, summary, kind: "exec" });
+    const allowed = await this.#askOwner({ toolName: `command:${entry.name}`, summary, kind: "exec" });
     return allowed
       ? { allow: true, reason: "The owner approved this command.", rule: "owner-approved", target: entry.name }
       : { allow: false, reason: "The owner declined to run that command.", rule: "owner-declined", target: entry.name };
@@ -678,11 +694,8 @@ Compose the reply to send back now.`;
 
   async #runOnce(prompt) {
     const abortController = new AbortController();
-    let timer = setTimeout(() => abortController.abort(), TURN_IDLE_TIMEOUT_MS);
-    this.#keepAlive = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => abortController.abort(), TURN_IDLE_TIMEOUT_MS);
-    };
+    this.#idle = new IdleClock(TURN_IDLE_TIMEOUT_MS, () => abortController.abort());
+    this.#idle.start();
     try {
       const run = query({ prompt, options: this.#options(abortController) });
       let resultText = null;
@@ -701,8 +714,8 @@ Compose the reply to send back now.`;
       if (!reply) throw new Error("agent turn produced no reply text");
       return reply.trim();
     } finally {
-      clearTimeout(timer);
-      this.#keepAlive = null;
+      this.#idle.stop();
+      this.#idle = null;
     }
   }
 }
