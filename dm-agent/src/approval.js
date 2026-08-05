@@ -5,10 +5,17 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 /**
- * Owner approval for tool calls. Two modes, both suspend the turn until decided:
- *  - Interactive TTY: y/N prompt right in the owner's terminal.
- *  - Headless: a pending-approval file is written under the state dir; the owner
- *    resolves it from any terminal with `aicoo-dm-agent approve <id> --allow|--deny`.
+ * Owner approval for tool calls. Every question is published two ways at once and suspends the
+ * turn until one of them answers:
+ *  - a y/N prompt in the owner's terminal, when the agent has one;
+ *  - a pending-approval file under the state dir, resolvable from anywhere with
+ *    `aicoo-dm-agent approve <id> --allow|--deny`.
+ *
+ * Both channels are always open. Earlier this was either/or, keyed off isTTY, which meant the
+ * owner had to be sitting at the terminal that happened to start the agent — the one place they
+ * are least likely to be while someone else is using their machine. Whichever channel answers
+ * first wins; the other is torn down in the same finally.
+ *
  * No decision within timeoutSec -> deny (fail closed).
  */
 /**
@@ -38,11 +45,21 @@ export class ApprovalBroker {
   #addWaiter(fn) { this.#waiting.add(fn); }
   #removeWaiter(fn) { this.#waiting.delete(fn); }
 
-  constructor({ approvalsDir, timeoutSec = 300, autoAllowRead = false, log = console.log }) {
+  /**
+   * @param {object} options
+   * @param {Function|null} [options.prompt] Override the terminal channel. Receives
+   *   ({toolName, summary, kind, timeoutSec, signal}) and resolves "allow"/"deny", or never
+   *   resolves if that channel has nothing to say. Pass null to run file-only. Defaults to the
+   *   readline prompt when stdin/stdout are a TTY, and to file-only when they are not.
+   */
+  constructor({ approvalsDir, timeoutSec = 300, autoAllowRead = false, log = console.log, prompt }) {
     this.approvalsDir = approvalsDir;
     this.timeoutSec = timeoutSec;
     this.autoAllowRead = autoAllowRead;
     this.log = log;
+    this.prompt = prompt === undefined
+      ? (process.stdin.isTTY && process.stdout.isTTY ? (req) => this.#askTty(req) : null)
+      : prompt;
     mkdirSync(approvalsDir, { recursive: true });
     this.#sweepOrphans();
   }
@@ -72,78 +89,83 @@ export class ApprovalBroker {
       this.log(`[approval] auto-allowed (--auto-allow-read): ${toolName} ${summary}`);
       return true;
     }
-    if (process.stdin.isTTY && process.stdout.isTTY) {
-      return this.#askTty({ toolName, summary, kind });
-    }
-    return this.#askFile({ toolName, summary, kind });
-  }
 
-  async #askTty({ toolName, summary, kind }) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const timeoutController = new AbortController();
-    // Ctrl-C at a y/N prompt must return control, not wait out the approval window. Closing
-    // the readline interface resolves its question, which is enough to unwind the turn.
-    const cancel = () => { try { rl.close(); } catch { /* already closed */ } };
-    this.#addWaiter(cancel);
-    try {
-      process.stdout.write(""); // bell
-      const answer = await Promise.race([
-        // An out-of-folder read is the one decision the owner must not make on autopilot, so
-        // it gets its own banner rather than looking like the reads they have been waving
-        // through all session.
-        rl.question(`\n== ${BANNERS[kind] ?? BANNERS.exec} ==\n   tool: ${toolName}\n   ${summary}\n   allow? [y/N] (${this.timeoutSec}s, default deny) `),
-        delay(this.timeoutSec * 1000, "__timeout__", { signal: timeoutController.signal }).catch(() => "__aborted__"),
-      ]);
-      if (answer === "__timeout__") {
-        this.log(`[approval] timed out after ${this.timeoutSec}s -> deny`);
-        return false;
-      }
-      return /^y(es)?$/i.test(String(answer).trim());
-    } finally {
-      this.#removeWaiter(cancel);
-      timeoutController.abort();
-      rl.close();
-    }
-  }
-
-  async #askFile({ toolName, summary, kind }) {
     const id = randomUUID().slice(0, 8);
     const file = join(this.approvalsDir, `${id}.json`);
     const expiresAt = Date.now() + this.timeoutSec * 1000;
-    writeFileSync(file, JSON.stringify({ id, toolName, summary, kind, createdAt: new Date().toISOString(), expiresAt, decision: null }, null, 2));
+    writeFileSync(file, JSON.stringify(
+      { id, toolName, summary, kind, createdAt: new Date().toISOString(), expiresAt, decision: null },
+      null,
+      2,
+    ));
     this.log(`[approval] PENDING ${id}${kind === "escalation" ? " (OUTSIDE your shared folders)" : ""}: ${toolName} ${summary}`);
     this.log(`[approval]   resolve with: aicoo-dm-agent approve ${id} --allow   (or --deny)`);
+
+    const stop = new AbortController();
     let cancelled = false;
-    const cancel = () => { cancelled = true; };
+    const cancel = () => { cancelled = true; stop.abort(); };
     this.#addWaiter(cancel);
     try {
-      while (Date.now() < expiresAt) {
-        await delay(500);
-        if (cancelled) {
-          this.log(`[approval] ${id} -> cancelled (agent stopping)`);
-          return false;
-        }
-        let record;
-        try {
-          record = JSON.parse(readFileSync(file, "utf8"));
-        } catch {
-          this.log(`[approval] ${id} file unreadable/removed -> deny`);
-          return false;
-        }
-        if (record.decision === "allow") {
-          this.log(`[approval] ${id} -> ALLOWED by owner`);
-          return true;
-        }
-        if (record.decision === "deny") {
-          this.log(`[approval] ${id} -> DENIED by owner`);
-          return false;
-        }
+      const racers = [this.#watchFile({ id, file, expiresAt, isCancelled: () => cancelled })];
+      if (this.prompt) {
+        racers.push(
+          Promise.resolve(this.prompt({ toolName, summary, kind, timeoutSec: this.timeoutSec, signal: stop.signal }))
+            // A closed readline settles its question with nothing. That is not a decision — it
+            // means the other channel got there first, so leave the race to whoever did.
+            .then((answer) => (answer === undefined || answer === null ? new Promise(() => {}) : answer))
+            .catch(() => new Promise(() => {})),
+        );
       }
-      this.log(`[approval] ${id} timed out after ${this.timeoutSec}s -> deny`);
-      return false;
+      const outcome = await Promise.race(racers);
+      if (outcome === "allow") this.log(`[approval] ${id} -> ALLOWED by owner`);
+      else if (outcome === "cancelled") this.log(`[approval] ${id} -> cancelled (agent stopping)`);
+      else if (outcome === "timeout") this.log(`[approval] ${id} timed out after ${this.timeoutSec}s -> deny`);
+      else this.log(`[approval] ${id} -> DENIED by owner`);
+      return outcome === "allow";
     } finally {
       this.#removeWaiter(cancel);
+      // Tears down the terminal prompt when the file answered first, and vice versa.
+      stop.abort();
       rmSync(file, { force: true });
+    }
+  }
+
+  /** The file channel: poll our own pending record until someone writes a decision into it. */
+  async #watchFile({ id, file, expiresAt, isCancelled }) {
+    while (Date.now() < expiresAt) {
+      await delay(500);
+      if (isCancelled()) return "cancelled";
+      let record;
+      try {
+        record = JSON.parse(readFileSync(file, "utf8"));
+      } catch {
+        this.log(`[approval] ${id} file unreadable/removed -> deny`);
+        return "deny";
+      }
+      if (record.decision === "allow") return "allow";
+      if (record.decision === "deny") return "deny";
+    }
+    return "timeout";
+  }
+
+  /** The terminal channel. Resolves undefined when closed out from under us — see the race. */
+  async #askTty({ toolName, summary, kind, timeoutSec, signal }) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const close = () => { try { rl.close(); } catch { /* already closed */ } };
+    signal?.addEventListener("abort", close, { once: true });
+    try {
+      process.stdout.write(""); // bell
+      const answer = await rl.question(
+        // An out-of-folder read is the one decision the owner must not make on autopilot, so
+        // it gets its own banner rather than looking like the reads they have been waving
+        // through all session.
+        `\n== ${BANNERS[kind] ?? BANNERS.exec} ==\n   tool: ${toolName}\n   ${summary}\n   allow? [y/N] (${timeoutSec}s, default deny) `,
+      );
+      if (answer === undefined || answer === null) return undefined;
+      return /^y(es)?$/i.test(String(answer).trim()) ? "allow" : "deny";
+    } finally {
+      signal?.removeEventListener?.("abort", close);
+      close();
     }
   }
 }

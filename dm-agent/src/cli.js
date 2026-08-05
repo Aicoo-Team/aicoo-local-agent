@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createWriteStream, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { AicooApi } from "./api.js";
 import { LocalDmAgent } from "./agent.js";
@@ -18,8 +19,40 @@ const DEFAULT_SERVER = "https://www.aicoo.io";
 // Retrying forever is worse than giving up: it burns a turn every poll and blocks the queue.
 const MAX_MESSAGE_ATTEMPTS = 3;
 
+/**
+ * Everything the agent says also lands in <state-dir>/agent.log.
+ *
+ * The terminal is the wrong and only place to have to be. An owner who started the agent in a
+ * window they have since closed, or scrolled past, has no way to see what a visitor asked or
+ * what is waiting on them — and nothing outside this process can watch for it either. A file
+ * next to the state gives both: the owner can look back, and a monitor can tail it.
+ */
+let logSink = null;
+let logPath = null;
+
+function setLogFile(path) {
+  if (logPath === path) return; // start resolves the dir twice; do not open the file twice
+  logPath = path;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    // A log that grows without bound eventually becomes the reason someone stops keeping it.
+    if (existsSync(path) && statSync(path).size > 5_000_000) renameSync(path, `${path}.1`);
+    logSink = createWriteStream(path, { flags: "a" });
+    // A broken log must never take the agent down with it — this is a convenience, not the job.
+    logSink.on("error", () => { logSink = null; });
+  } catch {
+    logSink = null;
+  }
+}
+
 function log(line) {
-  console.log(`[${new Date().toISOString()}] ${line}`);
+  const stamped = `[${new Date().toISOString()}] ${line}`;
+  console.log(stamped);
+  try {
+    logSink?.write(`${stamped}\n`);
+  } catch {
+    logSink = null;
+  }
 }
 
 function parseArgs(argv) {
@@ -59,6 +92,7 @@ Usage:
                                                                can open your agent and ask it
   aicoo-dm-agent approve <id> --allow|--deny --peer <peer>     resolve a pending tool approval
   aicoo-dm-agent pending --peer <peer>                         list pending tool approvals
+                 (share links have no peer: pass --state-dir <dir> instead, the one you started with)
   aicoo-dm-agent grants --peer <peer> [--revoke <key>]         standing capability grants
                                      [--revoke-all]           (what you already said yes to)
   aicoo-dm-agent start --dry-run-message "…" [options]         one local turn, no network send
@@ -146,7 +180,14 @@ async function main() {
   // ── Local-only commands (no token needed) ──
   if (command === "approve" || command === "pending") {
     const peer = args.peer;
-    if (!peer) throw new Error("--peer is required (state is scoped per peer)");
+    // A share-link agent has no peer — the visitor is a stranger by design. Demanding one made
+    // the file channel unusable in the one mode it matters most for, even though stateDirFor
+    // only needs a peer when it has to derive the path itself.
+    if (!peer && !args["state-dir"]) {
+      throw new Error(
+        "need --peer <peer>, or --state-dir <dir> for a share-link agent (use the same --state-dir you started it with)",
+      );
+    }
     const me = args.me ?? "me";
     // approvals dir must match the running agent's; allow explicit --state-dir
     const dir = join(stateDirFor({ server, me, peer, override: args["state-dir"] }), "approvals");
@@ -295,6 +336,9 @@ async function main() {
   }
 
   // ── start: the main loop ──
+  // When the dir was given outright there is no reason to wait for identity() to start keeping
+  // the log — the lines before that point are the ones explaining a failure to come up at all.
+  if (args["state-dir"]) setLogFile(join(args["state-dir"], "agent.log"));
   const workspace = args.workspace ?? process.cwd();
   const pollMs = Number(args.poll ?? 3000);
   // The policy has to be read before --peer is validated: a share-link policy answers whoever
@@ -323,6 +367,9 @@ async function main() {
   }
 
   const stateDir = stateDirFor({ server, me: me.username, peer, override: args["state-dir"] });
+  mkdirSync(stateDir, { recursive: true });
+  // From here on, everything logged is also readable from outside this process — see setLogFile.
+  setLogFile(join(stateDir, "agent.log"));
 
   // One agent per state directory, claimed before anything else touches it.
   let releaseLock = () => {};
