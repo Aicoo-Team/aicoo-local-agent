@@ -37,16 +37,15 @@ faithful to the user's request. If the request names files or folders, include
 that detail in the delegated task; the peer's bridge will enforce any approved
 folder policy.
 
-If the command reports approval is needed, tell the user that the peer must
-approve in Aicoo and that this turn is parked. Do not poll or repeatedly post
-"still waiting" messages.
+By default, `ccd delegate` stays open while approval or execution is pending,
+then prints the correlated peer reply. Present that reply naturally to the
+user. Do not stop merely because the command first reports `delegated` or
+`Approval requested`.
 
-If the command reports delegated, tell the user the task was sent and that the
-reply will arrive back in this local session. Stop the turn.
-
-When an Aicoo reply arrives later in this session, present the peer local
-agent's answer to the user. Do not send another reply back to the peer unless
-the user explicitly asks for a follow-up.
+Use `--no-wait` only when the user explicitly wants asynchronous dispatch. In
+that mode, tell the user the task was sent and that the reply will arrive later
+in the local session. Do not send another reply back to the peer unless the
+user explicitly asks for a follow-up.
 
 ## Safety
 

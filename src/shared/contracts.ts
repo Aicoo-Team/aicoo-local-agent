@@ -210,6 +210,18 @@ export type LocalAgentDelegationResponse =
       clientMessageId: string;
       correlationId?: string;
       duplicate: boolean;
+      /** A folder approval is parked behind the already-active collaboration grant. */
+      approvalKind?: "collaboration" | "folder";
+      approvalId?: string;
+    }
+  | {
+      status: "folder_access_requested";
+      communicationSession: CommunicationSession;
+      clientMessageId: string;
+      correlationId?: string;
+      duplicate: boolean;
+      approvalKind: "folder";
+      approvalId: string;
     }
   | {
       status: "delegated";

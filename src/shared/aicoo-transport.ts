@@ -12,6 +12,7 @@ import {
   type PollDeviceCodeResponse,
 } from "./http-client.js";
 import { describeTimeoutTiming, startEventLoopMonitor } from "./event-loop.js";
+import type { DelegationRequestOptions } from "./transport.js";
 import type {
   CommunicationGrant,
   CommunicationSession,
@@ -32,6 +33,7 @@ import type {
 
 const LA = "/api/v1/local-agent";
 const LR = "/api/v1/local-realtime";
+const DEFAULT_DELEGATION_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * Attempts per call. Two, not more: the presence caps are bounded by the control plane's 60s
@@ -358,8 +360,63 @@ export class AicooTransport extends HttpMessageTransport {
     return this.requestJson(`${LA}/messages`, { method: "POST", body: input });
   }
 
-  override async delegateLocalAgentTask(input: LocalAgentDelegationInput): Promise<LocalAgentDelegationResponse> {
-    return this.requestJson(`${LA}/delegations`, { method: "POST", body: input });
+  override async delegateLocalAgentTask(
+    input: LocalAgentDelegationInput,
+    options: DelegationRequestOptions = {},
+  ): Promise<LocalAgentDelegationResponse> {
+    const response = await this.requestJson<unknown>(`${LA}/delegations`, {
+      method: "POST",
+      body: input,
+      timeoutMs: options.timeoutMs ?? DEFAULT_DELEGATION_REQUEST_TIMEOUT_MS,
+    });
+    if (isCanonicalDelegationResponse(response)) return response;
+
+    const row = hostedDelegationRow(response);
+    const communicationSession = (await this.listCommunicationSessions())
+      .find((session) => session.id === row.communicationSessionId);
+    if (!communicationSession) {
+      throw new ApiError(500, "invalid_response", {
+        message: `Delegation response referenced unknown communication session ${row.communicationSessionId}`,
+      });
+    }
+
+    const common = {
+      communicationSession,
+      clientMessageId: input.clientMessageId,
+      ...(stringValue(row.correlationId) ?? input.correlationId
+        ? { correlationId: stringValue(row.correlationId) ?? input.correlationId }
+        : {}),
+      duplicate: typeof row.duplicate === "boolean" ? row.duplicate : false,
+    };
+    if (row.status === "grant_requested" || row.status === "folder_access_requested") {
+      const approvalId = stringValue(row.approvalId);
+      if (row.status === "folder_access_requested" && !approvalId) {
+        throw new ApiError(500, "invalid_response", {
+          message: "Folder-access response is missing approvalId",
+        });
+      }
+      return {
+        status: row.status,
+        ...common,
+        approvalKind: row.status === "folder_access_requested" || approvalId ? "folder" : "collaboration",
+        ...(approvalId ? { approvalId } : {}),
+      } as LocalAgentDelegationResponse;
+    }
+
+    const messageId = requiredDelegationString(row, "messageId");
+    const deliveryId = requiredDelegationString(row, "deliveryId");
+    const queuedAt = requiredDelegationString(row, "queuedAt");
+    return {
+      status: "delegated",
+      ...common,
+      receipt: {
+        messageId,
+        deliveryId,
+        status: "queued",
+        duplicate: common.duplicate,
+        queuedAt,
+      },
+    };
   }
 
   override async acknowledgeDelivery(input: DeliveryAckInput): Promise<void> {
@@ -429,11 +486,20 @@ export class AicooTransport extends HttpMessageTransport {
 
   async requestToolApproval(
     input: ToolApprovalRequest,
-  ): Promise<{ approvalId: string; status: string; decision: string | null }> {
+  ): Promise<{
+    approvalId: string;
+    status: string;
+    decision: "allow" | "deny" | null;
+    scope?: "once" | "session" | null;
+  }> {
     return this.requestJson(`${LA}/tool-approvals`, { method: "POST", body: input });
   }
 
-  async getToolApproval(approvalId: string): Promise<{ status: string; decision: "allow" | "deny" | null }> {
+  async getToolApproval(approvalId: string): Promise<{
+    status: string;
+    decision: "allow" | "deny" | null;
+    scope?: "once" | "session" | null;
+  }> {
     return this.requestJson(`${LA}/tool-approvals/${encodeURIComponent(approvalId)}`);
   }
 
@@ -472,6 +538,51 @@ interface CommRow {
   activatedAt: string | null;
   grantExpiresAt: string | null;
   revokedAt: string | null;
+}
+
+type HostedDelegationRow = Record<string, unknown> & {
+  status: "grant_requested" | "folder_access_requested" | "delegated";
+  communicationSessionId: string;
+};
+
+function hostedDelegationRow(response: unknown): HostedDelegationRow {
+  if (!response || typeof response !== "object") {
+    throw new ApiError(500, "invalid_response", { message: "Delegation response must be an object" });
+  }
+  const row = response as Record<string, unknown>;
+  if (
+    row.status !== "grant_requested"
+    && row.status !== "folder_access_requested"
+    && row.status !== "delegated"
+  ) {
+    throw new ApiError(500, "invalid_response", { message: "Delegation response has an invalid status" });
+  }
+  if (!stringValue(row.communicationSessionId)) {
+    throw new ApiError(500, "invalid_response", { message: "Delegation response is missing communicationSessionId" });
+  }
+  return row as HostedDelegationRow;
+}
+
+function isCanonicalDelegationResponse(response: unknown): response is LocalAgentDelegationResponse {
+  if (!response || typeof response !== "object") return false;
+  const row = response as Record<string, unknown>;
+  const recognizedStatus = (
+    row.status === "grant_requested"
+    || row.status === "folder_access_requested"
+    || row.status === "delegated"
+  );
+  if (!recognizedStatus || !row.communicationSession || typeof row.communicationSession !== "object") return false;
+  return row.status !== "folder_access_requested" || Boolean(stringValue(row.approvalId));
+}
+
+function requiredDelegationString(row: Record<string, unknown>, key: string): string {
+  const value = stringValue(row[key]);
+  if (!value) throw new ApiError(500, "invalid_response", { message: `Delegation response is missing ${key}` });
+  return value;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function mapCommSession(row: CommRow): CommunicationSession {
