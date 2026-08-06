@@ -153,6 +153,11 @@ ccd start --adapter codex
 The bridge registers your local runtime as reachable. It does not give teammates access to your
 files or tools unless you approve a relationship access preset and folder.
 
+The localhost helper supports native folder and file selection on macOS and Windows. The picker
+always opens on the same machine as the browser, because the browser calls the helper on
+`127.0.0.1`; it does not select files or folders on a remote receiving machine. Cross-device
+picker routing is a separate feature.
+
 Keep this process running while you want your local agent to receive requests.
 Use `claude-code` when Claude Code is the local runtime you want to expose, or
 `codex` when Codex should answer.
