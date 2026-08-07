@@ -321,7 +321,7 @@ function inbound(
   id: string,
   overrides: Partial<Pick<
     InboundMessage,
-    "replyTo" | "correlationId" | "communicationSessionId"
+    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId"
   >> = {},
 ): InboundMessage {
   return {
@@ -395,7 +395,27 @@ describe("CodeAdapter just-in-time tool approval", () => {
     return join(directory, "relationships.json");
   }
 
-  async function startedAdapter(approvalGateway?: ReturnType<typeof gateway>, policyFile?: string) {
+  function readPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-read-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [process.cwd()],
+      }],
+    }));
+    return policyFile;
+  }
+
+  async function startedAdapter(
+    approvalGateway?: ReturnType<typeof gateway>,
+    policyFile?: string,
+    collaborationId?: string,
+  ) {
     const driver = new FakeClaudeAgentDriver();
     // canUseTool fires mid-turn; hold the turn open so the active message (and its
     // communicationSessionId) is still there, as it is in a real session.
@@ -410,7 +430,11 @@ describe("CodeAdapter just-in-time tool approval", () => {
     });
     cleanups.push(() => adapter.close());
     await adapter.initialize();
-    await adapter.deliverToSession("claude-managed-1", inbound("msg_appr"), "new_turn");
+    await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_appr", { ...(collaborationId ? { collaborationId } : {}) }),
+      "new_turn",
+    );
     return driver.starts[0]!.options;
   }
 
@@ -454,6 +478,15 @@ describe("CodeAdapter just-in-time tool approval", () => {
     // allowance. The bridge must not silently broaden a one-time decision by itself.
     await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
     expect(g.asked).toHaveLength(3);
+  });
+
+  it("asks the collaboration gate even when legacy relationship policy permits the read", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g, readPolicyFile(), "collab-1");
+
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
+      .toMatchObject({ behavior: "allow" });
+    expect(g.asked).toHaveLength(1);
   });
 
   it("asks the owner even before any policy file exists", async () => {

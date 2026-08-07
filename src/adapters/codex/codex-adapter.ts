@@ -447,7 +447,12 @@ export class CodexAdapter implements RuntimeAdapter {
       this.finishTurn(session, active, planText);
       return;
     }
-    const brokerResult = executeBrokerPlan(active.brokerPolicy, active.message, planText);
+    const brokerResult = await executeBrokerPlan(
+      active.brokerPolicy,
+      active.message,
+      planText,
+      this.#config.approvalGateway,
+    );
     const finalTurn = this.#driver.startTurn({
       prompt: formatBrokerResult(active.message, brokerResult),
       cwd: this.#config.cwd,
@@ -675,10 +680,18 @@ interface BrokerResult {
   results: Array<{ tool: string; filePath?: string; ok: boolean; content?: string; error?: string }>;
 }
 
-function executeBrokerPlan(policy: RelationshipPolicy, message: InboundMessage, planText: string | undefined): BrokerResult {
+async function executeBrokerPlan(
+  policy: RelationshipPolicy,
+  message: InboundMessage,
+  planText: string | undefined,
+  approvalGateway?: ToolApprovalGateway,
+): Promise<BrokerResult> {
   const parsed = parseBrokerPlan(planText);
   const operations = parsed.operations.slice(0, 8);
-  const results = operations.map((operation) => executeBrokerOperation(policy, message, operation));
+  const results: BrokerResult["results"] = [];
+  for (const operation of operations) {
+    results.push(await executeBrokerOperation(policy, message, operation, approvalGateway));
+  }
   if (operations.length === 0 && !parsed.response) {
     results.push({ tool: "Plan", ok: false, error: "Codex did not request a valid broker operation" });
   }
@@ -707,11 +720,12 @@ function extractJsonObject(text: string): string | undefined {
   return text.slice(start, end + 1);
 }
 
-function executeBrokerOperation(
+async function executeBrokerOperation(
   policy: RelationshipPolicy,
   message: InboundMessage,
   operation: BrokerOperation,
-): BrokerResult["results"][number] {
+  approvalGateway?: ToolApprovalGateway,
+): Promise<BrokerResult["results"][number]> {
   const tool = typeof operation.tool === "string" ? operation.tool : "";
   const filePath = typeof operation.file_path === "string" ? operation.file_path : "";
   if (!["Read", "Write", "Edit"].includes(tool)) {
@@ -720,6 +734,24 @@ function executeBrokerOperation(
   const decision = policy.authorize({ toolName: tool, input: { file_path: filePath } }, message);
   if (decision.behavior === "deny") {
     return { tool, ...(filePath ? { filePath } : {}), ok: false, error: decision.message ?? "Denied by relationship policy" };
+  }
+  if (message.collaborationId) {
+    if (!approvalGateway || !message.communicationSessionId) {
+      return { tool, filePath, ok: false, error: "Collaboration tool approval is unavailable" };
+    }
+    const outcome = await awaitToolApproval(
+      approvalGateway,
+      {
+        communicationSessionId: message.communicationSessionId,
+        sessionHandle: message.target.sessionHandle ?? "",
+        messageId: message.id,
+        toolName: tool,
+        toolInputSummary: `${tool} ${filePath}`.slice(0, 500),
+      },
+    );
+    if (outcome.behavior !== "allow") {
+      return { tool, filePath, ok: false, error: outcome.message ?? "Denied by owner" };
+    }
   }
   const canonicalPath = decision.updatedInput?.file_path;
   if (typeof canonicalPath !== "string") {

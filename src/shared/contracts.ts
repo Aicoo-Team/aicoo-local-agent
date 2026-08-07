@@ -94,6 +94,7 @@ export interface MessageEnvelope {
   id: string;
   clientMessageId: string;
   communicationSessionId?: string;
+  collaborationId?: string;
   conversationId?: string;
   senderPrincipalId: string;
   /**

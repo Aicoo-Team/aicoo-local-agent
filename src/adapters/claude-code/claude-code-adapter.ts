@@ -445,7 +445,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       try {
         const relationshipPolicy = RelationshipPolicy.fromFile(this.#config.relationshipPolicyFile, this.#config.cwd);
         const decision = relationshipPolicy.authorize({ toolName, input }, activeMessage);
-        if (decision.behavior === "allow") {
+        // Legacy communication sessions keep their relationship-policy fast path. Mode 2 tasks
+        // must still ask the hosted collaboration grant gate, even when the local path sandbox
+        // permits the call; a later same-tool call may then auto-resolve there.
+        if (decision.behavior === "allow" && !activeMessage?.collaborationId) {
           this.#config.log?.(`claude tool allowed: ${toolName}`);
           return { behavior: "allow", ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}) };
         }
@@ -471,7 +474,12 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           },
           { log: this.#config.log },
         );
-        if (outcome.behavior === "allow") return { behavior: "allow" };
+        if (outcome.behavior === "allow") {
+          return {
+            behavior: "allow",
+            ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}),
+          };
+        }
         return { behavior: "deny", message: outcome.message };
       } catch (error) {
         this.#config.log?.(`claude relationship policy could not be loaded; denying tool ${toolName}: ${String(error)}`);

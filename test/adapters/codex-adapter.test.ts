@@ -98,6 +98,56 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[1]?.prompt).toContain("[Aicoo brokered file-operation results]");
   });
 
+  it("asks the collaboration gate before executing a brokered file operation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-collab-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    writeFileSync(join(project, "README.md"), "approved content", "utf8");
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "read-project",
+      folder: project,
+    });
+    const driver = new FakeCodexDriver((prompt) => prompt.includes("[Aicoo brokered file-operation request]")
+      ? JSON.stringify({ operations: [{ tool: "Read", file_path: "README.md" }] })
+      : "done");
+    const asked: Array<{ toolName: string; toolInputSummary: string }> = [];
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input);
+          return { approvalId: "appr-1", status: "allow", decision: "allow" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession(
+      "codex-managed-1",
+      inbound("msg_collab_policy", { collaborationId: "collab-1" }),
+      "queue",
+    );
+    await events;
+
+    expect(asked).toEqual([{ toolName: "Read", toolInputSummary: "Read README.md", communicationSessionId: "comm_1", sessionHandle: "rs_b", messageId: "msg_collab_policy" }]);
+  });
+
   it("passes edit-project folders as Codex writable roots", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-writable-roots-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -416,7 +466,10 @@ async function waitForIdle(adapter: CodexAdapter, sessionHandle: string, timeout
 
 function inbound(
   id: string,
-  overrides: Partial<Pick<InboundMessage, "replyTo" | "correlationId" | "communicationSessionId">> = {},
+  overrides: Partial<Pick<
+    InboundMessage,
+    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId"
+  >> = {},
 ): InboundMessage {
   return {
     id,
