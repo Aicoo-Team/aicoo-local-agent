@@ -90,11 +90,29 @@ export interface MessageTarget {
   sessionHandle?: string;
 }
 
+export type CollaborationTurnType = "task" | "question" | "response" | "result" | "control";
+export type CollaborationTurnOutcome = "respond" | "needs_owner" | "propose_complete" | "failed";
+
+export interface CollaborationTurnInput {
+  clientTurnId: string;
+  parentTurnId?: string;
+  type: CollaborationTurnType;
+  expectsReply: boolean;
+  outcome?: CollaborationTurnOutcome;
+}
+
+export interface CollaborationTurnEnvelope extends CollaborationTurnInput {
+  turnId: string;
+  sequence: number;
+}
+
 export interface MessageEnvelope {
   id: string;
   clientMessageId: string;
   communicationSessionId?: string;
   collaborationId?: string;
+  collaborationRole?: "requester" | "recipient";
+  collaborationTurn?: CollaborationTurnEnvelope;
   conversationId?: string;
   senderPrincipalId: string;
   /**
@@ -154,6 +172,9 @@ export interface RuntimeEvent<T = Record<string, unknown>> {
     | "comm.declined"
     | "comm.revoked"
     | "comm.expired"
+    | "collaboration.completed"
+    | "collaboration.revoked"
+    | "collaboration.expired"
     | "relationship.policy_update";
   endpointId: string;
   createdAt: string;
@@ -252,6 +273,7 @@ export interface GrantScopedSendMessageInput {
   payload: Record<string, unknown>;
   replyTo?: string;
   correlationId?: string;
+  collaborationTurn?: CollaborationTurnInput;
 }
 
 export interface HumanInboxSendMessageInput {

@@ -186,6 +186,23 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(driver.received[0]?.shouldQuery).toBe(false);
   });
 
+  it("queries Claude for a reply turn only when the server marks expectsReply", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const reply = inbound("msg_turn_2", {
+      replyTo: "msg_turn_1",
+      collaborationId: "collab-1",
+      collaborationTurn: collaborationTurn("turn-2", "turn-1", true),
+    });
+    await adapter.deliverToSession("claude-managed-1", reply, "queue");
+
+    expect(driver.received[0]?.shouldQuery).toBe(true);
+    expect(JSON.stringify(driver.received[0]?.message)).toContain("bounded agent collaboration turn");
+  });
+
   it("reports busy and unsupported steering honestly", async () => {
     const driver = new FakeClaudeAgentDriver();
     driver.resultDelayMs = 100;
@@ -321,7 +338,7 @@ function inbound(
   id: string,
   overrides: Partial<Pick<
     InboundMessage,
-    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId"
+    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId" | "collaborationTurn"
   >> = {},
 ): InboundMessage {
   return {
@@ -344,6 +361,18 @@ function inbound(
     trust: "untrusted_external_content",
     correlationId: "corr_initial",
     ...overrides,
+  };
+}
+
+function collaborationTurn(turnId: string, parentTurnId: string, expectsReply: boolean) {
+  return {
+    turnId,
+    clientTurnId: `client-${turnId}`,
+    parentTurnId,
+    sequence: 2,
+    type: "question" as const,
+    expectsReply,
+    outcome: "respond" as const,
   };
 }
 

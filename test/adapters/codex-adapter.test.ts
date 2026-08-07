@@ -260,6 +260,27 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[1]?.resumeThreadId).toBe(adapter.providerThreadId("codex-managed-1"));
   });
 
+  it("runs Codex reasoning for an explicit collaboration reply turn", async () => {
+    const driver = new FakeCodexDriver('{"outcome":"respond","expectsReply":false,"text":"done"}');
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_turn_2", {
+      replyTo: "msg_turn_1",
+      collaborationId: "collab-1",
+      collaborationTurn: collaborationTurn("turn-2", "turn-1", true),
+    }), "queue");
+
+    expect(driver.turns[0]?.prompt).not.toContain("reply for context only");
+    expect(driver.turns[0]?.prompt).toContain("bounded agent collaboration turn");
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started", inReplyTo: "msg_turn_2" }),
+      expect.objectContaining({ type: "reply", inReplyTo: "msg_turn_2" }),
+    ]);
+  });
+
   it("reports busy and unsupported steering honestly", async () => {
     const driver = new FakeCodexDriver();
     driver.resultDelayMs = 100;
@@ -468,7 +489,7 @@ function inbound(
   id: string,
   overrides: Partial<Pick<
     InboundMessage,
-    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId"
+    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId" | "collaborationTurn"
   >> = {},
 ): InboundMessage {
   return {
@@ -491,5 +512,17 @@ function inbound(
     trust: "untrusted_external_content",
     correlationId: "corr_initial",
     ...overrides,
+  };
+}
+
+function collaborationTurn(turnId: string, parentTurnId: string, expectsReply: boolean) {
+  return {
+    turnId,
+    clientTurnId: `client-${turnId}`,
+    parentTurnId,
+    sequence: 2,
+    type: "question" as const,
+    expectsReply,
+    outcome: "respond" as const,
   };
 }

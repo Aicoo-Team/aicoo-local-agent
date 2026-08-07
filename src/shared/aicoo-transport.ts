@@ -683,6 +683,9 @@ const EVENT_TYPE_MAP: Record<string, RuntimeEvent["type"]> = {
   "grant.activated": "comm.activated",
   "grant.declined": "comm.declined",
   "grant.revoked": "comm.revoked",
+  "collaboration.completed": "collaboration.completed",
+  "collaboration.revoked": "collaboration.revoked",
+  "collaboration.expired": "collaboration.expired",
   "message.dispatch": "message.dispatch",
   "relationship.policy_update": "relationship.policy_update",
 };

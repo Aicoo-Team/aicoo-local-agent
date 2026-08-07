@@ -5,7 +5,12 @@ import {
   upsertRelationshipPreset,
   type RelationshipAccessPreset,
 } from "../security/relationship-policy.js";
-import type { LocalAgentDelegationInput, LocalAgentDelegationResponse, RuntimeEvent } from "../shared/contracts.js";
+import type {
+  CollaborationTurnInput,
+  LocalAgentDelegationInput,
+  LocalAgentDelegationResponse,
+  RuntimeEvent,
+} from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
@@ -292,6 +297,21 @@ export class RuntimeBridge {
         this.rotateDefaultRouteAfterActivation(sessionHandle);
       }
       if (commSessionId) await this.retryPendingDelegations(commSessionId);
+    } else if (
+      event.type === "collaboration.completed"
+      || event.type === "collaboration.revoked"
+      || event.type === "collaboration.expired"
+    ) {
+      const collaborationId = stringField(event.data, "collaborationId");
+      if (collaborationId) {
+        const commSessionIds = this.options.spool.blockCollaboration(
+          collaborationId,
+          event.type.replace(".", "_"),
+        );
+        for (const commSessionId of commSessionIds) {
+          await this.options.adapter.releaseCommunicationSession?.(commSessionId);
+        }
+      }
     } else if (event.type === "relationship.policy_update") {
       this.applyRelationshipPolicyUpdate(event.data);
     }
@@ -453,13 +473,20 @@ export class RuntimeBridge {
             const original = this.options.spool.getMessage(event.inReplyTo);
             if (!original) {
               this.options.log?.(`adapter reply ignored: inbound message ${event.inReplyTo} is not in the spool`);
-            } else if (!original.envelope.replyTo) {
+            } else if (
+              !original.envelope.replyTo
+              || original.envelope.collaborationTurn?.expectsReply === true
+            ) {
               const runtimeEventId = typeof event.payload?.runtimeEventId === "string"
                 ? event.payload.runtimeEventId
                 : `${nativeHandle}:${event.cursor ?? id("runtime_event")}`;
-              const text = typeof event.payload?.text === "string"
+              const rawText = typeof event.payload?.text === "string"
                 ? event.payload.text
                 : JSON.stringify(event.payload ?? {});
+              const collaborationReply = original.envelope.collaborationTurn
+                ? parseCollaborationRuntimeReply(rawText, runtimeEventId, original.envelope.collaborationTurn.turnId)
+                : undefined;
+              const text = collaborationReply?.text ?? rawText;
               const correlationId = event.correlationId
                 ?? original.envelope.correlationId
                 ?? original.messageId;
@@ -478,6 +505,7 @@ export class RuntimeBridge {
                 payload: { text, source: this.options.runtime ?? "claude-code" },
                 replyTo: original.messageId,
                 correlationId,
+                ...(collaborationReply ? { collaborationTurn: collaborationReply.turn } : {}),
               });
             }
           }
@@ -508,6 +536,7 @@ export class RuntimeBridge {
             payload: reply.payload,
             replyTo: reply.replyTo,
             correlationId: reply.correlationId,
+            ...(reply.collaborationTurn ? { collaborationTurn: reply.collaborationTurn } : {}),
           });
           this.options.spool.markOutboundSent(reply.eventId);
         } catch (error) {
@@ -536,6 +565,45 @@ export class RuntimeBridge {
       .map((mapping) => mapping.serverHandle)
       .find((serverHandle) => serverHandle !== activatedServerHandle);
     if (replacement) this.#pendingDefaultRoute = replacement;
+  }
+}
+
+export function parseCollaborationRuntimeReply(
+  rawText: string,
+  runtimeEventId: string,
+  parentTurnId: string,
+): { text: string; turn: CollaborationTurnInput } {
+  const fallback = {
+    text: rawText,
+    turn: {
+      clientTurnId: `runtime-turn:${runtimeEventId}`,
+      parentTurnId,
+      type: "response" as const,
+      expectsReply: false,
+      outcome: "respond" as const,
+    },
+  };
+  try {
+    const parsed = JSON.parse(rawText.trim()) as Record<string, unknown>;
+    const outcomes = new Set(["respond", "needs_owner", "propose_complete", "failed"]);
+    if (typeof parsed.text !== "string" || typeof parsed.outcome !== "string" || !outcomes.has(parsed.outcome)) {
+      return fallback;
+    }
+    const outcome = parsed.outcome as CollaborationTurnInput["outcome"];
+    const expectsReply = (outcome === "respond" || outcome === "propose_complete")
+      && parsed.expectsReply === true;
+    return {
+      text: parsed.text,
+      turn: {
+        clientTurnId: `runtime-turn:${runtimeEventId}`,
+        parentTurnId,
+        type: expectsReply ? "question" : "response",
+        expectsReply,
+        outcome,
+      },
+    };
+  } catch {
+    return fallback;
   }
 }
 
