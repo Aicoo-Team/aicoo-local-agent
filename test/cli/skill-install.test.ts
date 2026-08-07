@@ -17,6 +17,8 @@ describe("Codex skill installer", () => {
     expect(installed).toContain("local Aicoo bridge <-> Aicoo relay");
     expect(installed).toContain("stays open while approval or execution is pending");
     expect(installed).toContain("Use `--no-wait` only when the user explicitly wants asynchronous dispatch");
+    expect(installed).toContain("--context-file");
+    expect(installed).toContain("Never attach raw memory");
   });
 
   it("can be safely ensured during bridge start", () => {

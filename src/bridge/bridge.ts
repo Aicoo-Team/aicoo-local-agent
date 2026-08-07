@@ -411,6 +411,7 @@ export class RuntimeBridge {
         const result = await this.options.transport.delegateLocalAgentTask({
           target: pending.target,
           task: pending.task,
+          ...(pending.context ? { context: pending.context } : {}),
           sessionHandle: pending.sessionHandle,
           clientMessageId: pending.clientMessageId,
           ...(pending.correlationId ? { correlationId: pending.correlationId } : {}),
@@ -419,6 +420,7 @@ export class RuntimeBridge {
         recordDelegationResult(this.options.spool, result, {
           target: pending.target,
           task: pending.task,
+          context: pending.context,
           sessionHandle: pending.sessionHandle,
           expiresAt: pending.expiresAt,
           requestedTtlMinutes: pending.requestedTtlMinutes,
@@ -542,6 +544,7 @@ export async function requestRuntimeDelegation(input: {
   spool: BridgeSpool;
   target: LocalAgentDelegationInput["target"];
   task: LocalAgentDelegationInput["task"];
+  context?: LocalAgentDelegationInput["context"];
   sessionHandle: string;
   clientMessageId: string;
   correlationId?: string;
@@ -553,6 +556,7 @@ export async function requestRuntimeDelegation(input: {
   const delegation = {
     target: input.target,
     task: input.task,
+    ...(input.context ? { context: input.context } : {}),
     sessionHandle: input.sessionHandle,
     clientMessageId: input.clientMessageId,
     ...(input.correlationId ? { correlationId: input.correlationId } : {}),
@@ -564,6 +568,7 @@ export async function requestRuntimeDelegation(input: {
   recordDelegationResult(input.spool, result, {
     target: input.target,
     task: input.task,
+    context: input.context,
     sessionHandle: input.sessionHandle,
     expiresAt,
     requestedTtlMinutes: input.requestedTtlMinutes,
@@ -577,6 +582,7 @@ function recordDelegationResult(
   input: {
     target: LocalAgentDelegationInput["target"];
     task: LocalAgentDelegationInput["task"];
+    context?: LocalAgentDelegationInput["context"];
     sessionHandle: string;
     expiresAt: string;
     requestedTtlMinutes?: number;
@@ -587,6 +593,7 @@ function recordDelegationResult(
       clientMessageId: result.clientMessageId,
       target: input.target,
       task: input.task,
+      ...(input.context ? { context: input.context } : {}),
       sessionHandle: input.sessionHandle,
       ...(result.correlationId ? { correlationId: result.correlationId } : {}),
       ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
@@ -604,6 +611,7 @@ function recordDelegationResult(
       clientMessageId: result.clientMessageId,
       target: input.target,
       task: input.task,
+      ...(input.context ? { context: input.context } : {}),
       sessionHandle: input.sessionHandle,
       ...(result.correlationId ? { correlationId: result.correlationId } : {}),
       ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
@@ -617,6 +625,7 @@ function recordDelegationResult(
     clientMessageId: result.clientMessageId,
     target: input.target,
     task: input.task,
+    ...(input.context ? { context: input.context } : {}),
     sessionHandle: input.sessionHandle,
     ...(result.correlationId ? { correlationId: result.correlationId } : {}),
     ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),

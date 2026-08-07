@@ -52,6 +52,7 @@ export interface PendingDelegation {
   clientMessageId: string;
   target: LocalAgentDelegationInput["target"];
   task: LocalAgentDelegationInput["task"];
+  context?: LocalAgentDelegationInput["context"];
   sessionHandle: string;
   correlationId?: string;
   requestedTtlMinutes?: number;
@@ -131,6 +132,7 @@ export class BridgeSpool {
         client_message_id TEXT PRIMARY KEY,
         target_json TEXT NOT NULL,
         task_json TEXT NOT NULL,
+        context_json TEXT,
         session_handle TEXT NOT NULL,
         correlation_id TEXT,
         requested_ttl_minutes INTEGER,
@@ -148,6 +150,12 @@ export class BridgeSpool {
       CREATE INDEX IF NOT EXISTS idx_pending_delegations_status
         ON pending_delegations(status, comm_session_id, expires_at);
     `);
+    const pendingColumns = this.db.prepare("PRAGMA table_info(pending_delegations)").all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!pendingColumns.some((column) => column.name === "context_json")) {
+      this.db.exec("ALTER TABLE pending_delegations ADD COLUMN context_json TEXT");
+    }
   }
 
   close(): void {
@@ -405,6 +413,7 @@ export class BridgeSpool {
     clientMessageId: string;
     target: LocalAgentDelegationInput["target"];
     task: LocalAgentDelegationInput["task"];
+    context?: LocalAgentDelegationInput["context"];
     sessionHandle: string;
     correlationId?: string;
     requestedTtlMinutes?: number;
@@ -415,10 +424,11 @@ export class BridgeSpool {
   }): void {
     const now = new Date().toISOString();
     this.db.prepare(
-      `INSERT INTO pending_delegations(client_message_id, target_json, task_json, session_handle,
+      `INSERT INTO pending_delegations(client_message_id, target_json, task_json, context_json, session_handle,
        correlation_id, requested_ttl_minutes, comm_session_id, message_id, status, created_at, updated_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_message_id) DO UPDATE SET
+       context_json = COALESCE(excluded.context_json, pending_delegations.context_json),
        comm_session_id = COALESCE(excluded.comm_session_id, pending_delegations.comm_session_id),
        message_id = COALESCE(excluded.message_id, pending_delegations.message_id),
        status = excluded.status,
@@ -428,6 +438,7 @@ export class BridgeSpool {
       input.clientMessageId,
       JSON.stringify(input.target),
       JSON.stringify(input.task),
+      input.context ? JSON.stringify(input.context) : null,
       input.sessionHandle,
       input.correlationId ?? null,
       input.requestedTtlMinutes ?? null,
@@ -531,6 +542,7 @@ interface PendingDelegationRow {
   client_message_id: string;
   target_json: string;
   task_json: string;
+  context_json: string | null;
   session_handle: string;
   correlation_id: string | null;
   requested_ttl_minutes: number | null;
@@ -578,6 +590,9 @@ function mapPendingDelegation(row: PendingDelegationRow): PendingDelegation {
     clientMessageId: row.client_message_id,
     target: JSON.parse(row.target_json) as LocalAgentDelegationInput["target"],
     task: JSON.parse(row.task_json) as LocalAgentDelegationInput["task"],
+    ...(row.context_json
+      ? { context: JSON.parse(row.context_json) as NonNullable<LocalAgentDelegationInput["context"]> }
+      : {}),
     sessionHandle: row.session_handle,
     ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
     ...(row.requested_ttl_minutes ? { requestedTtlMinutes: row.requested_ttl_minutes } : {}),

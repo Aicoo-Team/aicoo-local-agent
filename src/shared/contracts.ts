@@ -1,4 +1,5 @@
 import type { ReasonCode } from "./reason-codes.js";
+import type { CollaborationContext } from "./collaboration-context.js";
 
 export type RuntimeKind = "claude-code" | "codex";
 export type TargetKind = "human_inbox" | "person_default_runtime" | "runtime_session";
@@ -201,6 +202,7 @@ export interface LocalAgentDelegationInput {
   clientMessageId: string;
   correlationId?: string;
   requestedTtlMinutes?: number;
+  context?: CollaborationContext;
 }
 
 export type LocalAgentDelegationResponse =

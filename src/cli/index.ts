@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
@@ -20,6 +20,11 @@ import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
 import { selectLocalSessionForPeer } from "./active-session.js";
+import {
+  COLLABORATION_CONTEXT_MAX_BYTES,
+  parseCollaborationContext,
+  type CollaborationContext,
+} from "../shared/collaboration-context.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
@@ -406,6 +411,7 @@ program.command("delegate")
   .option("--ttl <minutes>", "grant TTL", "30")
   .option("--timeout <seconds>", "local pending-delegation timeout", "1800")
   .option("--request-timeout <seconds>", "delegation HTTP submission timeout", "30")
+  .option("--context-file <path>", "bounded JSON context capsule prepared by your local agent")
   .option("--no-wait", "return after dispatch instead of waiting for the peer reply")
   .option("--server <url>", "control-plane URL")
   .action(async (person, taskParts, options) => {
@@ -423,6 +429,23 @@ program.command("delegate")
     }
 
     const route = await resolveRoute({ spool: options.spool });
+    const task = taskParts.join(" ");
+    let context: CollaborationContext | undefined;
+    if (options.contextFile) {
+      try {
+        if (statSync(options.contextFile).size > COLLABORATION_CONTEXT_MAX_BYTES) {
+          throw new Error("context_too_large");
+        }
+        context = parseCollaborationContext(
+          JSON.parse(readFileSync(options.contextFile, "utf8")) as unknown,
+          task,
+        );
+      } catch (error) {
+        console.error(`Could not load context capsule: ${errorMessage(error)}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
     const clientMessageId = options.clientId ?? `delegate:${randomUUID()}`;
     const correlationId = options.correlationId ?? clientMessageId;
     const spool = new BridgeSpool(options.spool);
@@ -431,7 +454,8 @@ program.command("delegate")
         transport: client,
         spool,
         target: { kind: "person_default_runtime", principalId: targetPrincipalId },
-        task: taskParts.join(" "),
+        task,
+        ...(context ? { context } : {}),
         sessionHandle: route.sessionHandle,
         clientMessageId,
         correlationId,
@@ -439,6 +463,9 @@ program.command("delegate")
         timeoutMs: Number.parseInt(options.timeout, 10) * 1000,
         requestTimeoutMs: Number.parseInt(options.requestTimeout, 10) * 1000,
       });
+      if (context) {
+        console.log(`Context sent: ${context.items.length} item${context.items.length === 1 ? "" : "s"}.`);
+      }
       if (result.status === "delegated") {
         console.log(`Delegated to ${person}'s local agent.`);
         console.log(`messageId: ${result.receipt.messageId}`);
