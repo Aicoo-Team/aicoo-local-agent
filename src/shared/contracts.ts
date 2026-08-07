@@ -205,7 +205,15 @@ export interface LocalAgentDelegationInput {
 
 export type LocalAgentDelegationResponse =
   | {
+      status: "collaboration_requested";
+      collaborationId: string;
+      clientMessageId: string;
+      correlationId?: string;
+      duplicate: boolean;
+    }
+  | {
       status: "grant_requested";
+      collaborationId?: string;
       communicationSession: CommunicationSession;
       clientMessageId: string;
       correlationId?: string;
@@ -216,6 +224,7 @@ export type LocalAgentDelegationResponse =
     }
   | {
       status: "folder_access_requested";
+      collaborationId?: string;
       communicationSession: CommunicationSession;
       clientMessageId: string;
       correlationId?: string;
@@ -225,6 +234,7 @@ export type LocalAgentDelegationResponse =
     }
   | {
       status: "delegated";
+      collaborationId?: string;
       communicationSession: CommunicationSession;
       receipt: MessageReceipt;
       clientMessageId: string;

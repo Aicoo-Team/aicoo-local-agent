@@ -372,16 +372,29 @@ export class AicooTransport extends HttpMessageTransport {
     if (isCanonicalDelegationResponse(response)) return response;
 
     const row = hostedDelegationRow(response);
+    if (row.status === "collaboration_requested") {
+      return {
+        status: "collaboration_requested",
+        collaborationId: requiredDelegationString(row, "collaborationId"),
+        clientMessageId: input.clientMessageId,
+        ...(stringValue(row.correlationId) ?? input.correlationId
+          ? { correlationId: stringValue(row.correlationId) ?? input.correlationId }
+          : {}),
+        duplicate: typeof row.duplicate === "boolean" ? row.duplicate : false,
+      };
+    }
+    const communicationSessionId = requiredDelegationString(row, "communicationSessionId");
     const communicationSession = (await this.listCommunicationSessions())
-      .find((session) => session.id === row.communicationSessionId);
+      .find((session) => session.id === communicationSessionId);
     if (!communicationSession) {
       throw new ApiError(500, "invalid_response", {
-        message: `Delegation response referenced unknown communication session ${row.communicationSessionId}`,
+        message: `Delegation response referenced unknown communication session ${communicationSessionId}`,
       });
     }
 
     const common = {
       communicationSession,
+      ...(stringValue(row.collaborationId) ? { collaborationId: stringValue(row.collaborationId) } : {}),
       clientMessageId: input.clientMessageId,
       ...(stringValue(row.correlationId) ?? input.correlationId
         ? { correlationId: stringValue(row.correlationId) ?? input.correlationId }
@@ -541,8 +554,8 @@ interface CommRow {
 }
 
 type HostedDelegationRow = Record<string, unknown> & {
-  status: "grant_requested" | "folder_access_requested" | "delegated";
-  communicationSessionId: string;
+  status: "collaboration_requested" | "grant_requested" | "folder_access_requested" | "delegated";
+  communicationSessionId?: string;
 };
 
 function hostedDelegationRow(response: unknown): HostedDelegationRow {
@@ -551,13 +564,14 @@ function hostedDelegationRow(response: unknown): HostedDelegationRow {
   }
   const row = response as Record<string, unknown>;
   if (
-    row.status !== "grant_requested"
+    row.status !== "collaboration_requested"
+    && row.status !== "grant_requested"
     && row.status !== "folder_access_requested"
     && row.status !== "delegated"
   ) {
     throw new ApiError(500, "invalid_response", { message: "Delegation response has an invalid status" });
   }
-  if (!stringValue(row.communicationSessionId)) {
+  if (row.status !== "collaboration_requested" && !stringValue(row.communicationSessionId)) {
     throw new ApiError(500, "invalid_response", { message: "Delegation response is missing communicationSessionId" });
   }
   return row as HostedDelegationRow;
@@ -567,11 +581,16 @@ function isCanonicalDelegationResponse(response: unknown): response is LocalAgen
   if (!response || typeof response !== "object") return false;
   const row = response as Record<string, unknown>;
   const recognizedStatus = (
-    row.status === "grant_requested"
+    row.status === "collaboration_requested"
+    || row.status === "grant_requested"
     || row.status === "folder_access_requested"
     || row.status === "delegated"
   );
-  if (!recognizedStatus || !row.communicationSession || typeof row.communicationSession !== "object") return false;
+  if (!recognizedStatus) return false;
+  if (row.status === "collaboration_requested") {
+    return Boolean(stringValue(row.collaborationId) && stringValue(row.clientMessageId));
+  }
+  if (!row.communicationSession || typeof row.communicationSession !== "object") return false;
   return row.status !== "folder_access_requested" || Boolean(stringValue(row.approvalId));
 }
 

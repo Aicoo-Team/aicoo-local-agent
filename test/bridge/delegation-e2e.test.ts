@@ -44,6 +44,7 @@ describe("local-to-local delegation E2E", () => {
       timeoutMs: 60_000,
     });
     expect(requested.status).toBe("grant_requested");
+    if (requested.status === "collaboration_requested") throw new Error("unexpected collaboration request");
     expect(a.spool.listPendingDelegations(requested.communicationSession.id)).toHaveLength(1);
 
     await b.client.acceptCommunicationSession(requested.communicationSession.id);

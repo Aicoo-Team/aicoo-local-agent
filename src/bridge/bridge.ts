@@ -599,6 +599,20 @@ function recordDelegationResult(
     return;
   }
 
+  if (result.status === "collaboration_requested") {
+    spool.storePendingDelegation({
+      clientMessageId: result.clientMessageId,
+      target: input.target,
+      task: input.task,
+      sessionHandle: input.sessionHandle,
+      ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+      ...(input.requestedTtlMinutes ? { requestedTtlMinutes: input.requestedTtlMinutes } : {}),
+      status: "grant_requested",
+      expiresAt: input.expiresAt,
+    });
+    return;
+  }
+
   spool.storePendingDelegation({
     clientMessageId: result.clientMessageId,
     target: input.target,

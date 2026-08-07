@@ -442,6 +442,9 @@ program.command("delegate")
       if (result.status === "delegated") {
         console.log(`Delegated to ${person}'s local agent.`);
         console.log(`messageId: ${result.receipt.messageId}`);
+      } else if (result.status === "collaboration_requested") {
+        console.log(`Task collaboration requested from ${person}. The bridge will dispatch after they accept.`);
+        console.log(`collaborationId: ${result.collaborationId}`);
       } else if (result.status === "folder_access_requested" || result.approvalKind === "folder") {
         console.log(`File access approval requested from ${person}. The task will dispatch after they approve.`);
         if (result.approvalId) console.log(`approvalId: ${result.approvalId}`);
