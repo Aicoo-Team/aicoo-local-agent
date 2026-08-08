@@ -40,6 +40,41 @@ describe("bearer token normalization", () => {
 });
 
 describe("hosted Aicoo transport", () => {
+  it("maps a collaboration request without trying to load a grant that does not exist yet", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/local-agent/delegations")) {
+        return Response.json({
+          ok: true,
+          status: "collaboration_requested",
+          collaborationId: "collab-1",
+          targetPrincipalId: "peer",
+          message: "Waiting for task acceptance",
+        }, { status: 202 });
+      }
+      throw new Error(`Unexpected request ${url}`);
+    });
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_dev_test",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await expect(transport.delegateLocalAgentTask({
+      target: { kind: "person_default_runtime", principalId: "peer" },
+      task: "Review my pending diff",
+      sessionHandle: "rs-me",
+      clientMessageId: "client-1",
+      correlationId: "corr-1",
+    })).resolves.toMatchObject({
+      status: "collaboration_requested",
+      collaborationId: "collab-1",
+      clientMessageId: "client-1",
+      correlationId: "corr-1",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("maps the hosted flat delegated response into the client delegation contract", async () => {
     // Regression: ccd delegate crashed while reading result.communicationSession.id.
     const grant = hostedGrant({ status: "active" });
@@ -299,6 +334,46 @@ describe("hosted Aicoo transport", () => {
     const iterator = transport.subscribeEvents()[Symbol.asyncIterator]();
     await expect(iterator.next()).resolves.toMatchObject({
       value: { type: "relationship.policy_update", data: { access: "read-project" } },
+      done: false,
+    });
+  });
+
+  it("passes through trusted tool policy events from hosted SSE", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode([
+          "data: {\"cursor\":\"1\",\"type\":\"trusted_tool_policy.upserted\",\"endpointId\":\"ep-1\",\"createdAt\":\"2026-08-08T00:00:00.000Z\",\"data\":{\"policyId\":\"ttp-1\"}}\n\n",
+          "data: {\"cursor\":\"2\",\"type\":\"trusted_tool_policy.revoked\",\"endpointId\":\"ep-1\",\"createdAt\":\"2026-08-08T00:01:00.000Z\",\"data\":{\"policyId\":\"ttp-1\"}}\n\n",
+        ].join("")));
+      },
+    });
+    let fetchCalls = 0;
+    const fetchMock = vi.fn(async () => {
+      fetchCalls += 1;
+      return fetchCalls === 1
+        ? Response.json({ endpoint: { endpointId: "ep-1", principalId: "user-1" }, deviceToken: "aicoo_dev_next" })
+        : new Response(stream);
+    });
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_sk_example",
+      deviceId: "device-1",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await transport.registerEndpoint({
+      runtime: "codex",
+      bridgeVersion: "test",
+      adapterVersion: "test",
+      capabilities: [],
+    });
+    const iterator = transport.subscribeEvents()[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: { type: "trusted_tool_policy.upserted", data: { policyId: "ttp-1" } },
+      done: false,
+    });
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: { type: "trusted_tool_policy.revoked", data: { policyId: "ttp-1" } },
       done: false,
     });
   });

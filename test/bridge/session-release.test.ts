@@ -1,12 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeAdapter } from "../../src/adapters/runtime-adapter.js";
 import { requestRuntimeDelegation, RuntimeBridge } from "../../src/bridge/bridge.js";
 import { BridgeSpool } from "../../src/bridge/spool.js";
-import type { RuntimeEvent } from "../../src/shared/contracts.js";
+import type {
+  RegisterRuntimeSessionInput,
+  RuntimeEvent,
+  RuntimeSessionBinding,
+} from "../../src/shared/contracts.js";
 import { ApiError, type HttpMessageTransport } from "../../src/shared/http-client.js";
+import {
+  markTrustedToolPolicyUsed,
+  readTrustedToolPolicies,
+  upsertTrustedToolPolicy,
+} from "../../src/security/trusted-tool-policy.js";
 
 describe("RuntimeBridge communication session release", () => {
   const cleanups: Array<() => void> = [];
@@ -52,6 +61,100 @@ describe("RuntimeBridge communication session release", () => {
     await callHandleEvent(bridge, event("comm.activated", "comm_new", "server-session"));
 
     expect(adapter.prepareCommunicationSession).toHaveBeenCalledWith("native-session", "comm_new");
+  });
+
+  it("publishes the enforced workspace boundary with each managed session", async () => {
+    const registerRuntimeSession = vi.fn(async (
+      _endpointId: string,
+      input: RegisterRuntimeSessionInput,
+    ): Promise<RuntimeSessionBinding> => ({
+      sessionHandle: "server-session",
+      endpointId: "ep_b",
+      principalId: "prn_b",
+      label: input.label,
+      ...(input.workspaceBoundary ? { workspaceBoundary: input.workspaceBoundary } : {}),
+      state: input.state,
+      deliveryMode: input.deliveryMode,
+      capabilities: input.capabilities,
+      allowInbound: input.allowInbound,
+      allowMidTurnSteer: input.allowMidTurnSteer,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    }));
+    const { bridge } = setup({
+      sessions: [{ sessionHandle: "native-session", label: "Native session", state: "idle", allowInbound: true }],
+      transport: transport({ registerRuntimeSession }),
+      workspaceBoundary: "/srv/checkout",
+    });
+    cleanups.push(() => void bridge.stop());
+
+    await bridge.start();
+
+    expect(registerRuntimeSession).toHaveBeenCalledWith("ep_b", expect.objectContaining({
+      workspaceBoundary: "/srv/checkout",
+    }));
+  });
+
+  it("publishes a fresh bridge-run identity with endpoint capabilities", async () => {
+    const registerEndpoint = vi.fn(async () => ({
+      endpointId: "ep_b", principalId: "prn_b", deviceId: "device_b",
+      runtime: "codex" as const,
+      bridgeVersion: "0.1.0",
+      adapterVersion: "0.1.0",
+      capabilities: [],
+      presence: "online" as const,
+      lastSeenAt: new Date().toISOString(),
+    }));
+    const { bridge } = setup({
+      bridgeInstanceId: "bridge-run-b",
+      transport: transport({ registerEndpoint }),
+    });
+    cleanups.push(() => void bridge.stop());
+
+    await bridge.start();
+
+    expect(registerEndpoint).toHaveBeenCalledWith(expect.objectContaining({
+      capabilities: expect.arrayContaining(["bridge-instance:bridge-run-b"]),
+    }));
+  });
+
+  it("removes stale spool mappings when the configured session count shrinks", async () => {
+    const updateRuntimeSession = vi.fn(async (
+      endpointId: string,
+      sessionHandle: string,
+      input: { state?: "idle" | "busy" | "closed"; allowInbound?: boolean },
+    ): Promise<RuntimeSessionBinding> => ({
+      sessionHandle,
+      endpointId,
+      principalId: "prn_b",
+      label: "Removed session",
+      state: input.state ?? "idle",
+      deliveryMode: "managed_stream",
+      capabilities: { liveInject: true, midTurnSteer: false, replyEvents: true },
+      allowInbound: input.allowInbound ?? true,
+      allowMidTurnSteer: false,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    }));
+    const { bridge, spool } = setup({
+      sessions: [{ sessionHandle: "native-session", label: "Native session", state: "idle", allowInbound: true }],
+      transport: transport({ updateRuntimeSession }),
+    });
+    spool.saveSessionMapping("removed-session", "server-removed", "Removed session");
+    cleanups.push(() => void bridge.stop());
+
+    const started = await bridge.start();
+
+    expect(updateRuntimeSession).toHaveBeenCalledWith("ep_b", "server-removed", {
+      state: "closed",
+      allowInbound: false,
+    });
+    expect(spool.listSessionMappings()).toEqual([
+      { nativeHandle: "native-session", serverHandle: "server-session", label: "Native session" },
+    ]);
+    expect(started.sessions).toEqual([
+      { nativeHandle: "native-session", serverHandle: "server-session" },
+    ]);
   });
 
   it("retries a parked local delegation when the peer approves the grant", async () => {
@@ -273,6 +376,125 @@ describe("RuntimeBridge communication session release", () => {
     });
   });
 
+  it("ignores a folder policy event from an earlier bridge run", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-stale-policy-update-"));
+    const policyFile = join(directory, "relationships.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const { bridge } = setup({ relationshipPolicyFile: policyFile, bridgeInstanceId: "bridge-run-new" });
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-stale-1",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        access: "edit-project",
+        folderPath: folder,
+        bridgeInstanceId: "bridge-run-old",
+      },
+    });
+
+    expect(() => readFileSync(policyFile, "utf8")).toThrow();
+  });
+
+  it("applies an exact trusted tool policy for the current owner bridge run", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-trusted-policy-update-"));
+    const trustedToolPolicyFile = join(directory, "trusted-tools.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const acknowledgeTrustedToolPolicy = vi.fn(async () => undefined);
+    const { bridge } = setup({
+      trustedToolPolicyFile,
+      bridgeInstanceId: "bridge-run-new",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      transport: transport({ acknowledgeTrustedToolPolicy }),
+    });
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-trusted-1",
+      type: "trusted_tool_policy.upserted",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        policyId: "ttp_server_1",
+        ownerPrincipalId: "prn_b",
+        ownerDeviceId: "device_b",
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        canonicalFolder: folder,
+        normalizedTool: "GitStatus",
+        scope: "bridge_run",
+        bridgeInstanceId: "bridge-run-new",
+        revision: 7,
+        createdFrom: "settings",
+        createdBy: "prn_b",
+        createdAt: new Date().toISOString(),
+      },
+    });
+
+    expect(readTrustedToolPolicies(trustedToolPolicyFile).policies).toEqual([
+      expect.objectContaining({
+        policyId: "ttp_server_1",
+        normalizedTool: "GitStatus",
+        canonicalFolder: realpathSync.native(folder),
+        scope: "bridge_run",
+        status: "active",
+      }),
+    ]);
+    expect(acknowledgeTrustedToolPolicy).toHaveBeenCalledWith({
+      policyId: "ttp_server_1",
+      revision: 7,
+      canonicalFolder: realpathSync.native(folder),
+    });
+  });
+
+  it("reports durable trusted-policy usage and removes only acknowledged sequences", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-trusted-usage-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const trustedToolPolicyFile = join(directory, "trusted-tools.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    upsertTrustedToolPolicy({
+      file: trustedToolPolicyFile,
+      policyId: "ttp_usage_1",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      requesterPrincipalId: "prn_a",
+      requesterDeviceId: "device-a1",
+      folder,
+      normalizedTool: "Read",
+      scope: "persistent",
+      createdFrom: "settings",
+      createdBy: "prn_b",
+      serverRevision: 9,
+    });
+    markTrustedToolPolicyUsed(trustedToolPolicyFile, "ttp_usage_1");
+    const reportTrustedToolPolicyUsage = vi.fn(async () => ({
+      acceptedThroughSequence: 1,
+      duplicate: false,
+    }));
+    const { bridge } = setup({
+      trustedToolPolicyFile,
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      transport: transport({ reportTrustedToolPolicyUsage }),
+    });
+
+    await (bridge as unknown as { flushTrustedToolUsageReports(): Promise<void> })
+      .flushTrustedToolUsageReports();
+
+    expect(reportTrustedToolPolicyUsage).toHaveBeenCalledWith(expect.objectContaining({
+      policyId: "ttp_usage_1",
+      revision: 9,
+      uses: [{ sequence: 1, usedAt: expect.any(String) }],
+    }));
+    expect(readTrustedToolPolicies(trustedToolPolicyFile).policies[0]?.pendingUses).toEqual([]);
+  });
+
   it("does not expand an explicit empty tool list from a folder-boundary update", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-boundary-update-"));
     const policyFile = join(directory, "relationships.json");
@@ -309,6 +531,11 @@ describe("RuntimeBridge communication session release", () => {
     sessions?: Awaited<ReturnType<RuntimeAdapter["listSessions"]>>;
     transport?: HttpMessageTransport;
     relationshipPolicyFile?: string;
+    trustedToolPolicyFile?: string;
+    bridgeInstanceId?: string;
+    ownerPrincipalId?: string;
+    ownerDeviceId?: string;
+    workspaceBoundary?: string;
     log?: (line: string) => void;
   }): {
     bridge: RuntimeBridge;
@@ -345,6 +572,11 @@ describe("RuntimeBridge communication session release", () => {
       heartbeatMs: 60_000,
       injectorMs: 60_000,
       relationshipPolicyFile: options?.relationshipPolicyFile,
+      trustedToolPolicyFile: options?.trustedToolPolicyFile,
+      bridgeInstanceId: options?.bridgeInstanceId,
+      ownerPrincipalId: options?.ownerPrincipalId,
+      ownerDeviceId: options?.ownerDeviceId,
+      workspaceBoundary: options?.workspaceBoundary,
       log: options?.log,
     });
     return { bridge, spool, adapter };

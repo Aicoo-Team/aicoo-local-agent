@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -49,6 +50,38 @@ describe("CodexAdapter managed sessions", () => {
     expect(adapter.providerThreadId("codex-managed-1")).toMatch(/^fake-codex-thread-/);
   });
 
+  it("maps app-server Git approvals to dedicated tools and refuses raw shell", async () => {
+    const driver = new FakeCodexDriver("done");
+    driver.resultDelayMs = 5_000;
+    const asked: string[] = [];
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: process.cwd(),
+      driver,
+      turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input.toolName);
+          return { approvalId: "appr-git", status: "allow", decision: "allow" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_app_git"), "new_turn");
+    const approve = driver.turns[0]?.onApproval;
+    expect(approve).toBeTypeOf("function");
+
+    await expect(approve!({ kind: "commandExecution", summary: "Run: git status --short" }))
+      .resolves.toBe("accept");
+    await expect(approve!({ kind: "commandExecution", summary: "Run: git reset --hard" }))
+      .resolves.toBe("decline");
+    expect(asked).toEqual(["GitStatus"]);
+  });
+
   it("brokers Codex Read through the shared relationship policy", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -94,8 +127,112 @@ describe("CodexAdapter managed sessions", () => {
       }),
     ]);
     expect(driver.turns[0]?.prompt).toContain("[Aicoo brokered file-operation request]");
+    expect(driver.turns[0]?.prompt).toContain(
+      `Allowed folders (use these exact absolute paths for every operation):\n- ${realpathSync.native(project)}`,
+    );
     expect(driver.turns[0]?.writableRoots).toEqual([]);
     expect(driver.turns[1]?.prompt).toContain("[Aicoo brokered file-operation results]");
+  });
+
+  it("reuses approved relationship tool and folder access during collaboration", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-collab-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    writeFileSync(join(project, "README.md"), "approved content", "utf8");
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "read-project",
+      folder: project,
+    });
+    const driver = new FakeCodexDriver((prompt) => prompt.includes("[Aicoo brokered file-operation request]")
+      ? JSON.stringify({ operations: [{ tool: "Read", file_path: "README.md" }] })
+      : "done");
+    const asked: Array<{ toolName: string; toolInputSummary: string }> = [];
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input);
+          return { approvalId: "appr-1", status: "allow", decision: "allow" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession(
+      "codex-managed-1",
+      inbound("msg_collab_policy", { collaborationId: "collab-1" }),
+      "queue",
+    );
+    await events;
+
+    expect(asked).toEqual([]);
+  });
+
+  it("brokers GitStatus through its dedicated owner approval", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-git-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    execFileSync("git", ["init", project]);
+    writeFileSync(join(project, "untracked.txt"), "hello", "utf8");
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "read-project",
+      folder: project,
+    });
+    const driver = new FakeCodexDriver((prompt) => {
+      if (prompt.includes("[Aicoo brokered file-operation request]")) {
+        return JSON.stringify({ operations: [{ tool: "GitStatus", repository: project }] });
+      }
+      expect(prompt).toContain("untracked.txt");
+      return "The repository has one untracked file.";
+    });
+    const asked: string[] = [];
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input.toolName);
+          return { approvalId: "appr-git", status: "allow", decision: "allow", scope: "session" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow", scope: "session" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_git"), "queue");
+    await events;
+
+    expect(asked).toEqual(["GitStatus"]);
   });
 
   it("passes edit-project folders as Codex writable roots", async () => {
@@ -208,6 +345,27 @@ describe("CodexAdapter managed sessions", () => {
     // The follow-up turn continued the same provider thread the context turn created.
     expect(driver.turns).toHaveLength(2);
     expect(driver.turns[1]?.resumeThreadId).toBe(adapter.providerThreadId("codex-managed-1"));
+  });
+
+  it("runs Codex reasoning for an explicit collaboration reply turn", async () => {
+    const driver = new FakeCodexDriver('{"outcome":"respond","expectsReply":false,"text":"done"}');
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_turn_2", {
+      replyTo: "msg_turn_1",
+      collaborationId: "collab-1",
+      collaborationTurn: collaborationTurn("turn-2", "turn-1", true),
+    }), "queue");
+
+    expect(driver.turns[0]?.prompt).not.toContain("reply for context only");
+    expect(driver.turns[0]?.prompt).toContain("bounded agent collaboration turn");
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started", inReplyTo: "msg_turn_2" }),
+      expect.objectContaining({ type: "reply", inReplyTo: "msg_turn_2" }),
+    ]);
   });
 
   it("reports busy and unsupported steering honestly", async () => {
@@ -389,6 +547,32 @@ describe("CodexAdapter managed sessions", () => {
     expect((await second.deliverToSession("codex-managed-1", inbound("msg_resume"), "queue")).status).toBe("runtime_acked");
     expect(secondDriver.turns[0]?.resumeThreadId).toBe(providerThreadId);
   });
+
+  it("reconciles persisted sessions to a smaller configured count", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-count-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const stateFile = join(directory, "sessions.db");
+    const first = new CodexAdapter({
+      stateFile,
+      cwd: directory,
+      driver: new FakeCodexDriver(),
+      sessionCount: 2,
+    });
+    expect(await first.listSessions()).toHaveLength(2);
+    await first.close();
+
+    const second = new CodexAdapter({
+      stateFile,
+      cwd: directory,
+      driver: new FakeCodexDriver(),
+      sessionCount: 1,
+    });
+    cleanups.push(() => second.close());
+
+    expect(await second.listSessions()).toEqual([
+      expect.objectContaining({ sessionHandle: "codex-managed-1" }),
+    ]);
+  });
 });
 
 function makeAdapter(driver: FakeCodexDriver): CodexAdapter {
@@ -416,7 +600,10 @@ async function waitForIdle(adapter: CodexAdapter, sessionHandle: string, timeout
 
 function inbound(
   id: string,
-  overrides: Partial<Pick<InboundMessage, "replyTo" | "correlationId" | "communicationSessionId">> = {},
+  overrides: Partial<Pick<
+    InboundMessage,
+    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId" | "collaborationTurn"
+  >> = {},
 ): InboundMessage {
   return {
     id,
@@ -438,5 +625,17 @@ function inbound(
     trust: "untrusted_external_content",
     correlationId: "corr_initial",
     ...overrides,
+  };
+}
+
+function collaborationTurn(turnId: string, parentTurnId: string, expectsReply: boolean) {
+  return {
+    turnId,
+    clientTurnId: `client-${turnId}`,
+    parentTurnId,
+    sequence: 2,
+    type: "question" as const,
+    expectsReply,
+    outcome: "respond" as const,
   };
 }

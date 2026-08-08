@@ -26,7 +26,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       allowInbound: true,
     })]);
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
+    expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(options.settingSources).toEqual([]);
     expect(options.mcpServers).toEqual({});
@@ -79,6 +79,34 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     ]);
   });
 
+  it("reconciles persisted sessions to a smaller configured count", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-count-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const stateFile = join(directory, "sessions.db");
+    const first = new ClaudeCodeAdapter({
+      stateFile,
+      cwd: directory,
+      driver: new FakeClaudeAgentDriver(),
+      sessionCount: 2,
+    });
+    await first.initialize();
+    expect(await first.listSessions()).toHaveLength(2);
+    await first.close();
+
+    const second = new ClaudeCodeAdapter({
+      stateFile,
+      cwd: directory,
+      driver: new FakeClaudeAgentDriver(),
+      sessionCount: 1,
+    });
+    cleanups.push(() => second.close());
+    await second.initialize();
+
+    expect(await second.listSessions()).toEqual([
+      expect.objectContaining({ sessionHandle: "claude-managed-1" }),
+    ]);
+  });
+
   it("keeps tools denied during an active verified turn without a policy", async () => {
     const driver = new FakeClaudeAgentDriver();
     driver.resultDelayMs = 100;
@@ -94,7 +122,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
+    expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
       signal: new AbortController().signal,
@@ -184,6 +212,23 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     );
     expect(driver.received).toHaveLength(1);
     expect(driver.received[0]?.shouldQuery).toBe(false);
+  });
+
+  it("queries Claude for a reply turn only when the server marks expectsReply", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const reply = inbound("msg_turn_2", {
+      replyTo: "msg_turn_1",
+      collaborationId: "collab-1",
+      collaborationTurn: collaborationTurn("turn-2", "turn-1", true),
+    });
+    await adapter.deliverToSession("claude-managed-1", reply, "queue");
+
+    expect(driver.received[0]?.shouldQuery).toBe(true);
+    expect(JSON.stringify(driver.received[0]?.message)).toContain("bounded agent collaboration turn");
   });
 
   it("reports busy and unsupported steering honestly", async () => {
@@ -321,7 +366,7 @@ function inbound(
   id: string,
   overrides: Partial<Pick<
     InboundMessage,
-    "replyTo" | "correlationId" | "communicationSessionId"
+    "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId" | "collaborationTurn"
   >> = {},
 ): InboundMessage {
   return {
@@ -344,6 +389,18 @@ function inbound(
     trust: "untrusted_external_content",
     correlationId: "corr_initial",
     ...overrides,
+  };
+}
+
+function collaborationTurn(turnId: string, parentTurnId: string, expectsReply: boolean) {
+  return {
+    turnId,
+    clientTurnId: `client-${turnId}`,
+    parentTurnId,
+    sequence: 2,
+    type: "question" as const,
+    expectsReply,
+    outcome: "respond" as const,
   };
 }
 
@@ -395,7 +452,27 @@ describe("CodeAdapter just-in-time tool approval", () => {
     return join(directory, "relationships.json");
   }
 
-  async function startedAdapter(approvalGateway?: ReturnType<typeof gateway>, policyFile?: string) {
+  function readPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-read-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [process.cwd()],
+      }],
+    }));
+    return policyFile;
+  }
+
+  async function startedAdapter(
+    approvalGateway?: ReturnType<typeof gateway>,
+    policyFile?: string,
+    collaborationId?: string,
+  ) {
     const driver = new FakeClaudeAgentDriver();
     // canUseTool fires mid-turn; hold the turn open so the active message (and its
     // communicationSessionId) is still there, as it is in a real session.
@@ -410,7 +487,11 @@ describe("CodeAdapter just-in-time tool approval", () => {
     });
     cleanups.push(() => adapter.close());
     await adapter.initialize();
-    await adapter.deliverToSession("claude-managed-1", inbound("msg_appr"), "new_turn");
+    await adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_appr", { ...(collaborationId ? { collaborationId } : {}) }),
+      "new_turn",
+    );
     return driver.starts[0]!.options;
   }
 
@@ -454,6 +535,33 @@ describe("CodeAdapter just-in-time tool approval", () => {
     // allowance. The bridge must not silently broaden a one-time decision by itself.
     await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
     expect(g.asked).toHaveLength(3);
+  });
+
+  it("reuses approved relationship tool and folder access during collaboration", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g, readPolicyFile(), "collab-1");
+
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
+      .toMatchObject({ behavior: "allow" });
+    expect(g.asked).toHaveLength(0);
+  });
+
+  it("maps a safe Git command to a dedicated approval and keeps raw shell blocked", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g, readPolicyFile(), "collab-1");
+
+    const allowed = await options.canUseTool?.("Bash", { command: "git status --short" }, permissionContext());
+    expect(allowed).toMatchObject({
+      behavior: "allow",
+      updatedInput: { command: expect.stringContaining("core.hooksPath=/dev/null") },
+    });
+    expect(g.asked).toEqual([
+      expect.objectContaining({ toolName: "GitStatus", toolInputSummary: expect.stringContaining("GitStatus") }),
+    ]);
+
+    expect(await options.canUseTool?.("Bash", { command: "git reset --hard" }, permissionContext()))
+      .toMatchObject({ behavior: "deny", interrupt: false });
+    expect(g.asked).toHaveLength(1);
   });
 
   it("asks the owner even before any policy file exists", async () => {

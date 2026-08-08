@@ -1,5 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
-import type { LocalAgentDelegationInput, MessageEnvelope, RuntimeEvent } from "../shared/contracts.js";
+import type {
+  CollaborationTurnInput,
+  LocalAgentDelegationInput,
+  MessageEnvelope,
+  RuntimeEvent,
+} from "../shared/contracts.js";
 
 export type SpoolStatus =
   | "received"
@@ -41,6 +46,7 @@ export interface OutboundReply {
   payload: Record<string, unknown>;
   replyTo: string;
   correlationId: string;
+  collaborationTurn?: CollaborationTurnInput;
   status: "pending" | "sent" | "failed";
   attemptCount: number;
   lastError?: string;
@@ -52,6 +58,7 @@ export interface PendingDelegation {
   clientMessageId: string;
   target: LocalAgentDelegationInput["target"];
   task: LocalAgentDelegationInput["task"];
+  context?: LocalAgentDelegationInput["context"];
   sessionHandle: string;
   correlationId?: string;
   requestedTtlMinutes?: number;
@@ -131,6 +138,7 @@ export class BridgeSpool {
         client_message_id TEXT PRIMARY KEY,
         target_json TEXT NOT NULL,
         task_json TEXT NOT NULL,
+        context_json TEXT,
         session_handle TEXT NOT NULL,
         correlation_id TEXT,
         requested_ttl_minutes INTEGER,
@@ -148,6 +156,18 @@ export class BridgeSpool {
       CREATE INDEX IF NOT EXISTS idx_pending_delegations_status
         ON pending_delegations(status, comm_session_id, expires_at);
     `);
+    const pendingColumns = this.db.prepare("PRAGMA table_info(pending_delegations)").all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!pendingColumns.some((column) => column.name === "context_json")) {
+      this.db.exec("ALTER TABLE pending_delegations ADD COLUMN context_json TEXT");
+    }
+    const outboundColumns = this.db.prepare("PRAGMA table_info(outbound_replies)").all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!outboundColumns.some((column) => column.name === "collaboration_turn_json")) {
+      this.db.exec("ALTER TABLE outbound_replies ADD COLUMN collaboration_turn_json TEXT");
+    }
   }
 
   close(): void {
@@ -166,6 +186,10 @@ export class BridgeSpool {
       | { value: string }
       | undefined;
     return row?.value;
+  }
+
+  deleteIdentity(key: string): void {
+    this.db.prepare("DELETE FROM bridge_identity WHERE key = ?").run(key);
   }
 
   saveSessionMapping(nativeHandle: string, serverHandle: string, label: string): void {
@@ -189,6 +213,10 @@ export class BridgeSpool {
       label: string;
     }>;
     return rows.map((row) => ({ nativeHandle: row.native_handle, serverHandle: row.server_handle, label: row.label }));
+  }
+
+  deleteSessionMapping(nativeHandle: string): void {
+    this.db.prepare("DELETE FROM session_mappings WHERE native_handle = ?").run(nativeHandle);
   }
 
   cursor(serverKey: string): string {
@@ -294,7 +322,29 @@ export class BridgeSpool {
       `UPDATE spool_messages SET status = 'blocked', last_result_code = ?
        WHERE comm_session_id = ? AND status NOT IN ('injected', 'failed', 'blocked')`,
     ).run(reason, commSessionId);
+    this.db.prepare(
+      `UPDATE injection_attempts SET reported = 1
+       WHERE reported = 0 AND message_id IN (
+         SELECT message_id FROM spool_messages WHERE comm_session_id = ?
+       )`,
+    ).run(commSessionId);
     this.setGrant(commSessionId, grantStatus);
+  }
+
+  blockCollaboration(collaborationId: string, reason: string): string[] {
+    const rows = this.db.prepare(
+      `SELECT DISTINCT comm_session_id FROM spool_messages
+       WHERE json_extract(envelope_json, '$.collaborationId') = ?`,
+    ).all(collaborationId) as unknown as Array<{ comm_session_id: string }>;
+    const communicationSessionIds = rows.map((row) => row.comm_session_id);
+    for (const commSessionId of communicationSessionIds) {
+      this.blockCommunicationSession(commSessionId, reason);
+      this.db.prepare(
+        `UPDATE outbound_replies SET status = 'failed', last_error = ?
+         WHERE comm_session_id = ? AND status = 'pending'`,
+      ).run(reason, commSessionId);
+    }
+    return communicationSessionIds;
   }
 
   setGrant(commSessionId: string, status: string, expiresAt?: string): void {
@@ -361,10 +411,12 @@ export class BridgeSpool {
     payload: Record<string, unknown>;
     replyTo: string;
     correlationId: string;
+    collaborationTurn?: CollaborationTurnInput;
   }): void {
     this.db.prepare(
       `INSERT OR IGNORE INTO outbound_replies(event_id, comm_session_id, client_message_id,
-       payload_json, reply_to, correlation_id, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+       payload_json, reply_to, correlation_id, collaboration_turn_json, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
     ).run(
       input.eventId,
       input.communicationSessionId,
@@ -372,6 +424,7 @@ export class BridgeSpool {
       JSON.stringify(input.payload),
       input.replyTo,
       input.correlationId,
+      input.collaborationTurn ? JSON.stringify(input.collaborationTurn) : null,
     );
   }
 
@@ -405,6 +458,7 @@ export class BridgeSpool {
     clientMessageId: string;
     target: LocalAgentDelegationInput["target"];
     task: LocalAgentDelegationInput["task"];
+    context?: LocalAgentDelegationInput["context"];
     sessionHandle: string;
     correlationId?: string;
     requestedTtlMinutes?: number;
@@ -415,10 +469,11 @@ export class BridgeSpool {
   }): void {
     const now = new Date().toISOString();
     this.db.prepare(
-      `INSERT INTO pending_delegations(client_message_id, target_json, task_json, session_handle,
+      `INSERT INTO pending_delegations(client_message_id, target_json, task_json, context_json, session_handle,
        correlation_id, requested_ttl_minutes, comm_session_id, message_id, status, created_at, updated_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(client_message_id) DO UPDATE SET
+       context_json = COALESCE(excluded.context_json, pending_delegations.context_json),
        comm_session_id = COALESCE(excluded.comm_session_id, pending_delegations.comm_session_id),
        message_id = COALESCE(excluded.message_id, pending_delegations.message_id),
        status = excluded.status,
@@ -428,6 +483,7 @@ export class BridgeSpool {
       input.clientMessageId,
       JSON.stringify(input.target),
       JSON.stringify(input.task),
+      input.context ? JSON.stringify(input.context) : null,
       input.sessionHandle,
       input.correlationId ?? null,
       input.requestedTtlMinutes ?? null,
@@ -525,12 +581,14 @@ interface OutboundRow {
   status: OutboundReply["status"];
   attempt_count: number;
   last_error: string | null;
+  collaboration_turn_json: string | null;
 }
 
 interface PendingDelegationRow {
   client_message_id: string;
   target_json: string;
   task_json: string;
+  context_json: string | null;
   session_handle: string;
   correlation_id: string | null;
   requested_ttl_minutes: number | null;
@@ -567,6 +625,9 @@ function mapOutbound(row: OutboundRow): OutboundReply {
     payload: JSON.parse(row.payload_json) as Record<string, unknown>,
     replyTo: row.reply_to,
     correlationId: row.correlation_id,
+    ...(row.collaboration_turn_json
+      ? { collaborationTurn: JSON.parse(row.collaboration_turn_json) as CollaborationTurnInput }
+      : {}),
     status: row.status,
     attemptCount: row.attempt_count,
     ...(row.last_error ? { lastError: row.last_error } : {}),
@@ -578,6 +639,9 @@ function mapPendingDelegation(row: PendingDelegationRow): PendingDelegation {
     clientMessageId: row.client_message_id,
     target: JSON.parse(row.target_json) as LocalAgentDelegationInput["target"],
     task: JSON.parse(row.task_json) as LocalAgentDelegationInput["task"],
+    ...(row.context_json
+      ? { context: JSON.parse(row.context_json) as NonNullable<LocalAgentDelegationInput["context"]> }
+      : {}),
     sessionHandle: row.session_handle,
     ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
     ...(row.requested_ttl_minutes ? { requestedTtlMinutes: row.requested_ttl_minutes } : {}),

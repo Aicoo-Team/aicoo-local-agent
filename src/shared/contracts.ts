@@ -1,4 +1,5 @@
 import type { ReasonCode } from "./reason-codes.js";
+import type { CollaborationContext } from "./collaboration-context.js";
 
 export type RuntimeKind = "claude-code" | "codex";
 export type TargetKind = "human_inbox" | "person_default_runtime" | "runtime_session";
@@ -38,6 +39,7 @@ export interface RuntimeSessionBinding {
   endpointId: string;
   principalId: string;
   label: string;
+  workspaceBoundary?: string;
   state: "idle" | "busy" | "closed";
   deliveryMode: "managed_stream" | "remote_control" | "resume_only";
   capabilities: {
@@ -89,10 +91,29 @@ export interface MessageTarget {
   sessionHandle?: string;
 }
 
+export type CollaborationTurnType = "task" | "question" | "response" | "result" | "control";
+export type CollaborationTurnOutcome = "respond" | "needs_owner" | "propose_complete" | "failed";
+
+export interface CollaborationTurnInput {
+  clientTurnId: string;
+  parentTurnId?: string;
+  type: CollaborationTurnType;
+  expectsReply: boolean;
+  outcome?: CollaborationTurnOutcome;
+}
+
+export interface CollaborationTurnEnvelope extends CollaborationTurnInput {
+  turnId: string;
+  sequence: number;
+}
+
 export interface MessageEnvelope {
   id: string;
   clientMessageId: string;
   communicationSessionId?: string;
+  collaborationId?: string;
+  collaborationRole?: "requester" | "recipient";
+  collaborationTurn?: CollaborationTurnEnvelope;
   conversationId?: string;
   senderPrincipalId: string;
   /**
@@ -152,10 +173,23 @@ export interface RuntimeEvent<T = Record<string, unknown>> {
     | "comm.declined"
     | "comm.revoked"
     | "comm.expired"
-    | "relationship.policy_update";
+    | "collaboration.completed"
+    | "collaboration.revoked"
+    | "collaboration.expired"
+    | "relationship.policy_update"
+    | "trusted_tool_policy.upserted"
+    | "trusted_tool_policy.revoked";
   endpointId: string;
   createdAt: string;
   data: T;
+}
+
+export interface TrustedToolPolicyUsageInput {
+  policyId: string;
+  revision: number;
+  normalizedTool: string;
+  canonicalFolder: string;
+  uses: Array<{ sequence: number; usedAt: string }>;
 }
 
 export interface ReachableTarget {
@@ -176,6 +210,7 @@ export interface RegisterEndpointInput {
 
 export interface RegisterRuntimeSessionInput {
   label: string;
+  workspaceBoundary?: string;
   state: "idle" | "busy";
   deliveryMode: "managed_stream";
   capabilities: RuntimeSessionBinding["capabilities"];
@@ -201,11 +236,20 @@ export interface LocalAgentDelegationInput {
   clientMessageId: string;
   correlationId?: string;
   requestedTtlMinutes?: number;
+  context?: CollaborationContext;
 }
 
 export type LocalAgentDelegationResponse =
   | {
+      status: "collaboration_requested";
+      collaborationId: string;
+      clientMessageId: string;
+      correlationId?: string;
+      duplicate: boolean;
+    }
+  | {
       status: "grant_requested";
+      collaborationId?: string;
       communicationSession: CommunicationSession;
       clientMessageId: string;
       correlationId?: string;
@@ -216,6 +260,7 @@ export type LocalAgentDelegationResponse =
     }
   | {
       status: "folder_access_requested";
+      collaborationId?: string;
       communicationSession: CommunicationSession;
       clientMessageId: string;
       correlationId?: string;
@@ -225,6 +270,7 @@ export type LocalAgentDelegationResponse =
     }
   | {
       status: "delegated";
+      collaborationId?: string;
       communicationSession: CommunicationSession;
       receipt: MessageReceipt;
       clientMessageId: string;
@@ -239,6 +285,7 @@ export interface GrantScopedSendMessageInput {
   payload: Record<string, unknown>;
   replyTo?: string;
   correlationId?: string;
+  collaborationTurn?: CollaborationTurnInput;
 }
 
 export interface HumanInboxSendMessageInput {

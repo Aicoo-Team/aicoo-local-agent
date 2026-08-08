@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
 import {
   RelationshipPolicy,
+  resetRelationshipPolicy,
   upsertRelationshipPreset,
 } from "../../src/security/relationship-policy.js";
 
@@ -160,6 +161,78 @@ describe("RelationshipPolicy", () => {
 
     const document = JSON.parse(readFileSync(file, "utf8")) as { relationships: unknown[] };
     expect(document.relationships).toHaveLength(1);
+  });
+
+  it("forgets generated peer permissions when a bridge run resets its policy", () => {
+    const directory = makeDirectory();
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const file = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "edit-project",
+      folder: project,
+    });
+
+    resetRelationshipPolicy(file);
+
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+    expect(permissions.enabledTools()).toEqual([]);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ version: 1, relationships: [] });
+  });
+
+  it("validates a Git repository boundary without silently granting the Git tool", () => {
+    const directory = makeDirectory();
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const file = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "edit-project",
+      folder: project,
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+
+    expect(permissions.authorizeBoundary(
+      { toolName: "GitStatus", input: { repository: project } },
+      inbound(),
+    )).toMatchObject({ behavior: "allow", updatedInput: { repository: realpathSync.native(project) } });
+    expect(permissions.authorize(
+      { toolName: "GitStatus", input: { repository: project } },
+      inbound(),
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("not allowed") });
+  });
+
+  it("prevents peer edits from planting Git configuration or attribute execution", () => {
+    const directory = makeDirectory();
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(config);
+    const file = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "edit-project",
+      folder: project,
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+
+    for (const filePath of [join(project, ".git", "config"), join(project, ".gitattributes")]) {
+      expect(permissions.authorize(
+        { toolName: "Write", input: { file_path: filePath } },
+        inbound(),
+      )).toMatchObject({ behavior: "deny", message: expect.stringContaining("Execution-on-next-use") });
+    }
   });
 
   it.runIf(process.platform !== "win32")(

@@ -14,6 +14,7 @@ import type {
   RegisterRuntimeSessionInput,
   RequestCommunicationSessionInput,
   RuntimeEvent,
+  TrustedToolPolicyUsageInput,
   RuntimeSessionBinding,
   SendMessageInput,
 } from "./contracts.js";
@@ -167,7 +168,12 @@ export class HttpMessageTransport implements MessageTransport {
   async updateRuntimeSession(
     endpointId: string,
     sessionHandle: string,
-    input: { state?: "idle" | "busy" | "closed"; allowInbound?: boolean; allowMidTurnSteer?: boolean },
+    input: {
+      state?: "idle" | "busy" | "closed";
+      allowInbound?: boolean;
+      allowMidTurnSteer?: boolean;
+      workspaceBoundary?: string;
+    },
   ): Promise<RuntimeSessionBinding> {
     return this.requestJson(
       `/api/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionHandle)}`,
@@ -264,6 +270,29 @@ export class HttpMessageTransport implements MessageTransport {
   async acknowledgeDelivery(input: DeliveryAckInput): Promise<void> {
     const { messageId, ...body } = input;
     await this.requestJson(`/api/v1/messages/${encodeURIComponent(messageId)}/ack`, { method: "POST", body });
+  }
+
+  async acknowledgeTrustedToolPolicy(input: {
+    policyId: string;
+    revision: number;
+    canonicalFolder: string;
+  }): Promise<void> {
+    const { policyId, ...body } = input;
+    await this.requestJson(`/api/v1/trusted-tool-policies/${encodeURIComponent(policyId)}/ack`, {
+      method: "POST",
+      body,
+    });
+  }
+
+  async reportTrustedToolPolicyUsage(input: TrustedToolPolicyUsageInput): Promise<{
+    acceptedThroughSequence: number;
+    duplicate: boolean;
+  }> {
+    const { policyId, ...body } = input;
+    return this.requestJson(`/api/v1/trusted-tool-policies/${encodeURIComponent(policyId)}/usage`, {
+      method: "POST",
+      body,
+    });
   }
 
   async getMessageStatus(messageId: string): Promise<MessageDelivery> {

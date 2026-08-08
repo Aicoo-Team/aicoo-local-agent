@@ -52,6 +52,7 @@ describe("local-agent delegations", () => {
       communicationSession: { status: "pending" },
     });
     expect(second.response.status).toBe(200);
+    if (first.body.status === "collaboration_requested") throw new Error("unexpected collaboration request");
     expect(second.body).toMatchObject({
       status: "grant_requested",
       duplicate: true,
@@ -83,6 +84,7 @@ describe("local-agent delegations", () => {
       "POST",
       input,
     );
+    if (requested.body.status === "collaboration_requested") throw new Error("unexpected collaboration request");
     await api(app, TOKENS.b, `/api/v1/comm-sessions/${requested.body.communicationSession.id}/accept`, "POST");
 
     const delegated = await api<LocalAgentDelegationResponse>(

@@ -27,6 +27,7 @@ import type {
   RegisterRuntimeSessionInput,
   RequestCommunicationSessionInput,
   RuntimeEvent,
+  TrustedToolPolicyUsageInput,
   RuntimeSessionBinding,
   SendMessageInput,
 } from "./contracts.js";
@@ -34,14 +35,15 @@ import type {
 const LA = "/api/v1/local-agent";
 const LR = "/api/v1/local-realtime";
 const DEFAULT_DELEGATION_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 10_000;
 
 /**
  * Attempts per call. Two, not more: the presence caps are bounded by the control plane's 60s
  * endpoint-staleness window (LOCAL_AGENT_ENDPOINT_STALE_MS). runHeartbeat is a serial loop —
  * delay(heartbeatMs) -> heartbeat -> setDefaultRoute — and lastSeenAt only advances on a
  * successful heartbeat, so the worst gap between successful beats is
- * heartbeatMs + attempts * (heartbeatCap + routeCap). At heartbeatMs=10s and 5s caps that is
- * 30s, comfortably inside 60s. Raising either the cap or the attempt count past this trades a
+ * heartbeatMs + attempts * (heartbeatCap + routeCap). At heartbeatMs=10s, a 10s heartbeat cap,
+ * and a 5s route cap that is 40s, comfortably inside 60s. Raising either cap or the attempt count trades a
  * recovered request for the endpoint being declared unreachable, which is strictly worse.
  */
 const DEFAULT_ATTEMPTS = 2;
@@ -60,6 +62,7 @@ export class AicooTransport extends HttpMessageTransport {
   readonly #base: string;
   readonly #userToken: string;
   readonly #timeoutMs: number;
+  readonly #heartbeatTimeoutMs: number;
   readonly #fetch: typeof fetch;
   readonly #deviceId: string;
   readonly #onTokenRefreshed?: (token: string) => void;
@@ -75,6 +78,7 @@ export class AicooTransport extends HttpMessageTransport {
     this.#base = options.baseUrl.replace(/\/$/, "");
     this.#userToken = normalizeBearerToken(options.token);
     this.#timeoutMs = options.timeoutMs ?? 5_000;
+    this.#heartbeatTimeoutMs = options.timeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
     this.#fetch = options.fetchImpl ?? fetch;
     this.#deviceId = options.deviceId?.trim() ?? "";
     this.#onTokenRefreshed = options.onTokenRefreshed;
@@ -279,7 +283,10 @@ export class AicooTransport extends HttpMessageTransport {
   }
 
   override async heartbeatEndpoint(endpointId: string): Promise<void> {
-    await this.requestJson(`${LA}/endpoints/${encodeURIComponent(endpointId)}/heartbeat`, { method: "POST" });
+    await this.requestJson(`${LA}/endpoints/${encodeURIComponent(endpointId)}/heartbeat`, {
+      method: "POST",
+      timeoutMs: this.#heartbeatTimeoutMs,
+    });
   }
 
   override async registerRuntimeSession(
@@ -292,7 +299,12 @@ export class AicooTransport extends HttpMessageTransport {
   override async updateRuntimeSession(
     endpointId: string,
     sessionHandle: string,
-    input: { state?: "idle" | "busy" | "closed"; allowInbound?: boolean; allowMidTurnSteer?: boolean },
+    input: {
+      state?: "idle" | "busy" | "closed";
+      allowInbound?: boolean;
+      allowMidTurnSteer?: boolean;
+      workspaceBoundary?: string;
+    },
   ): Promise<RuntimeSessionBinding> {
     return this.requestJson(`${LA}/sessions/${encodeURIComponent(sessionHandle)}`, { method: "PATCH", body: input });
   }
@@ -372,16 +384,29 @@ export class AicooTransport extends HttpMessageTransport {
     if (isCanonicalDelegationResponse(response)) return response;
 
     const row = hostedDelegationRow(response);
+    if (row.status === "collaboration_requested") {
+      return {
+        status: "collaboration_requested",
+        collaborationId: requiredDelegationString(row, "collaborationId"),
+        clientMessageId: input.clientMessageId,
+        ...(stringValue(row.correlationId) ?? input.correlationId
+          ? { correlationId: stringValue(row.correlationId) ?? input.correlationId }
+          : {}),
+        duplicate: typeof row.duplicate === "boolean" ? row.duplicate : false,
+      };
+    }
+    const communicationSessionId = requiredDelegationString(row, "communicationSessionId");
     const communicationSession = (await this.listCommunicationSessions())
-      .find((session) => session.id === row.communicationSessionId);
+      .find((session) => session.id === communicationSessionId);
     if (!communicationSession) {
       throw new ApiError(500, "invalid_response", {
-        message: `Delegation response referenced unknown communication session ${row.communicationSessionId}`,
+        message: `Delegation response referenced unknown communication session ${communicationSessionId}`,
       });
     }
 
     const common = {
       communicationSession,
+      ...(stringValue(row.collaborationId) ? { collaborationId: stringValue(row.collaborationId) } : {}),
       clientMessageId: input.clientMessageId,
       ...(stringValue(row.correlationId) ?? input.correlationId
         ? { correlationId: stringValue(row.correlationId) ?? input.correlationId }
@@ -429,6 +454,29 @@ export class AicooTransport extends HttpMessageTransport {
       method: "POST",
       body,
       attempts: 1,
+    });
+  }
+
+  override async acknowledgeTrustedToolPolicy(input: {
+    policyId: string;
+    revision: number;
+    canonicalFolder: string;
+  }): Promise<void> {
+    const { policyId, ...body } = input;
+    await this.requestJson(`${LA}/trusted-tool-policies/${encodeURIComponent(policyId)}/ack`, {
+      method: "POST",
+      body,
+    });
+  }
+
+  override async reportTrustedToolPolicyUsage(input: TrustedToolPolicyUsageInput): Promise<{
+    acceptedThroughSequence: number;
+    duplicate: boolean;
+  }> {
+    const { policyId, ...body } = input;
+    return this.requestJson(`${LA}/trusted-tool-policies/${encodeURIComponent(policyId)}/usage`, {
+      method: "POST",
+      body,
     });
   }
 
@@ -541,8 +589,8 @@ interface CommRow {
 }
 
 type HostedDelegationRow = Record<string, unknown> & {
-  status: "grant_requested" | "folder_access_requested" | "delegated";
-  communicationSessionId: string;
+  status: "collaboration_requested" | "grant_requested" | "folder_access_requested" | "delegated";
+  communicationSessionId?: string;
 };
 
 function hostedDelegationRow(response: unknown): HostedDelegationRow {
@@ -551,13 +599,14 @@ function hostedDelegationRow(response: unknown): HostedDelegationRow {
   }
   const row = response as Record<string, unknown>;
   if (
-    row.status !== "grant_requested"
+    row.status !== "collaboration_requested"
+    && row.status !== "grant_requested"
     && row.status !== "folder_access_requested"
     && row.status !== "delegated"
   ) {
     throw new ApiError(500, "invalid_response", { message: "Delegation response has an invalid status" });
   }
-  if (!stringValue(row.communicationSessionId)) {
+  if (row.status !== "collaboration_requested" && !stringValue(row.communicationSessionId)) {
     throw new ApiError(500, "invalid_response", { message: "Delegation response is missing communicationSessionId" });
   }
   return row as HostedDelegationRow;
@@ -567,11 +616,16 @@ function isCanonicalDelegationResponse(response: unknown): response is LocalAgen
   if (!response || typeof response !== "object") return false;
   const row = response as Record<string, unknown>;
   const recognizedStatus = (
-    row.status === "grant_requested"
+    row.status === "collaboration_requested"
+    || row.status === "grant_requested"
     || row.status === "folder_access_requested"
     || row.status === "delegated"
   );
-  if (!recognizedStatus || !row.communicationSession || typeof row.communicationSession !== "object") return false;
+  if (!recognizedStatus) return false;
+  if (row.status === "collaboration_requested") {
+    return Boolean(stringValue(row.collaborationId) && stringValue(row.clientMessageId));
+  }
+  if (!row.communicationSession || typeof row.communicationSession !== "object") return false;
   return row.status !== "folder_access_requested" || Boolean(stringValue(row.approvalId));
 }
 
@@ -664,8 +718,13 @@ const EVENT_TYPE_MAP: Record<string, RuntimeEvent["type"]> = {
   "grant.activated": "comm.activated",
   "grant.declined": "comm.declined",
   "grant.revoked": "comm.revoked",
+  "collaboration.completed": "collaboration.completed",
+  "collaboration.revoked": "collaboration.revoked",
+  "collaboration.expired": "collaboration.expired",
   "message.dispatch": "message.dispatch",
   "relationship.policy_update": "relationship.policy_update",
+  "trusted_tool_policy.upserted": "trusted_tool_policy.upserted",
+  "trusted_tool_policy.revoked": "trusted_tool_policy.revoked",
 };
 
 async function* parseSse(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<RuntimeEvent> {

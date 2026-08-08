@@ -37,6 +37,35 @@ faithful to the user's request. If the request names files or folders, include
 that detail in the delegated task; the peer's bridge will enforce any approved
 folder policy.
 
+When the answer depends on context already present in this session—such as a
+requirement, pending diff, error, test output, or decision—prepare a bounded
+context JSON file and pass `--context-file`:
+
+```json
+{
+  "summary": "Checkout changes relevant to the review",
+  "items": [
+    {
+      "kind": "diff",
+      "label": "Current git diff",
+      "content": "<relevant diff only>",
+      "sourcePath": "src/app.ts"
+    }
+  ],
+  "limitations": ["Tests have not been run"]
+}
+```
+
+```bash
+ccd delegate @username "review my checkout changes" --context-file /path/to/context.json
+```
+
+Use only these item kinds: `requirement`, `diff`, `file_excerpt`, `error`,
+`test_output`, `decision`, or `freeform`. Include only task-relevant excerpts.
+Never attach raw memory, full conversation history, `.env` files, credentials,
+tokens, private keys, or unrelated files. The CLI computes content hashes and
+rejects oversized, tampered, or obviously secret-bearing capsules.
+
 By default, `ccd delegate` stays open while approval or execution is pending,
 then prints the correlated peer reply. Present that reply naturally to the
 user. Do not stop merely because the command first reports `delegated` or

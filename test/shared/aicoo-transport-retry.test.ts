@@ -47,6 +47,29 @@ describe("hosted transport retry", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it("gives default heartbeats enough time for a slow development server", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn((() => new Promise<Response>((resolve) => {
+        setTimeout(() => resolve(new Response(null, { status: 204 })), 6_000);
+      })) as unknown as typeof fetch);
+      const client = new AicooTransport({
+        baseUrl: "https://example.test",
+        token: "aicoo_sk_example",
+        deviceId: "device-1",
+        fetchImpl,
+      });
+
+      const heartbeat = client.heartbeatEndpoint("ep_1");
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      await expect(heartbeat).resolves.toBeUndefined();
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("aborts with a diagnosable reason instead of a bare AbortError", async () => {
     await expect(transport(hangingFetch()).heartbeatEndpoint("ep_1")).rejects.toThrow(
       /timed out after 20ms \(attempt 2\/2\).*POST .*\/endpoints\/ep_1\/heartbeat/,
