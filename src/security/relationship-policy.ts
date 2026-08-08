@@ -13,6 +13,13 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { InboundMessage } from "../adapters/runtime-adapter.js";
+import {
+  markTrustedToolPolicyUsed,
+  policyMatchesOwner,
+  readTrustedToolPolicies,
+  type TrustedToolPolicy,
+  type TrustedToolPolicyIdentity,
+} from "./trusted-tool-policy.js";
 
 const policySchema = z.object({
   version: z.literal(1),
@@ -40,10 +47,19 @@ interface CompiledRelationship {
   folders: readonly string[];
 }
 
+interface RelationshipPolicyOptions extends Partial<TrustedToolPolicyIdentity> {
+  trustedToolPolicyFile?: string;
+}
+
 const PATH_INPUTS = {
   Read: ["file_path"],
   Write: ["file_path"],
   Edit: ["file_path"],
+  GitStatus: ["repository"],
+  GitDiff: ["repository"],
+  GitLog: ["repository"],
+  GitAdd: ["repository"],
+  GitCommit: ["repository"],
 } as const;
 
 const POLICY_SUPPORTED_TOOLS = Object.keys(PATH_INPUTS).sort();
@@ -66,6 +82,8 @@ const CREDENTIAL_FILE_NAMES = new Set([
   "credentials",
 ]);
 const EXECUTION_ON_NEXT_USE_PATHS = new Set([
+  ".gitattributes",
+  ".git/config",
   ".git/hooks",
   ".vscode/tasks.json",
   "Makefile",
@@ -89,10 +107,25 @@ export class RelationshipPolicy {
   readonly #relationships: readonly CompiledRelationship[];
   readonly #cwd: string;
   readonly #policyFile: string;
+  readonly #trustedToolPolicyFile?: string;
+  readonly #trustedPolicies: readonly TrustedToolPolicy[];
 
-  private constructor(document: RelationshipPolicyDocument, cwd: string, policyFile: string) {
+  private constructor(
+    document: RelationshipPolicyDocument,
+    cwd: string,
+    policyFile: string,
+    options: RelationshipPolicyOptions = {},
+  ) {
     this.#cwd = canonicalPath(cwd);
     this.#policyFile = canonicalPath(policyFile);
+    this.#trustedToolPolicyFile = options.trustedToolPolicyFile
+      ? canonicalPath(options.trustedToolPolicyFile)
+      : undefined;
+    const trustedIdentity = trustedPolicyIdentity(options);
+    this.#trustedPolicies = this.#trustedToolPolicyFile && trustedIdentity
+      ? readTrustedToolPolicies(this.#trustedToolPolicyFile).policies.filter((policy) =>
+        policyMatchesOwner(policy, trustedIdentity))
+      : [];
     this.#relationships = document.relationships.map((relationship) => ({
       principalId: relationship.principalId,
       deviceId: relationship.deviceId,
@@ -107,10 +140,18 @@ export class RelationshipPolicy {
         }
       }
     }
+    for (const policy of this.#trustedPolicies) {
+      if (isWithin(policy.canonicalFolder, this.#policyFile)) {
+        throw new Error("Relationship policy must be stored outside every granted folder");
+      }
+      if (this.#trustedToolPolicyFile && isWithin(policy.canonicalFolder, this.#trustedToolPolicyFile)) {
+        throw new Error("Trusted tool policy must be stored outside every granted folder");
+      }
+    }
   }
 
-  static fromFile(file: string, cwd: string): RelationshipPolicy {
-    return new RelationshipPolicy(readPolicyDocument(file), cwd, file);
+  static fromFile(file: string, cwd: string, options: RelationshipPolicyOptions = {}): RelationshipPolicy {
+    return new RelationshipPolicy(readPolicyDocument(file), cwd, file, options);
   }
 
   static supportedTools(): string[] {
@@ -118,19 +159,30 @@ export class RelationshipPolicy {
   }
 
   enabledTools(): string[] {
-    return [...new Set(this.#relationships.flatMap((relationship) => [...relationship.tools]))]
+    return [...new Set([
+      ...this.#relationships.flatMap((relationship) => [...relationship.tools]),
+      ...this.#trustedPolicies.map((policy) => policy.normalizedTool),
+    ])]
       .filter((tool) => POLICY_SUPPORTED_TOOL_SET.has(tool))
       .sort();
   }
 
   grantedFolders(): string[] {
-    return [...new Set(this.#relationships.flatMap((relationship) => relationship.folders))].sort();
+    return [...new Set([
+      ...this.#relationships.flatMap((relationship) => relationship.folders),
+      ...this.#trustedPolicies.map((policy) => policy.canonicalFolder),
+    ])].sort();
   }
 
   writableFolders(): string[] {
-    return [...new Set(this.#relationships
+    return [...new Set([
+      ...this.#relationships
       .filter((relationship) => relationship.tools.has("Write") || relationship.tools.has("Edit"))
-      .flatMap((relationship) => relationship.folders))]
+      .flatMap((relationship) => relationship.folders),
+      ...this.#trustedPolicies
+        .filter((policy) => ["Write", "Edit", "GitAdd", "GitCommit"].includes(policy.normalizedTool))
+        .map((policy) => policy.canonicalFolder),
+    ])]
       .sort();
   }
 
@@ -147,12 +199,33 @@ export class RelationshipPolicy {
     const relationship = this.#relationships.find((candidate) =>
       candidate.principalId === message.senderPrincipalId
       && candidate.deviceId === message.senderDeviceId);
-    return Boolean(relationship && relationship.tools.size > 0);
+    return Boolean(
+      (relationship && relationship.tools.size > 0)
+      || this.#trustedPolicies.some((policy) =>
+        policy.requesterPrincipalId === message.senderPrincipalId
+        && policy.requesterDeviceId === message.senderDeviceId),
+    );
   }
 
   authorize(
     action: { toolName: string; input: Record<string, unknown> },
     message: InboundMessage | undefined,
+  ): ToolPermissionDecision {
+    return this.#authorize(action, message, true);
+  }
+
+  /** Validate the verified relationship and folder without treating that as a per-tool grant. */
+  authorizeBoundary(
+    action: { toolName: string; input: Record<string, unknown> },
+    message: InboundMessage | undefined,
+  ): ToolPermissionDecision {
+    return this.#authorize(action, message, false);
+  }
+
+  #authorize(
+    action: { toolName: string; input: Record<string, unknown> },
+    message: InboundMessage | undefined,
+    requireToolGrant: boolean,
   ): ToolPermissionDecision {
     if (!message) return deny("No active verified c2c message");
     if (!message.senderDeviceId) return deny("Sender device identity is unavailable");
@@ -160,14 +233,30 @@ export class RelationshipPolicy {
     const relationship = this.#relationships.find((candidate) =>
       candidate.principalId === message.senderPrincipalId
       && candidate.deviceId === message.senderDeviceId);
-    if (!relationship) return deny("No policy for this user and device");
+    const trustedPolicies = this.#trustedPolicies.filter((policy) =>
+      policy.requesterPrincipalId === message.senderPrincipalId
+      && policy.requesterDeviceId === message.senderDeviceId);
+    if (!relationship && trustedPolicies.length === 0) return deny("No policy for this user and device");
     if (!POLICY_SUPPORTED_TOOL_SET.has(action.toolName) || action.toolName.startsWith("mcp__")) {
       return deny(`Unsupported tool ${action.toolName}`);
     }
-    if (!relationship.tools.has(action.toolName)) return deny(`Tool ${action.toolName} is not allowed`);
+    const trustedToolPolicies = trustedPolicies.filter((policy) => policy.normalizedTool === action.toolName);
+    const relationshipAllowsTool = relationship?.tools.has(action.toolName) ?? false;
+    if (requireToolGrant && !relationshipAllowsTool && trustedToolPolicies.length === 0) {
+      const boundary = this.#authorize(action, message, false);
+      return boundary.behavior === "allow"
+        ? { behavior: "deny", message: `Tool ${action.toolName} is not allowed`, updatedInput: boundary.updatedInput }
+        : boundary;
+    }
 
     const pathKeys = PATH_INPUTS[action.toolName as keyof typeof PATH_INPUTS];
-    if (relationship.folders.length === 0) return deny(`Tool ${action.toolName} requires an allowed folder`);
+    const relationshipFolders = requireToolGrant && !relationshipAllowsTool
+      ? []
+      : relationship?.folders ?? [];
+    const trustedFolders = (requireToolGrant ? trustedToolPolicies : trustedPolicies)
+      .map((policy) => policy.canonicalFolder);
+    const allowedFolders = [...new Set([...relationshipFolders, ...trustedFolders])];
+    if (allowedFolders.length === 0) return deny(`Tool ${action.toolName} requires an allowed folder`);
 
     const paths = pathKeys.flatMap((key) => {
       const value = action.input[key];
@@ -179,20 +268,40 @@ export class RelationshipPolicy {
     for (const path of paths) {
       let candidate: string;
       try {
-        candidate = resolveRelationshipPath(this.#cwd, relationship.folders, path.value);
+        candidate = resolveRelationshipPath(this.#cwd, allowedFolders, path.value);
       } catch {
         return deny("Path could not be resolved safely");
       }
       if (candidate === this.#policyFile) return deny("Relationship policy cannot be accessed by a remote tool");
       const dangerous = dangerousPathDecision(action.toolName, candidate);
       if (dangerous) return deny(dangerous);
-      if (!relationship.folders.some((folder) => isWithin(folder, candidate))) {
+      if (!allowedFolders.some((folder) => isWithin(folder, candidate))) {
         return deny(`Path is outside the folders allowed for this relationship`);
       }
       updatedInput[path.key] = candidate;
     }
+    if (requireToolGrant && this.#trustedToolPolicyFile) {
+      const matches = (policy: TrustedToolPolicy) =>
+        paths.every((path) => {
+          const candidate = updatedInput[path.key];
+          return typeof candidate === "string" && isWithin(policy.canonicalFolder, candidate);
+        });
+      const matched = trustedToolPolicies.find((policy) => policy.createdFrom !== "cli" && matches(policy))
+        ?? trustedToolPolicies.find(matches);
+      if (matched) markTrustedToolPolicyUsed(this.#trustedToolPolicyFile, matched.policyId);
+    }
     return { behavior: "allow", updatedInput };
   }
+}
+
+function trustedPolicyIdentity(options: RelationshipPolicyOptions): TrustedToolPolicyIdentity | undefined {
+  return options.ownerPrincipalId && options.ownerDeviceId && options.bridgeInstanceId
+    ? {
+      ownerPrincipalId: options.ownerPrincipalId,
+      ownerDeviceId: options.ownerDeviceId,
+      bridgeInstanceId: options.bridgeInstanceId,
+    }
+    : undefined;
 }
 
 export function upsertRelationshipPreset(input: {
@@ -214,6 +323,11 @@ export function upsertRelationshipPreset(input: {
     tools: [...PRESET_TOOLS[input.preset]],
     folders: folder ? [folder] : [],
   });
+}
+
+/** Start or end an ephemeral bridge run with no remembered peer file permissions. */
+export function resetRelationshipPolicy(file: string): void {
+  writePolicyDocument(file, { version: 1, relationships: [] });
 }
 
 /** Persist the server's exact folder boundary and per-tool policy without expanding presets. */
