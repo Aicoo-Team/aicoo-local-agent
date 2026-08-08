@@ -396,21 +396,24 @@ export class LocalDmAgent {
 
     if (!READ_TOOLS.includes(toolName)) {
       const capability = capabilityFor(toolName);
-      // A read outside the folders can be escalated to the owner; a write cannot. Reading the
-      // wrong file is recoverable and visible; writing one is neither, and "may I change
-      // something outside what you shared" is not a question worth having an answer to.
+      // A write outside the folders is put to the owner, like a read, but never quietly: the
+      // prompt has to say it CHANGES a file, because that is the whole difference. This used to
+      // be refused outright on the grounds that "may I change something outside what you
+      // shared" is not worth asking — but refusing it also means an owner who genuinely wants
+      // one file written next door has no way to say yes, and works around the agent instead.
+      // What must not be asked is still not asked: credential stores and execute-on-next-run
+      // paths were refused above, before any of this ran.
       if (capability === "write" && this.policy.can("write")) {
         const target = input?.file_path ?? input?.notebook_path;
-        if (!target || !this.#folderFor(target)) {
-          const real = target ? resolveReal(target, this.workspace) : null;
-          this.log(`[gate] write outside the shared folders refused: ${printableSafe(real ?? String(target))}`);
+        if (!target) {
           return {
             allow: false,
-            reason: "Writing is limited to the shared folders, and that path is outside them.",
-            rule: "write-outside-folders",
-            target: String(real ?? target),
+            reason: "A write has to name the file it changes.",
+            rule: "write-without-path",
+            target: toolName,
           };
         }
+        if (!this.#folderFor(target)) return this.#evaluateOutsideFolders(toolName, target, { writing: true });
       }
       if (capability && this.policy.can(capability)) return this.#evaluateCapability(capability, toolName, input);
       return {
@@ -518,7 +521,7 @@ export class LocalDmAgent {
    *  - A budget per turn. The point of a wall is to protect the owner's attention as much as
    *    their files; a peer who can ring the terminal indefinitely gets a `y` eventually.
    */
-  async #evaluateOutsideFolders(toolName, target) {
+  async #evaluateOutsideFolders(toolName, target, { writing = false } = {}) {
     const real = resolveReal(target, this.workspace);
     if (real === null) {
       return { allow: false, reason: "Path could not be resolved.", rule: "path-unresolvable", target: String(target) };
@@ -532,16 +535,31 @@ export class LocalDmAgent {
       return { allow: false, reason: "Too many out-of-folder requests in one turn.", rule: "escalation-budget", target: real };
     }
     this.#escalations += 1;
-    this.log(`[gate] OUTSIDE the shared folders — asking the owner: ${printableSafe(real)}`);
+    this.log(`[gate] OUTSIDE the shared folders — asking the owner to ${writing ? "CHANGE" : "read"}: ${printableSafe(real)}`);
     const allowed = await this.#askOwner({
       toolName,
       // Who is asking belongs in the line, not just what for. A one-time link with a password
       // means the owner sent it to someone specific, so this is a real decision about a real
       // intended recipient — but they cannot verify the holder IS that person, and the prompt
       // should not read as though they can.
-      summary: `OUTSIDE the folders you shared\n   path: ${printableSafe(real)}\n   asked by: ${this.peerLabel}${this.policy.isGuest ? " — identity not verified" : ""}`,
+      //
+      // Read and write are one word apart on the screen and worlds apart in consequence, so
+      // the write case leads with the verb rather than burying it in a tool name the owner is
+      // not required to know.
+      summary: [
+        writing
+          ? "OUTSIDE the folders you shared — and this CHANGES a file"
+          : "OUTSIDE the folders you shared",
+        `   path: ${printableSafe(real)}`,
+        `   asked by: ${this.peerLabel}${this.policy.isGuest ? " — identity not verified" : ""}`,
+      ].join("\n"),
       kind: "escalation",
     });
+    if (writing) {
+      return allowed
+        ? { allow: true, reason: "The owner allowed this one write outside the shared folders.", rule: "owner-escalated-write", target: real }
+        : { allow: false, reason: "That path is outside the shared folders and the owner declined the change.", rule: "owner-declined-escalation-write", target: real };
+    }
     return allowed
       ? { allow: true, reason: "The owner allowed this one read outside the shared folders.", rule: "owner-escalated", target: real }
       : { allow: false, reason: "That path is outside the shared folders and the owner declined.", rule: "owner-declined-escalation", target: real };

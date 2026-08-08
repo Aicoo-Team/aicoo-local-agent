@@ -12,9 +12,9 @@ import { dirname } from "node:path";
 export class AgentState {
   constructor(file) {
     this.file = file;
-    this.data = { sessionId: null, cursors: {}, failures: {}, grants: {} };
+    this.data = { sessionId: null, cursors: {}, failures: {}, grants: {}, restarts: [] };
     try {
-      this.data = { sessionId: null, cursors: {}, failures: {}, grants: {}, ...JSON.parse(readFileSync(file, "utf8")) };
+      this.data = { sessionId: null, cursors: {}, failures: {}, grants: {}, restarts: [], ...JSON.parse(readFileSync(file, "utf8")) };
     } catch {
       /* first run */
     }
@@ -35,6 +35,23 @@ export class AgentState {
 
   setGrant(key, decision) {
     this.data.grants[key] = { decision, at: new Date().toISOString() };
+    this.save();
+  }
+
+  /**
+   * When this agent last replaced itself, and how often lately.
+   *
+   * On disk rather than in memory because the thing being rate-limited is the restart, and a
+   * restart is precisely what destroys memory. A real test respawned three times in forty
+   * seconds against a ten-minute limit: each replacement started counting from zero and
+   * happily restarted again. A machine with its network off would have done that forever.
+   */
+  recentRestarts(withinMs = 3_600_000, now = Date.now()) {
+    return (this.data.restarts ?? []).filter((at) => now - at < withinMs);
+  }
+
+  noteRestart(now = Date.now()) {
+    this.data.restarts = [...this.recentRestarts(3_600_000, now), now];
     this.save();
   }
 

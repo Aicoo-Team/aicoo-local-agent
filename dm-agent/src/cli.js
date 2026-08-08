@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { createWriteStream, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, renameSync, statSync, writeSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { AicooApi } from "./api.js";
 import { LocalDmAgent } from "./agent.js";
@@ -12,6 +13,7 @@ import { Policy, PolicyError } from "./policy.js";
 import { AuditLog } from "./audit.js";
 import { acquireLock, LockError } from "./lock.js";
 import { checkModelReachable, explainUnreachable } from "./preflight.js";
+import { ReachabilityWatch, respawn } from "./reachability.js";
 import { collectSecrets, redact } from "./redact.js";
 
 const DEFAULT_SERVER = "https://www.aicoo.io";
@@ -27,7 +29,7 @@ const MAX_MESSAGE_ATTEMPTS = 3;
  * what is waiting on them — and nothing outside this process can watch for it either. A file
  * next to the state gives both: the owner can look back, and a monitor can tail it.
  */
-let logSink = null;
+let logFd = null;
 let logPath = null;
 
 function setLogFile(path) {
@@ -37,21 +39,31 @@ function setLogFile(path) {
     mkdirSync(dirname(path), { recursive: true });
     // A log that grows without bound eventually becomes the reason someone stops keeping it.
     if (existsSync(path) && statSync(path).size > 5_000_000) renameSync(path, `${path}.1`);
-    logSink = createWriteStream(path, { flags: "a" });
-    // A broken log must never take the agent down with it — this is a convenience, not the job.
-    logSink.on("error", () => { logSink = null; });
+    logFd = openSync(path, "a");
   } catch {
-    logSink = null;
+    logFd = null;
   }
 }
 
+/**
+ * Written synchronously, deliberately.
+ *
+ * A buffered stream loses whatever has not flushed when process.exit() runs, and the lines
+ * that immediately precede an exit are the only ones that explain it: FATAL on a rejected key,
+ * the lock conflict naming the process to stop, and "replacing this process" before a restart.
+ * A real restart test produced four startups and zero explanations for exactly this reason —
+ * the agent appeared to reboot itself for no stated reason. The volume here is a few lines a
+ * minute, so a synchronous write costs nothing worth measuring.
+ */
 function log(line) {
   const stamped = `[${new Date().toISOString()}] ${line}`;
   console.log(stamped);
+  if (logFd === null) return;
   try {
-    logSink?.write(`${stamped}\n`);
+    writeSync(logFd, `${stamped}\n`);
   } catch {
-    logSink = null;
+    // A broken log must never take the agent down with it — this is a convenience, not the job.
+    logFd = null;
   }
 }
 
@@ -553,6 +565,44 @@ async function main() {
   process.on("SIGINT", () => stop("SIGINT"));
   process.on("SIGTERM", () => stop("SIGTERM"));
 
+  // Being briefly unreachable is ordinary — roughly 0.3% of polls fail on a normal day. Staying
+  // unreachable is not, and used to go entirely unhandled: a three-day-old agent failed every
+  // poll for 37 minutes while a fresh process reached the same endpoint in 670ms.
+  const reach = new ReachabilityWatch({
+    warnAfterMs: Number(args["warn-after"] ?? 120) * 1000,
+    restartAfterMs: args["no-self-restart"] ? Infinity : Number(args["restart-after"] ?? 300) * 1000,
+    // Inherited from disk, because a restart is exactly what erases in-memory rate limits.
+    priorRestarts: state.recentRestarts(),
+    onRestart: () => state.noteRestart(),
+  });
+  const priorRestarts = state.recentRestarts();
+  if (priorRestarts.length) {
+    log(`note: this agent has replaced itself ${priorRestarts.length}x in the last hour (most recently ${new Date(Math.max(...priorRestarts)).toISOString()})`);
+  }
+  // "0m" is what a 40-second outage rounds to, and it reads as "no time at all" next to a
+  // warning that something is wrong. Say seconds when it is seconds.
+  const forHuman = (ms) => (ms < 90_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`);
+  const notePollOk = () => {
+    const { recovered, downForMs } = reach.ok();
+    if (recovered) log(`reachable again — Aicoo was unreachable for ${forHuman(downForMs)}`);
+  };
+  // `alreadyLogged` exists because the named-peer loop prints a richer line of its own (401
+  // handling, the proxy hint) and printing the raw error twice per poll would bury both.
+  const notePollFail = (error, { alreadyLogged = false } = {}) => {
+    if (!alreadyLogged) log(`[poll] ${String(error.message ?? error)}`);
+    const { action, downForMs, reason } = reach.fail();
+    const mins = forHuman(downForMs);
+    if (action === "warn") {
+      log(`WARNING: cannot reach Aicoo — ${mins} and counting. Nothing is lost; visitors are waiting. Still retrying.`);
+    } else if (action === "stuck") {
+      log(`WARNING: still cannot reach Aicoo after ${mins}, and not restarting again (${reason}). This looks like the network or Aicoo, not this process — check both.`);
+    } else if (action === "restart") {
+      log(`unreachable for ${mins} — that is no longer a blip.`);
+      reach.noteRestart();
+      respawn({ releaseLock, log, spawn, exit: (code) => process.exit(code) });
+    }
+  };
+
   // ── Share-link mode ──
   // A guest policy means this machine is answering visitors on a link rather than one named
   // person, so it polls the guest queue instead of conversations. Same turn, same gate, same
@@ -564,6 +614,7 @@ async function main() {
       try {
         const cursor = state.cursor("guest") ?? 0;
         const { links, messages } = await api.guestMessages(cursor);
+        notePollOk();
         if (!announced) {
           announced = true;
           log(links.length
@@ -607,7 +658,7 @@ async function main() {
         // Nothing to answer: still move past our own replies so they are not re-fetched.
         if (!fresh.length && maxId > cursor) state.setCursor("guest", maxId);
       } catch (error) {
-        log(`[poll] ${String(error.message ?? error)}`);
+        notePollFail(error);
       }
       await delay(pollMs);
     }
@@ -622,6 +673,7 @@ async function main() {
         // two different answers. Keeping to the DM makes the split legible: the DM
         // reaches the machine, the agent thread reaches the cloud.
         .filter((c) => (watchAgentThread ? c.type !== "group" : c.type === "direct"));
+      notePollOk();
       for (const conv of conversations) {
         const cursor = state.cursor(conv.conversationId);
         const messages = (conv.messages ?? []).filter((m) => m.id != null);
@@ -674,6 +726,7 @@ async function main() {
       }
       const detail = String(error.message ?? error);
       log(`poll error: ${detail.slice(0, 300)}`);
+      notePollFail(error, { alreadyLogged: true });
       // These two fail identically every few seconds forever, and the raw text says
       // nothing about the fix. Name it once, the first time it happens.
       if (!runtimeHintShown) {

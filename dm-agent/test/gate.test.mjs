@@ -102,6 +102,7 @@ const check = (label, cond) => { checks.push([label, cond]); };
   });
 
   const n = () => asked.length;
+  const lastPrompt = () => asked[asked.length - 1];
   let before = n();
   await agent.decide("Bash", { command: "git status" });
   check("a first shell command asks", n() === before + 1);
@@ -124,12 +125,26 @@ const check = (label, cond) => { checks.push([label, cond]); };
   await agent.decide("Write", { file_path: join(ws, "b.md"), content: "x" });
   check("a different file is a new question", n() === before + 1);
 
-  // Reads may escalate outside the folders; writes may not. Changing a file outside what was
-  // shared is not recoverable the way reading one is, so there is no question to ask.
+  // A write outside the folders is the owner's call, like a read — but it must reach them as a
+  // write. Refusing it outright used to seem safer; in practice it left an owner who wanted one
+  // file written next door with no way to say so, and the prompt is where that belongs.
   before = n();
   const out = await agent.decide("Write", { file_path: join(outside, "c.md"), content: "x" });
-  check("write outside the shared folders is denied", out.allow === false);
-  check("...by rule, not by asking", out.rule === "write-outside-folders" && n() === before);
+  check("write outside the shared folders asks the owner", n() === before + 1);
+  check("...and this owner said yes", out.allow === true);
+  check("...recorded as a write escalation, not a read one", out.rule === "owner-escalated-write");
+  check("...and the prompt says it CHANGES a file", /CHANGES a file/.test(lastPrompt()?.summary ?? ""));
+  check("...and names the path", (lastPrompt()?.summary ?? "").includes(join(outside, "c.md")));
+
+  // What must never be asked is still never asked. These sit above the folder logic, so the
+  // change above cannot have opened them: a shell rc or the agent's own state being one `y`
+  // away is delayed code execution and a self-granted permission respectively.
+  before = n();
+  const rc = await agent.decide("Write", { file_path: join(homedir(), ".zshrc"), content: "x" });
+  check("a shell rc is refused without asking", rc.allow === false && rc.rule === "path-never-writable");
+  const own = await agent.decide("Write", { file_path: join(homedir(), ".aicoo-dm-agent", "state.json"), content: "x" });
+  check("the agent's own state is refused without asking", own.allow === false);
+  check("...and neither woke the owner", n() === before);
 
   // A capability the owner did NOT enable is refused, and says which one is missing.
   const bare = new LocalDmAgent({
