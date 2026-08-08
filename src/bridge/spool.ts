@@ -188,6 +188,10 @@ export class BridgeSpool {
     return row?.value;
   }
 
+  deleteIdentity(key: string): void {
+    this.db.prepare("DELETE FROM bridge_identity WHERE key = ?").run(key);
+  }
+
   saveSessionMapping(nativeHandle: string, serverHandle: string, label: string): void {
     this.db.prepare(
       `INSERT INTO session_mappings(native_handle, server_handle, label) VALUES (?, ?, ?)
@@ -209,6 +213,10 @@ export class BridgeSpool {
       label: string;
     }>;
     return rows.map((row) => ({ nativeHandle: row.native_handle, serverHandle: row.server_handle, label: row.label }));
+  }
+
+  deleteSessionMapping(nativeHandle: string): void {
+    this.db.prepare("DELETE FROM session_mappings WHERE native_handle = ?").run(nativeHandle);
   }
 
   cursor(serverKey: string): string {
@@ -314,6 +322,12 @@ export class BridgeSpool {
       `UPDATE spool_messages SET status = 'blocked', last_result_code = ?
        WHERE comm_session_id = ? AND status NOT IN ('injected', 'failed', 'blocked')`,
     ).run(reason, commSessionId);
+    this.db.prepare(
+      `UPDATE injection_attempts SET reported = 1
+       WHERE reported = 0 AND message_id IN (
+         SELECT message_id FROM spool_messages WHERE comm_session_id = ?
+       )`,
+    ).run(commSessionId);
     this.setGrant(commSessionId, grantStatus);
   }
 

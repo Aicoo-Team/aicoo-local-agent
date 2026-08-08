@@ -78,10 +78,19 @@ describe("collaboration runtime replies", () => {
       replyTo: "msg-1",
       correlationId: "corr-1",
     });
+    spool.recordAttempt({
+      attemptId: "attempt-1",
+      messageId: "msg-1",
+      phase: "runtime_ack",
+      retryable: false,
+      runtimeAckId: "runtime-1",
+      createdAt: new Date().toISOString(),
+    });
 
     expect(spool.blockCollaboration("collab-1", "collaboration_completed")).toEqual(["comm-1"]);
     expect(spool.getMessage("msg-1")?.status).toBe("blocked");
     expect(spool.getOutboundReply("event-1")?.status).toBe("failed");
+    expect(spool.listPendingReports()).toEqual([]);
     spool.close();
   });
 });

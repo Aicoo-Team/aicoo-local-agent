@@ -76,6 +76,26 @@ export class Injector {
 
   private async flushPendingReports(): Promise<void> {
     for (const report of this.spool.listPendingReports()) {
+      const message = this.spool.getMessage(report.messageId);
+      if (!message || message.status === "blocked") {
+        this.spool.markAttemptReported(report.attemptId);
+        continue;
+      }
+      try {
+        const validation = await this.transport.validateInjection({
+          messageId: message.messageId,
+          communicationSessionId: message.communicationSessionId,
+          endpointId: this.endpointId,
+          sessionHandle: message.sessionHandle,
+        });
+        if (!validation.valid) {
+          this.spool.markResult(message.messageId, "blocked", validation.reason);
+          this.spool.markAttemptReported(report.attemptId);
+          continue;
+        }
+      } catch {
+        return;
+      }
       try {
         await this.transport.acknowledgeDelivery({
           messageId: report.messageId,

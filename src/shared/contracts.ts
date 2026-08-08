@@ -39,6 +39,7 @@ export interface RuntimeSessionBinding {
   endpointId: string;
   principalId: string;
   label: string;
+  workspaceBoundary?: string;
   state: "idle" | "busy" | "closed";
   deliveryMode: "managed_stream" | "remote_control" | "resume_only";
   capabilities: {
@@ -175,10 +176,20 @@ export interface RuntimeEvent<T = Record<string, unknown>> {
     | "collaboration.completed"
     | "collaboration.revoked"
     | "collaboration.expired"
-    | "relationship.policy_update";
+    | "relationship.policy_update"
+    | "trusted_tool_policy.upserted"
+    | "trusted_tool_policy.revoked";
   endpointId: string;
   createdAt: string;
   data: T;
+}
+
+export interface TrustedToolPolicyUsageInput {
+  policyId: string;
+  revision: number;
+  normalizedTool: string;
+  canonicalFolder: string;
+  uses: Array<{ sequence: number; usedAt: string }>;
 }
 
 export interface ReachableTarget {
@@ -199,6 +210,7 @@ export interface RegisterEndpointInput {
 
 export interface RegisterRuntimeSessionInput {
   label: string;
+  workspaceBoundary?: string;
   state: "idle" | "busy";
   deliveryMode: "managed_stream";
   capabilities: RuntimeSessionBinding["capabilities"];

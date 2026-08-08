@@ -5,6 +5,13 @@ import {
   upsertRelationshipPreset,
   type RelationshipAccessPreset,
 } from "../security/relationship-policy.js";
+import {
+  isTrustedToolName,
+  markTrustedToolPolicyUsesReported,
+  pendingTrustedToolPolicyUses,
+  revokeTrustedToolPolicy,
+  upsertTrustedToolPolicy,
+} from "../security/trusted-tool-policy.js";
 import type {
   CollaborationTurnInput,
   LocalAgentDelegationInput,
@@ -20,7 +27,7 @@ import { BridgeSpool } from "./spool.js";
  * The control plane declares an endpoint unreachable once lastSeenAt is older than 60s
  * (LOCAL_AGENT_ENDPOINT_STALE_MS), and lastSeenAt only advances on a *successful* heartbeat.
  * runHeartbeat is serial, so the worst gap between successful beats is
- * DEFAULT_HEARTBEAT_MS + attempts * (heartbeatCap + defaultRouteCap) = 10s + 2*(5s+5s) = 30s.
+ * DEFAULT_HEARTBEAT_MS + attempts * (heartbeatCap + defaultRouteCap) = 10s + 2*(10s+5s) = 40s.
  * At the previous 20s this was 50s — one bad beat away from the endpoint being dropped from
  * routing, which presents to the sender as "their local agent is not running".
  */
@@ -33,9 +40,15 @@ export interface BridgeOptions {
   runtime?: "claude-code" | "codex";
   bridgeVersion?: string;
   adapterVersion?: string;
+  workspaceBoundary?: string;
   heartbeatMs?: number;
   injectorMs?: number;
   relationshipPolicyFile?: string;
+  trustedToolPolicyFile?: string;
+  ownerPrincipalId?: string;
+  ownerDeviceId?: string;
+  /** Fresh for each bridge process. Folder grants are valid only while this instance is alive. */
+  bridgeInstanceId?: string;
   hooks?: InjectionHooks;
   log?: (line: string) => void;
 }
@@ -49,8 +62,11 @@ export class RuntimeBridge {
   #pendingDefaultRoute?: string;
   #publishedDefaultRoute?: string;
   #beforeExitHandler?: (code: number) => void;
+  readonly #bridgeInstanceId: string;
 
-  constructor(private readonly options: BridgeOptions) {}
+  constructor(private readonly options: BridgeOptions) {
+    this.#bridgeInstanceId = options.bridgeInstanceId ?? id("bridge");
+  }
 
   get endpointId(): string | undefined {
     return this.#endpointId;
@@ -74,7 +90,10 @@ export class RuntimeBridge {
       bridgeVersion: this.options.bridgeVersion ?? "0.1.0",
       adapterVersion: this.options.adapterVersion
         ?? (this.options.adapter instanceof FakeRuntimeAdapter ? FakeRuntimeAdapter.adapterVersion : "unknown"),
-      capabilities: Object.entries(adapterCapabilities).filter(([, value]) => value).map(([key]) => key),
+      capabilities: [
+        ...Object.entries(adapterCapabilities).filter(([, value]) => value).map(([key]) => key),
+        `bridge-instance:${this.#bridgeInstanceId}`,
+      ],
     });
     this.#endpointId = endpoint.endpointId;
     this.options.spool.setIdentity("endpointId", endpoint.endpointId);
@@ -82,6 +101,20 @@ export class RuntimeBridge {
     this.options.spool.setIdentity("serverKey", endpoint.endpointId);
 
     const sessions = await this.options.adapter.listSessions();
+    const activeNativeHandles = new Set(sessions.map((session) => session.sessionHandle));
+    for (const stale of this.options.spool.listSessionMappings()) {
+      if (activeNativeHandles.has(stale.nativeHandle)) continue;
+      try {
+        await this.options.transport.updateRuntimeSession(endpoint.endpointId, stale.serverHandle, {
+          state: "closed",
+          allowInbound: false,
+        });
+      } catch (error) {
+        this.options.log?.(`stale runtime session could not be closed remotely: ${String(error)}`);
+      }
+      this.options.spool.deleteSessionMapping(stale.nativeHandle);
+      this.options.log?.(`[bridge] removed stale session mapping ${stale.nativeHandle}`);
+    }
     for (const descriptor of sessions) {
       const existing = this.options.spool.getSessionMapping(descriptor.sessionHandle);
       let serverHandle = existing?.serverHandle;
@@ -90,6 +123,7 @@ export class RuntimeBridge {
           await this.options.transport.updateRuntimeSession(endpoint.endpointId, serverHandle, {
             state: descriptor.state,
             allowInbound: descriptor.allowInbound,
+            ...(this.options.workspaceBoundary ? { workspaceBoundary: this.options.workspaceBoundary } : {}),
           });
         } catch {
           serverHandle = undefined;
@@ -98,6 +132,7 @@ export class RuntimeBridge {
       if (!serverHandle) {
         const binding = await this.options.transport.registerRuntimeSession(endpoint.endpointId, {
           label: descriptor.label,
+          ...(this.options.workspaceBoundary ? { workspaceBoundary: this.options.workspaceBoundary } : {}),
           state: descriptor.state === "closed" ? "idle" : descriptor.state,
           deliveryMode: "managed_stream",
           capabilities: {
@@ -136,6 +171,7 @@ export class RuntimeBridge {
       this.runInjector(),
       this.runPendingDelegations(),
       this.runOutboundReplies(),
+      this.runTrustedToolUsageReports(),
       ...this.options.spool.listSessionMappings().map(({ nativeHandle, serverHandle }) =>
         this.runAdapterEvents(nativeHandle, serverHandle)),
     ];
@@ -239,6 +275,35 @@ export class RuntimeBridge {
     }
   }
 
+  private async runTrustedToolUsageReports(): Promise<void> {
+    while (!this.#controller.signal.aborted) {
+      await this.flushTrustedToolUsageReports();
+      await delay(1_000, this.#controller.signal);
+    }
+  }
+
+  private async flushTrustedToolUsageReports(): Promise<void> {
+    const file = this.options.trustedToolPolicyFile;
+    const ownerPrincipalId = this.options.ownerPrincipalId;
+    const ownerDeviceId = this.options.ownerDeviceId;
+    if (!file || !ownerPrincipalId || !ownerDeviceId) return;
+    try {
+      const pending = pendingTrustedToolPolicyUses(file, ownerPrincipalId, ownerDeviceId);
+      for (const { policy, serverRevision, uses } of pending) {
+        const result = await this.options.transport.reportTrustedToolPolicyUsage({
+          policyId: policy.policyId,
+          revision: serverRevision,
+          normalizedTool: policy.normalizedTool,
+          canonicalFolder: policy.canonicalFolder,
+          uses,
+        });
+        markTrustedToolPolicyUsesReported(file, policy.policyId, result.acceptedThroughSequence);
+      }
+    } catch (error) {
+      this.options.log?.(`trusted tool usage report deferred: ${String(error)}`);
+    }
+  }
+
   private async handleEvent(event: RuntimeEvent): Promise<void> {
     if (event.type === "message.dispatch") {
       const envelope = (event.data as { envelope?: { target?: { endpointId?: string } } }).envelope;
@@ -314,6 +379,79 @@ export class RuntimeBridge {
       }
     } else if (event.type === "relationship.policy_update") {
       this.applyRelationshipPolicyUpdate(event.data);
+    } else if (event.type === "trusted_tool_policy.upserted") {
+      await this.applyTrustedToolPolicyUpdate(event.data);
+    } else if (event.type === "trusted_tool_policy.revoked") {
+      this.applyTrustedToolPolicyRevocation(event.data);
+    }
+  }
+
+  private async applyTrustedToolPolicyUpdate(data: Record<string, unknown>): Promise<void> {
+    const file = this.options.trustedToolPolicyFile;
+    const policyId = stringField(data, "policyId");
+    const ownerPrincipalId = stringField(data, "ownerPrincipalId");
+    const ownerDeviceId = stringField(data, "ownerDeviceId");
+    const requesterPrincipalId = stringField(data, "requesterPrincipalId");
+    const requesterDeviceId = stringField(data, "requesterDeviceId");
+    const folder = stringField(data, "canonicalFolder");
+    const tool = stringField(data, "normalizedTool");
+    const scope = stringField(data, "scope");
+    const createdFrom = stringField(data, "createdFrom");
+    const createdBy = stringField(data, "createdBy");
+    const createdAtValue = stringField(data, "createdAt");
+    const bridgeInstanceId = stringField(data, "bridgeInstanceId");
+    const revision = numberField(data, "revision");
+    if (
+      !file || !policyId || !ownerPrincipalId || !ownerDeviceId || !requesterPrincipalId
+      || !requesterDeviceId || !folder || !tool || !isTrustedToolName(tool) || revision === undefined
+      || (createdFrom !== "settings" && createdFrom !== "approval_prompt") || !createdBy
+      || (scope !== "bridge_run" && scope !== "persistent")
+      || ownerPrincipalId !== this.options.ownerPrincipalId
+      || ownerDeviceId !== this.options.ownerDeviceId
+      || (scope === "bridge_run" && bridgeInstanceId !== this.#bridgeInstanceId)
+    ) {
+      this.options.log?.("trusted tool policy update ignored: invalid identity, tool, folder, or bridge run");
+      return;
+    }
+    try {
+      const policy = upsertTrustedToolPolicy({
+        file,
+        policyId,
+        ownerPrincipalId,
+        ownerDeviceId,
+        requesterPrincipalId,
+        requesterDeviceId,
+        folder,
+        normalizedTool: tool,
+        scope,
+        ...(scope === "bridge_run" ? { bridgeInstanceId } : {}),
+        createdFrom,
+        createdBy,
+        ...(createdAtValue ? { createdAt: new Date(createdAtValue) } : {}),
+        serverRevision: revision,
+      });
+      await this.options.transport.acknowledgeTrustedToolPolicy({
+        policyId,
+        revision,
+        canonicalFolder: policy.canonicalFolder,
+      });
+      this.options.log?.(`trusted tool policy applied: ${tool} for ${requesterPrincipalId}`);
+    } catch (error) {
+      this.options.log?.(`trusted tool policy update failed: ${String(error)}`);
+    }
+  }
+
+  private applyTrustedToolPolicyRevocation(data: Record<string, unknown>): void {
+    const file = this.options.trustedToolPolicyFile;
+    const policyId = stringField(data, "policyId");
+    const revokedBy = stringField(data, "revokedBy") ?? this.options.ownerPrincipalId;
+    const revision = numberField(data, "revision");
+    if (!file || !policyId || !revokedBy || revision === undefined) return;
+    try {
+      revokeTrustedToolPolicy({ file, policyId, revokedBy, serverRevision: revision });
+      this.options.log?.(`trusted tool policy revoked: ${policyId}`);
+    } catch (error) {
+      this.options.log?.(`trusted tool policy revocation failed: ${String(error)}`);
     }
   }
 
@@ -326,6 +464,11 @@ export class RuntimeBridge {
     const deviceId = stringField(data, "requesterDeviceId") ?? stringField(data, "deviceId");
     const preset = stringField(data, "access") ?? stringField(data, "preset");
     const folder = stringField(data, "folderPath") ?? stringField(data, "folder");
+    const bridgeInstanceId = stringField(data, "bridgeInstanceId");
+    if (bridgeInstanceId && bridgeInstanceId !== this.#bridgeInstanceId) {
+      this.options.log?.("relationship policy update ignored: it belongs to an earlier bridge run");
+      return;
+    }
     const hasExplicitTools = Object.prototype.hasOwnProperty.call(data, "tools");
     const explicitTools = Array.isArray(data.tools)
       && data.tools.every((tool) => typeof tool === "string" && tool.trim())
@@ -721,6 +864,11 @@ function shouldLogReconnect(failures: number): boolean {
 function stringField(data: Record<string, unknown>, key: string): string | undefined {
   const value = data[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberField(data: Record<string, unknown>, key: string): number | undefined {
+  const value = data[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function isRelationshipAccessPreset(value: string | undefined): value is RelationshipAccessPreset {

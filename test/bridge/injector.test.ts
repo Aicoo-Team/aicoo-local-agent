@@ -86,6 +86,44 @@ describe("Injector retry classification", () => {
       retryable: false,
     }));
   });
+
+  it("revalidates a pending ACK and stops retrying after revocation", async () => {
+    const spool = new BridgeSpool(":memory:");
+    cleanups.push(() => spool.close());
+    spool.storeDispatch(dispatchEvent());
+    spool.markDeviceAcked("msg_permission");
+    spool.recordAttempt({
+      attemptId: "attempt_pending_ack",
+      messageId: "msg_permission",
+      phase: "runtime_ack",
+      retryable: false,
+      runtimeAckId: "runtime-1",
+      createdAt: new Date().toISOString(),
+    });
+    spool.markResult("msg_permission", "injected_unreported", undefined, "runtime-1");
+    const transport = {
+      validateInjection: vi.fn(async () => ({ valid: false as const, reason: "collaboration_completed" })),
+      acknowledgeDelivery: vi.fn(async () => undefined),
+    } as unknown as HttpMessageTransport;
+    const adapter = { deliverToSession: vi.fn() } as unknown as RuntimeAdapter;
+    const injector = new Injector(
+      transport,
+      spool,
+      adapter,
+      "ep_b",
+      new Map([["server-session", "native-session"]]),
+    );
+
+    await injector.runOnce();
+
+    expect(spool.getMessage("msg_permission")).toMatchObject({
+      status: "blocked",
+      lastResultCode: "collaboration_completed",
+    });
+    expect(spool.listPendingReports()).toEqual([]);
+    expect(transport.acknowledgeDelivery).not.toHaveBeenCalled();
+    expect(adapter.deliverToSession).not.toHaveBeenCalled();
+  });
 });
 
 function dispatchEvent(): RuntimeEvent {

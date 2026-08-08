@@ -12,6 +12,7 @@ import type {
   RequestCommunicationSessionInput,
   RuntimeEvent,
   SendMessageInput,
+  TrustedToolPolicyUsageInput,
 } from "./contracts.js";
 
 export interface DelegationRequestOptions {
@@ -40,5 +41,9 @@ export interface MessageTransport {
     sessionHandle?: string;
   }): Promise<{ valid: true } | { valid: false; reason: string }>;
   acknowledgeDelivery(input: DeliveryAckInput): Promise<void>;
+  reportTrustedToolPolicyUsage(input: TrustedToolPolicyUsageInput): Promise<{
+    acceptedThroughSequence: number;
+    duplicate: boolean;
+  }>;
   getMessageStatus(messageId: string): Promise<MessageDelivery>;
 }
