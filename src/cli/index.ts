@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
@@ -8,14 +8,22 @@ import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
 import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
-import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
+import { ApiError, HttpMessageTransport, type ResolvedPersonResponse } from "../shared/http-client.js";
 import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
 import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import {
-  DEFAULT_RELATIONSHIP_POLICY_FILE,
+  resetRelationshipPolicy,
   upsertRelationshipPreset,
   type RelationshipAccessPreset,
 } from "../security/relationship-policy.js";
+import {
+  isTrustedToolName,
+  readTrustedToolPolicies,
+  revokeTrustedToolPolicy,
+  TRUSTED_TOOL_NAMES,
+  upsertTrustedToolPolicy,
+  type TrustedToolPolicyScope,
+} from "../security/trusted-tool-policy.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
@@ -138,7 +146,7 @@ program.command("bridge")
   .option(
     "--relationship-policy <file>",
     "JSON allowlist of tools/folders for verified users and devices",
-    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    process.env.CCD_RELATIONSHIP_POLICY,
   )
   .option("--model <model>", "provider model override", process.env.CLAUDE_MODEL)
   .action(async (options) => {
@@ -164,6 +172,117 @@ program.command("start")
   });
 
 program.command("whoami").action(async () => print(await makeClient().whoami()));
+
+const trustedTools = program.command("trusted-tools")
+  .description("manage narrow pre-approved collaborator tool access on this machine");
+
+trustedTools.command("allow")
+  .description("pre-approve one normalized tool for one verified collaborator device and folder")
+  .argument("<person>", "peer principal ID or @handle")
+  .requiredOption("--tool <tool>", `one of: ${TRUSTED_TOOL_NAMES.join(", ")}`)
+  .requiredOption("--folder <dir>", "exact local folder boundary")
+  .addOption(new Option("--scope <scope>", "permission lifetime")
+    .choices(["bridge-run", "always"])
+    .default("bridge-run"))
+  .option("--requester-device <id>", "verified peer device when more than one has been observed")
+  .option("--spool <file>", "running bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .action(async (person, options) => {
+    if (!isTrustedToolName(options.tool)) {
+      throw new Error(`Unsupported trusted tool ${options.tool}; choose one of ${TRUSTED_TOOL_NAMES.join(", ")}`);
+    }
+    const client = makeHostedClient(options.server, options.spool);
+    const [owner, target, sessions] = await Promise.all([
+      client.whoami(),
+      resolvePerson(client, person),
+      client.listCommunicationSessions(),
+    ]);
+    const requesterDeviceId = selectVerifiedCollaboratorDevice({
+      sessions,
+      ownerPrincipalId: owner.principalId,
+      requesterPrincipalId: target.principalId,
+      requestedDeviceId: options.requesterDevice,
+    });
+    const spool = new BridgeSpool(options.spool);
+    try {
+      const file = spool.getIdentity("trustedToolPolicyFile")
+        ?? `${resolve(options.spool)}.trusted-tools.json`;
+      const bridgeInstanceId = spool.getIdentity("bridgeInstanceId");
+      const scope: TrustedToolPolicyScope = options.scope === "always" ? "persistent" : "bridge_run";
+      if (scope === "bridge_run" && !bridgeInstanceId) {
+        throw new Error("The bridge is not running for this spool; bridge-run access cannot be created.");
+      }
+      const policy = upsertTrustedToolPolicy({
+        file,
+        ownerPrincipalId: owner.principalId,
+        ownerDeviceId: owner.deviceId,
+        requesterPrincipalId: target.principalId,
+        requesterDeviceId,
+        folder: options.folder,
+        normalizedTool: options.tool,
+        scope,
+        ...(scope === "bridge_run" ? { bridgeInstanceId } : {}),
+        createdFrom: "cli",
+        createdBy: owner.principalId,
+      });
+      print({
+        policyId: policy.policyId,
+        collaborator: target.displayName ?? target.name ?? target.handle ?? person,
+        requesterDeviceId,
+        folder: policy.canonicalFolder,
+        tool: policy.normalizedTool,
+        lifetime: policy.scope === "persistent" ? "always" : "while bridge is running",
+        status: policy.status,
+      });
+    } finally {
+      spool.close();
+    }
+  });
+
+trustedTools.command("list")
+  .description("list saved per-tool collaborator policies")
+  .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
+  .option("--all", "include revoked and invalid policies", false)
+  .action((options) => {
+    const spool = new BridgeSpool(options.spool);
+    try {
+      const file = spool.getIdentity("trustedToolPolicyFile")
+        ?? `${resolve(options.spool)}.trusted-tools.json`;
+      const bridgeInstanceId = spool.getIdentity("bridgeInstanceId");
+      const document = readTrustedToolPolicies(file);
+      print({
+        revision: document.revision,
+        policies: document.policies
+          .filter((policy) => options.all || policy.status === "active")
+          .map((policy) => ({
+            ...policy,
+            activeForCurrentBridge: policy.status === "active"
+              && (policy.scope === "persistent" || policy.bridgeInstanceId === bridgeInstanceId),
+          })),
+      });
+    } finally {
+      spool.close();
+    }
+  });
+
+trustedTools.command("revoke")
+  .description("revoke one saved tool policy")
+  .argument("<policyId>")
+  .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .action(async (policyId, options) => {
+    const owner = await makeHostedClient(options.server, options.spool).whoami();
+    const spool = new BridgeSpool(options.spool);
+    try {
+      const file = spool.getIdentity("trustedToolPolicyFile")
+        ?? `${resolve(options.spool)}.trusted-tools.json`;
+      const revoked = revokeTrustedToolPolicy({ file, policyId, revokedBy: owner.principalId });
+      if (!revoked) throw new Error(`Trusted tool policy ${policyId} was not found`);
+      print({ policyId: revoked.policyId, status: revoked.status, revokedAt: revoked.revokedAt });
+    } finally {
+      spool.close();
+    }
+  });
 
 program.command("targets")
   .requiredOption("--person <principalId>")
@@ -287,10 +406,12 @@ connect.command("accept")
   .option(
     "--policy <file>",
     "local relationship policy file",
-    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    process.env.CCD_RELATIONSHIP_POLICY,
   )
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
   .action(async (sessionId, options) => {
-    const grant = await makeClient().acceptCommunicationSession(sessionId);
+    const grant = await makeHostedClient(options.server, options.spool).acceptCommunicationSession(sessionId);
     if (!options.access) {
       print(grant);
       return;
@@ -306,8 +427,9 @@ connect.command("accept")
       });
       return;
     }
+    const policyFile = resolveRunningRelationshipPolicy(options.policy, options.spool);
     upsertRelationshipPreset({
-      file: options.policy,
+      file: policyFile,
       principalId: grant.requester.principalId,
       deviceId,
       preset: options.access as RelationshipAccessPreset,
@@ -319,7 +441,7 @@ connect.command("accept")
         status: "saved",
         preset: options.access,
         ...(options.folder ? { folder: options.folder } : {}),
-        policyFile: options.policy,
+        policyFile,
         note: "Aicoo relays between local runtimes. Claude Code enforces this policy per tool call; Codex uses the local bridge broker for allowed file operations.",
       },
     });
@@ -341,13 +463,14 @@ program.command("accept")
   .option(
     "--policy <file>",
     "local relationship policy file",
-    process.env.CCD_RELATIONSHIP_POLICY ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    process.env.CCD_RELATIONSHIP_POLICY,
   )
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--server <url>", "control-plane URL")
   .action(async (sessionId, options) => {
     const id = sessionId ?? (await latestPendingSessionId(options.server, options.spool));
-    const result = await acceptConnection(id, options.access as RelationshipAccessPreset, options.policy, options.folder, options.server, options.spool);
+    const policyFile = resolveRunningRelationshipPolicy(options.policy, options.spool);
+    const result = await acceptConnection(id, options.access as RelationshipAccessPreset, policyFile, options.folder, options.server, options.spool);
     console.log(`Accepted connection ${result.grant.id} from ${result.grant.requester.principalId}.`);
     if (result.accessPolicy.status !== "saved") {
       console.log(result.accessPolicy.reason);
@@ -471,7 +594,6 @@ program.command("delegate")
         console.log(`messageId: ${result.receipt.messageId}`);
       } else if (result.status === "collaboration_requested") {
         console.log(`Task collaboration requested from ${person}. The bridge will dispatch after they accept.`);
-        console.log(`collaborationId: ${result.collaborationId}`);
       } else if (result.status === "folder_access_requested" || result.approvalKind === "folder") {
         console.log(`File access approval requested from ${person}. The task will dispatch after they approve.`);
         if (result.approvalId) console.log(`approvalId: ${result.approvalId}`);
@@ -670,8 +792,16 @@ async function startBridge(options: {
   json?: boolean;
 }): Promise<void> {
   ensureParentDirectory(options.spool);
+  const bridgeInstanceId = randomUUID();
+  const relationshipPolicyFile = options.relationshipPolicy ?? `${resolve(options.spool)}.relationships.json`;
+  const trustedToolPolicyFile = `${resolve(options.spool)}.trusted-tools.json`;
+  // The generated policy is a bridge-run lease, not a durable trust decision. An explicitly
+  // supplied policy remains operator-managed and is not cleared automatically.
+  const ephemeralRelationshipPolicy = !options.relationshipPolicy;
+  if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
   const deviceId = resolveDeviceId(undefined, options.spool);
   const transport = makeClient({ hosted: options.hosted, server: options.server, deviceId, spool: options.spool });
+  const ownerIdentity = await transport.whoami();
   // Only the hosted transport can reach the approval endpoints; a self-hosted mock cannot, and
   // wiring it anyway would turn every un-preauthorized tool into a confusing runtime error.
   const approvalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
@@ -687,7 +817,11 @@ async function startBridge(options: {
     claudePath: options.claudePath,
     codexStateFile: options.codexState,
     codexPath: options.codexPath,
-    relationshipPolicyFile: options.relationshipPolicy ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    relationshipPolicyFile,
+    trustedToolPolicyFile,
+    ownerPrincipalId: ownerIdentity.principalId,
+    ownerDeviceId: ownerIdentity.deviceId,
+    bridgeInstanceId,
     ...(approvalGateway ? { approvalGateway } : {}),
     // Opt-in: drives Codex through app-server so the owner can be asked mid-turn.
     ...(options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1" ? { codexAppServer: true } : {}),
@@ -698,13 +832,23 @@ async function startBridge(options: {
     ensureCodexSkill({ log: options.json ? undefined : console.log });
   }
   const spool = new BridgeSpool(options.spool);
+  spool.setIdentity("relationshipPolicyFile", relationshipPolicyFile);
+  spool.setIdentity("trustedToolPolicyFile", trustedToolPolicyFile);
+  spool.setIdentity("ownerPrincipalId", ownerIdentity.principalId);
+  spool.setIdentity("ownerDeviceId", ownerIdentity.deviceId);
+  spool.setIdentity("bridgeInstanceId", bridgeInstanceId);
   const bridge = new RuntimeBridge({
     transport,
     spool,
     adapter: selected.adapter,
     adapterVersion: selected.adapterVersion,
+    workspaceBoundary: resolve(options.workspace ?? process.cwd()),
     runtime: selected.runtime,
-    relationshipPolicyFile: options.relationshipPolicy ?? DEFAULT_RELATIONSHIP_POLICY_FILE,
+    relationshipPolicyFile,
+    trustedToolPolicyFile,
+    ownerPrincipalId: ownerIdentity.principalId,
+    ownerDeviceId: ownerIdentity.deviceId,
+    bridgeInstanceId,
     log: console.log,
   });
   let localHelper: ReturnType<typeof startLocalHelper> | undefined;
@@ -744,11 +888,28 @@ async function startBridge(options: {
   const shutdown = async () => {
     await bridge.stop();
     localHelper?.close();
+    if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
+    spool.deleteIdentity("relationshipPolicyFile");
+    spool.deleteIdentity("bridgeInstanceId");
     spool.close();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+}
+
+function resolveRunningRelationshipPolicy(explicitPolicy: string | undefined, spoolFile: string): string {
+  if (explicitPolicy) return explicitPolicy;
+  const spool = new BridgeSpool(spoolFile);
+  try {
+    const policyFile = spool.getIdentity("relationshipPolicyFile");
+    if (!policyFile) {
+      throw new Error("The bridge is not running for this spool. Start it before granting folder access.");
+    }
+    return policyFile;
+  } finally {
+    spool.close();
+  }
 }
 
 function getCredentialsFile(spoolFile?: string): string {
@@ -790,6 +951,38 @@ function isHostedUrl(serverUrl: string): boolean {
 
 function isUuid(str: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
+}
+
+async function resolvePerson(
+  client: HttpMessageTransport,
+  person: string,
+): Promise<ResolvedPersonResponse> {
+  return isUuid(person) ? { principalId: person.trim() } : client.resolvePerson(person);
+}
+
+function selectVerifiedCollaboratorDevice(input: {
+  sessions: CommunicationSession[];
+  ownerPrincipalId: string;
+  requesterPrincipalId: string;
+  requestedDeviceId?: string;
+}): string {
+  const verified = [...new Set(input.sessions.flatMap((session) =>
+    session.requester.principalId === input.requesterPrincipalId
+    && session.recipient.principalId === input.ownerPrincipalId
+    && session.requester.deviceId
+      ? [session.requester.deviceId]
+      : []))].sort();
+  if (input.requestedDeviceId) {
+    if (!verified.includes(input.requestedDeviceId)) {
+      throw new Error("That collaborator device has not been verified in a C2C request to this owner device.");
+    }
+    return input.requestedDeviceId;
+  }
+  if (verified.length === 1) return verified[0]!;
+  if (verified.length === 0) {
+    throw new Error("No verified collaborator device was found. Accept one C2C task from that device first.");
+  }
+  throw new Error(`More than one verified collaborator device was found; pass --requester-device (${verified.join(", ")}).`);
 }
 
 function makeClient(options: { hosted?: boolean; server?: string; deviceId?: string; spool?: string } = {}): HttpMessageTransport {
