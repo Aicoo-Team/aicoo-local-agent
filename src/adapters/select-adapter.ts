@@ -23,6 +23,10 @@ export interface RuntimeAdapterSelectionOptions {
   codexStateFile?: string;
   codexPath?: string;
   relationshipPolicyFile?: string;
+  trustedToolPolicyFile?: string;
+  ownerPrincipalId?: string;
+  ownerDeviceId?: string;
+  bridgeInstanceId?: string;
   model?: string;
   /** Lets an un-preauthorized tool be put to the owner instead of refused, on either runtime. */
   approvalGateway?: ToolApprovalGateway;
@@ -75,7 +79,7 @@ export async function selectRuntimeAdapter(
       // Validate the shared onboarding file at startup. Codex reloads it for
       // each message, while remaining text-only even if it contains tool access.
       try {
-        RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+        RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace), trustedPolicyOptions(options));
       } catch (error) {
         options.log?.(`relationship policy could not be loaded; continuing text-only: ${String(error)}`);
       }
@@ -89,11 +93,12 @@ export async function selectRuntimeAdapter(
     const adapter = new CodexAdapter({
       stateFile: resolve(options.codexStateFile ?? `${options.spoolFile}.codex.db`),
       ...(useAppServer ? { driver: new CodexAppServerDriver({ ...(options.log ? { log: options.log } : {}) }) } : {}),
-      ...(useAppServer && options.approvalGateway ? { approvalGateway: options.approvalGateway } : {}),
+      ...(options.approvalGateway ? { approvalGateway: options.approvalGateway } : {}),
       cwd: resolve(options.workspace),
       sessionCount: options.sessions,
       codexPath: configuredPath,
       ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
+      ...trustedPolicyOptions(options),
       ...(options.model ? { model: options.model } : {}),
       log: options.log,
     });
@@ -115,7 +120,11 @@ export async function selectRuntimeAdapter(
     : undefined;
   if (relationshipPolicyFile) {
     try {
-      const policy = RelationshipPolicy.fromFile(relationshipPolicyFile, resolve(options.workspace));
+      const policy = RelationshipPolicy.fromFile(
+        relationshipPolicyFile,
+        resolve(options.workspace),
+        trustedPolicyOptions(options),
+      );
       if (policy.enabledTools().length > 0) {
         options.log?.(`relationship tool access enabled for Claude Code tools: ${policy.enabledTools().join(", ")}`);
       }
@@ -129,6 +138,7 @@ export async function selectRuntimeAdapter(
     sessionCount: options.sessions,
     ...(configuredPath ? { pathToClaudeCodeExecutable: configuredPath } : {}),
     ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
+    ...trustedPolicyOptions(options),
     ...(options.approvalGateway ? { approvalGateway: options.approvalGateway } : {}),
     ...(options.model ? { model: options.model } : {}),
     log: options.log,
@@ -138,6 +148,20 @@ export async function selectRuntimeAdapter(
     adapterVersion: ClaudeCodeAdapter.adapterVersion,
     runtime: "claude-code",
     label: `ClaudeCodeAdapter${configuredPath ? ` (${configuredPath})` : " (SDK bundled CLI)"}`,
+  };
+}
+
+function trustedPolicyOptions(options: RuntimeAdapterSelectionOptions): {
+  trustedToolPolicyFile?: string;
+  ownerPrincipalId?: string;
+  ownerDeviceId?: string;
+  bridgeInstanceId?: string;
+} {
+  return {
+    ...(options.trustedToolPolicyFile ? { trustedToolPolicyFile: resolve(options.trustedToolPolicyFile) } : {}),
+    ...(options.ownerPrincipalId ? { ownerPrincipalId: options.ownerPrincipalId } : {}),
+    ...(options.ownerDeviceId ? { ownerDeviceId: options.ownerDeviceId } : {}),
+    ...(options.bridgeInstanceId ? { bridgeInstanceId: options.bridgeInstanceId } : {}),
   };
 }
 

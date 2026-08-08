@@ -26,7 +26,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       allowInbound: true,
     })]);
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
+    expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(options.settingSources).toEqual([]);
     expect(options.mcpServers).toEqual({});
@@ -79,6 +79,34 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     ]);
   });
 
+  it("reconciles persisted sessions to a smaller configured count", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-count-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const stateFile = join(directory, "sessions.db");
+    const first = new ClaudeCodeAdapter({
+      stateFile,
+      cwd: directory,
+      driver: new FakeClaudeAgentDriver(),
+      sessionCount: 2,
+    });
+    await first.initialize();
+    expect(await first.listSessions()).toHaveLength(2);
+    await first.close();
+
+    const second = new ClaudeCodeAdapter({
+      stateFile,
+      cwd: directory,
+      driver: new FakeClaudeAgentDriver(),
+      sessionCount: 1,
+    });
+    cleanups.push(() => second.close());
+    await second.initialize();
+
+    expect(await second.listSessions()).toEqual([
+      expect.objectContaining({ sessionHandle: "claude-managed-1" }),
+    ]);
+  });
+
   it("keeps tools denied during an active verified turn without a policy", async () => {
     const driver = new FakeClaudeAgentDriver();
     driver.resultDelayMs = 100;
@@ -94,7 +122,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
     const options = driver.starts[0]!.options;
-    expect(options.tools).toEqual(["Edit", "Read", "Write"]);
+    expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
       signal: new AbortController().signal,
@@ -509,12 +537,30 @@ describe("CodeAdapter just-in-time tool approval", () => {
     expect(g.asked).toHaveLength(3);
   });
 
-  it("asks the collaboration gate even when legacy relationship policy permits the read", async () => {
+  it("reuses approved relationship tool and folder access during collaboration", async () => {
     const g = gateway("allow");
     const options = await startedAdapter(g, readPolicyFile(), "collab-1");
 
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
       .toMatchObject({ behavior: "allow" });
+    expect(g.asked).toHaveLength(0);
+  });
+
+  it("maps a safe Git command to a dedicated approval and keeps raw shell blocked", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g, readPolicyFile(), "collab-1");
+
+    const allowed = await options.canUseTool?.("Bash", { command: "git status --short" }, permissionContext());
+    expect(allowed).toMatchObject({
+      behavior: "allow",
+      updatedInput: { command: expect.stringContaining("core.hooksPath=/dev/null") },
+    });
+    expect(g.asked).toEqual([
+      expect.objectContaining({ toolName: "GitStatus", toolInputSummary: expect.stringContaining("GitStatus") }),
+    ]);
+
+    expect(await options.canUseTool?.("Bash", { command: "git reset --hard" }, permissionContext()))
+      .toMatchObject({ behavior: "deny", interrupt: false });
     expect(g.asked).toHaveLength(1);
   });
 
