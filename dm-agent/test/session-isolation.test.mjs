@@ -90,6 +90,23 @@ const fresh = (name) => new AgentState(join(dir, `${name}.json`));
   check("...and matches its string form", s.sessionFor("6070") === "S6070");
 }
 
+// 8. The Codex runtime keeps its threads in the same store, under its own prefix. It was
+//    missed when the Claude path was isolated — the guarantee was announced while half of it
+//    did not hold, which is worse than not having made it.
+{
+  const s = fresh("codex");
+  s.setSessionFor("codex:visitor-a", "thread-A");
+  s.setSessionFor("codex:visitor-b", "thread-B");
+  check("each visitor gets their own Codex thread", s.sessionFor("codex:visitor-a") === "thread-A");
+  check("...and cannot see the other's", s.sessionFor("codex:visitor-b") === "thread-B");
+  // Same conversation, two runtimes: a Claude session id must never be resumed as a Codex
+  // thread id or the other way round.
+  s.setSessionFor("visitor-a", "claude-A");
+  check("the two runtimes do not collide on one conversation", s.sessionFor("codex:visitor-a") === "thread-A" && s.sessionFor("visitor-a") === "claude-A");
+  s.clearAllSessions();
+  check("clearing before a new visitor forgets Codex threads too", s.sessionFor("codex:visitor-a") === null);
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 let failed = 0;

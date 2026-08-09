@@ -123,14 +123,28 @@ Compose the reply to send back now.`;
     this.audit?.record({ peer: this.peerLabel, runtime: "codex", tool, target, decision, rule });
   }
 
+  /**
+   * Threads are per conversation, exactly as the Claude path's sessions are.
+   *
+   * There used to be one codexThreadId for the whole agent, resumed for whoever wrote next, so
+   * a share link put every visitor in one thread with each other's messages. The Claude side
+   * was fixed first and this was missed, which is the worse kind of gap: the guarantee was
+   * announced while half of it did not hold. The `codex:` prefix keeps the two runtimes from
+   * resuming each other's ids under the same conversation.
+   */
+  #threadKey(inbound) {
+    return `codex:${inbound?.conversationId ?? ""}`;
+  }
+
   async runTurn(inbound) {
+    const key = this.#threadKey(inbound);
+    const existing = this.state.sessionFor(key);
     try {
-      return await this.#runOnce(inbound, this.state.data.codexThreadId);
+      return await this.#runOnce(inbound, existing);
     } catch (error) {
-      if (this.state.data.codexThreadId) {
+      if (existing) {
         this.log(`[codex] resume failed (${String(error).slice(0, 120)}); retrying with a fresh thread`);
-        this.state.data.codexThreadId = null;
-        this.state.save();
+        this.state.clearSessionFor(key);
         return this.#runOnce(inbound, null);
       }
       throw error;
@@ -170,8 +184,8 @@ Compose the reply to send back now.`;
       (async () => {
         for await (const event of turn) {
           if (event.type === "thread.started" && event.thread_id) {
-            if (this.state.data.codexThreadId !== event.thread_id) {
-              this.state.data.codexThreadId = event.thread_id;
+            if (this.state.sessionFor(this.#threadKey(inbound)) !== event.thread_id) {
+              this.state.setSessionFor(this.#threadKey(inbound), event.thread_id);
               this.state.save();
             }
           } else if (event.type === "item.completed") {
