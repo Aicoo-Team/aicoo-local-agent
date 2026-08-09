@@ -19,6 +19,22 @@ const SENSITIVE_PATHS = [
   "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud", "~/.kube", "~/.npmrc", "~/.netrc",
   "~/.aicoo-dm-agent",
 ];
+// The credential store that travels INSIDE the shared folder rather than sitting next to it.
+// Every path above is somewhere an owner would never knowingly share; a dotenv file is the
+// opposite — sharing a project means sharing the .env sitting in it, and that file is where a
+// working repo keeps its database password and its API keys. Sharing the work is not consent
+// to the keys, so this is matched by shape (the basename) rather than by location, wherever
+// the file turns up: <repo>/.env, <repo>/.env.production, <repo>/.codex/.env.
+//
+// Until now the only thing standing here was a line in the system prompt asking the model not
+// to say a secret out loud. That is discretion, not a mechanism, and it is exactly the wrong
+// kind of defence against the pairing it has to survive: read the file, then hand the value to
+// WebFetch, where the owner approving "fetch from example.com" cannot see what is in the URL.
+const DOTENV_FILE = /^\.env(\..*)?$/;
+// …with the one exception that keeps ordinary work working. A `.env.example` is checked into
+// the repo precisely BECAUSE it has no values in it, and it is the file you actually want when
+// the question is "what does this need to be configured with?".
+const DOTENV_EXAMPLE = /\.example$/;
 // Additionally never WRITABLE: files whose contents get executed later, where a write is
 // remote code execution on a delay rather than a document change. ~/.claude is in here
 // because its settings and hooks configure the runtime this agent is running inside.
@@ -49,6 +65,60 @@ const DECISION_MEMO_MS = 120_000;
 // same command again is a second request and deserves a second question. Keep just enough
 // window to dedupe the two paths of one call.
 const EXEC_MEMO_MS = 10_000;
+
+/**
+ * How far a decision reaches, as a field rather than something to infer.
+ *
+ * "allow" answers three different questions depending on the rule and the trust level: this
+ * one call, this one file for the rest of the turn, or this capability from now on. An audit
+ * that records only allow/deny cannot tell an owner which of those they agreed to, which is
+ * the first thing they want to know when reviewing it months later.
+ */
+function scopeOf(rule, policy) {
+  switch (rule) {
+    // Out-of-folder access is never remembered, by construction — it asks every single time,
+    // for a named peer as much as for a stranger.
+    case "owner-escalated":
+    case "owner-escalated-write":
+    case "owner-declined-escalation":
+    case "owner-declined-escalation-write":
+      return "once";
+    // A guest relationship remembers nothing at all.
+    case "guest-allowed-once":
+    case "guest-refused":
+      return "once";
+    // Standing capability grants: the owner answered once and will not be asked again until
+    // they revoke it. `grant-remembered*` is that answer being reused later.
+    case "owner-granted":
+    case "owner-refused":
+    case "grant-remembered":
+    case "grant-remembered-deny":
+      return "until-revoked";
+    // An ordinary in-folder file decision. Memoized for a couple of minutes so one tool call
+    // does not ask twice, and gone after that — narrower than a grant, wider than a single call.
+    case "owner-approved":
+    case "owner-declined":
+      return "turn";
+    // Nobody decided these; they are walls, or the absence of a grant. Recording them as a
+    // scope of consent would be a lie in the one direction that matters.
+    case "path-wall-sensitive":
+    case "path-never-writable":
+    case "path-unresolvable":
+    case "escalation-budget":
+    case "write-without-path":
+    case "pattern-traversal":
+    case "command-not-declared":
+    case "tool-not-allowed":
+    case "capability-not-enabled":
+    case "write-outside-folders":
+    case "free-tool":
+      return "not-a-decision";
+    default:
+      // An unrecognised rule is recorded as unknown rather than guessed at. A wrong scope in
+      // an audit is worse than an absent one: it is a claim about what the owner agreed to.
+      return "unknown";
+  }
+}
 
 function describeCommands(policy) {
   if (!policy?.commandNames?.length) return "";
@@ -127,6 +197,11 @@ configuration: which variables are set, which are missing, how something is wire
 never emit is a **secret value**: an API key, token, password, private key, or the credential part
 of a connection string. Names, presence, absence, and shape are fine; the value never is. If a
 question can only be answered by quoting a secret, say that instead of quoting it.
+Dotenv files themselves — .env, .env.local, .env.production and the like — are refused by the
+runtime before you ever see them, wherever they sit. That is not your judgement to make and not
+something to route around: do not grep the folder for their contents, and do not ask the owner to
+paste them. Say plainly that those files are off limits to you, and answer from .env.example or
+from the code that reads the variables instead.
 
 Glob is case-sensitive. Before telling anyone a file is not there, try the obvious case
 variants (README / readme, HANDOVER / handover) or list the directory — "I searched and
@@ -263,8 +338,34 @@ function matchesAny(real, entries) {
   });
 }
 
-function isSensitivePath(real) {
-  return matchesAny(real, SENSITIVE_PATHS);
+/**
+ * A dotenv-style credential file, identified by name wherever it sits — see #DOTENV_FILE.
+ *
+ * Exported so the shape can be tested directly, and so anything else that has to reason about
+ * "is this file the keys?" answers it the same way rather than growing a second definition.
+ */
+export function isDotenvFile(real) {
+  // Lowercased because the owner's filesystem may well not care about case: on macOS a wall
+  // that `.ENV` walks straight through is not a wall.
+  const base = path.basename(real).toLowerCase();
+  return DOTENV_FILE.test(base) && !DOTENV_EXAMPLE.test(base);
+}
+
+export function isSensitivePath(real) {
+  return matchesAny(real, SENSITIVE_PATHS) || isDotenvFile(real);
+}
+
+/**
+ * Why a read was refused, in words that say what to do instead.
+ *
+ * Never quotes the file. A refusal that reported what it was protecting — even a byte count or
+ * a first line — would leak precisely the thing the wall exists to keep in, and the peer sees
+ * this text.
+ */
+function sensitiveReadReason(real) {
+  return isDotenvFile(real)
+    ? "That file holds this project's credentials and is never readable, even inside a folder the owner shared. Try its .env.example, or the code that reads the variables."
+    : "That path holds credentials and is never readable.";
 }
 
 /**
@@ -272,7 +373,7 @@ function isSensitivePath(real) {
  * matched by shape rather than location, since it is execution-on-next-commit in whichever
  * repository the owner happened to share.
  */
-function isNeverWritePath(real) {
+export function isNeverWritePath(real) {
   if (matchesAny(real, NEVER_WRITE_PATHS)) return true;
   const parts = real.split(path.sep);
   const git = parts.indexOf(".git");
@@ -286,7 +387,7 @@ function isNeverWritePath(real) {
  * Newlines survive: an approval prompt showing a shell command needs them to be legible, and
  * a newline cannot overwrite what is already on screen. A carriage return can, so it goes.
  */
-function printableSafe(value, max = 300) {
+export function printableSafe(value, max = 300) {
   const flat = String(value).replace(/\r/g, " ").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "?");
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
@@ -295,6 +396,11 @@ export class LocalDmAgent {
   #decisions = new Map();
   /** Out-of-folder asks used by the turn in flight. Reset per turn, never carried over. */
   #escalations = 0;
+  // Which conversation this turn belongs to, and the model session that belongs to IT. Held
+  // per turn rather than per agent: one sessionId for everyone meant a visitor's turn ran with
+  // the previous visitor's messages in context.
+  #conversationId = null;
+  #resumeId = null;
   /** In-process MCP server exposing the owner's declared commands, or null if none. */
   #commandServer = null;
   /** Set while a turn is in flight. Paused whenever the owner has a question in front of them. */
@@ -302,7 +408,7 @@ export class LocalDmAgent {
   /** The in-flight turn's abort handle, so Ctrl-C can end it rather than wait it out. */
   #abort = null;
 
-  constructor({ workspace, state, approvals, ownerLabel, peerLabel, model, policy, audit, sandbox, log = console.log }) {
+  constructor({ workspace, state, approvals, ownerLabel, peerLabel, ownerId, deviceId, peerId, model, policy, audit, sandbox, log = console.log }) {
     this.workspace = realpathSync(workspace);
     this.policy = policy ?? Policy.readOnly(workspace);
     // cwd is where relative paths resolve, so it must always be inside the wall even if a
@@ -311,6 +417,11 @@ export class LocalDmAgent {
       this.policy.folders = [this.workspace, ...this.policy.folders];
     }
     this.audit = audit;
+    // Identity for the record, separate from the labels used in prompts. A label is written to
+    // be read by a person mid-decision; these are written to be searched a year later.
+    this.ownerId = ownerId ?? null;
+    this.deviceId = deviceId ?? null;
+    this.peerId = peerId ?? null;
     this.sandbox = sandbox;
     this.state = state;
     this.approvals = approvals;
@@ -354,10 +465,21 @@ export class LocalDmAgent {
     }
     this.#decisions.set(key, { decision, expiresAt: now + ttl });
     this.audit?.record({
+      // WHO owns the machine, WHICH machine, and WHO was asking. "peer" alone was a display
+      // label — "a visitor via your link" — which is unusable as a record: it cannot tell two
+      // visitors apart, and it does not say whose machine or which one.
+      ownerId: this.ownerId ?? null,
+      deviceId: this.deviceId ?? null,
       peer: this.peerLabel,
+      peerId: this.peerId ?? null,
+      conversationId: this.#conversationId,
       tool: toolName,
       target: decision.target,
       decision: decision.allow ? "allow" : "deny",
+      // HOW FAR the answer reaches. Until now this was implicit in the rule and the trust
+      // level, which meant reading the audit could not distinguish "they waved one file
+      // through" from "they opened that capability permanently".
+      scope: scopeOf(decision.rule, this.policy),
       rule: decision.rule,
     });
     // An owner decision — however long it took — is progress: restart the idle clock
@@ -387,7 +509,7 @@ export class LocalDmAgent {
           allow: false,
           reason: writing
             ? "That path is never writable — it holds credentials, or its contents get executed."
-            : "That path holds credentials and is never readable.",
+            : sensitiveReadReason(real),
           rule: writing ? "path-never-writable" : "path-wall-sensitive",
           target: real,
         };
@@ -396,21 +518,24 @@ export class LocalDmAgent {
 
     if (!READ_TOOLS.includes(toolName)) {
       const capability = capabilityFor(toolName);
-      // A read outside the folders can be escalated to the owner; a write cannot. Reading the
-      // wrong file is recoverable and visible; writing one is neither, and "may I change
-      // something outside what you shared" is not a question worth having an answer to.
+      // A write outside the folders is put to the owner, like a read, but never quietly: the
+      // prompt has to say it CHANGES a file, because that is the whole difference. This used to
+      // be refused outright on the grounds that "may I change something outside what you
+      // shared" is not worth asking — but refusing it also means an owner who genuinely wants
+      // one file written next door has no way to say yes, and works around the agent instead.
+      // What must not be asked is still not asked: credential stores and execute-on-next-run
+      // paths were refused above, before any of this ran.
       if (capability === "write" && this.policy.can("write")) {
         const target = input?.file_path ?? input?.notebook_path;
-        if (!target || !this.#folderFor(target)) {
-          const real = target ? resolveReal(target, this.workspace) : null;
-          this.log(`[gate] write outside the shared folders refused: ${printableSafe(real ?? String(target))}`);
+        if (!target) {
           return {
             allow: false,
-            reason: "Writing is limited to the shared folders, and that path is outside them.",
-            rule: "write-outside-folders",
-            target: String(real ?? target),
+            reason: "A write has to name the file it changes.",
+            rule: "write-without-path",
+            target: toolName,
           };
         }
+        if (!this.#folderFor(target)) return this.#evaluateOutsideFolders(toolName, target, { writing: true });
       }
       if (capability && this.policy.can(capability)) return this.#evaluateCapability(capability, toolName, input);
       return {
@@ -518,30 +643,45 @@ export class LocalDmAgent {
    *  - A budget per turn. The point of a wall is to protect the owner's attention as much as
    *    their files; a peer who can ring the terminal indefinitely gets a `y` eventually.
    */
-  async #evaluateOutsideFolders(toolName, target) {
+  async #evaluateOutsideFolders(toolName, target, { writing = false } = {}) {
     const real = resolveReal(target, this.workspace);
     if (real === null) {
       return { allow: false, reason: "Path could not be resolved.", rule: "path-unresolvable", target: String(target) };
     }
     if (isSensitivePath(real)) {
       this.log(`[gate] credential path refused without asking: ${printableSafe(real)}`);
-      return { allow: false, reason: "That path holds credentials and is never readable.", rule: "path-wall-sensitive", target: real };
+      return { allow: false, reason: sensitiveReadReason(real), rule: "path-wall-sensitive", target: real };
     }
     if (this.#escalations >= MAX_ESCALATIONS_PER_TURN) {
       this.log(`[gate] escalation budget spent (${MAX_ESCALATIONS_PER_TURN}/turn); refusing without asking: ${printableSafe(real)}`);
       return { allow: false, reason: "Too many out-of-folder requests in one turn.", rule: "escalation-budget", target: real };
     }
     this.#escalations += 1;
-    this.log(`[gate] OUTSIDE the shared folders — asking the owner: ${printableSafe(real)}`);
+    this.log(`[gate] OUTSIDE the shared folders — asking the owner to ${writing ? "CHANGE" : "read"}: ${printableSafe(real)}`);
     const allowed = await this.#askOwner({
       toolName,
       // Who is asking belongs in the line, not just what for. A one-time link with a password
       // means the owner sent it to someone specific, so this is a real decision about a real
       // intended recipient — but they cannot verify the holder IS that person, and the prompt
       // should not read as though they can.
-      summary: `OUTSIDE the folders you shared\n   path: ${printableSafe(real)}\n   asked by: ${this.peerLabel}${this.policy.isGuest ? " — identity not verified" : ""}`,
+      //
+      // Read and write are one word apart on the screen and worlds apart in consequence, so
+      // the write case leads with the verb rather than burying it in a tool name the owner is
+      // not required to know.
+      summary: [
+        writing
+          ? "OUTSIDE the folders you shared — and this CHANGES a file"
+          : "OUTSIDE the folders you shared",
+        `   path: ${printableSafe(real)}`,
+        `   asked by: ${this.peerLabel}${this.policy.isGuest ? " — identity not verified" : ""}`,
+      ].join("\n"),
       kind: "escalation",
     });
+    if (writing) {
+      return allowed
+        ? { allow: true, reason: "The owner allowed this one write outside the shared folders.", rule: "owner-escalated-write", target: real }
+        : { allow: false, reason: "That path is outside the shared folders and the owner declined the change.", rule: "owner-declined-escalation-write", target: real };
+    }
     return allowed
       ? { allow: true, reason: "The owner allowed this one read outside the shared folders.", rule: "owner-escalated", target: real }
       : { allow: false, reason: "That path is outside the shared folders and the owner declined.", rule: "owner-declined-escalation", target: real };
@@ -606,7 +746,7 @@ export class LocalDmAgent {
     return {
       cwd: this.workspace,
       abortController,
-      ...(this.state.sessionId ? { resume: this.state.sessionId } : {}),
+      ...(this.#resumeId ? { resume: this.#resumeId } : {}),
       ...(this.model ? { model: this.model } : {}),
       systemPrompt: buildSystemPrompt({ ownerLabel: this.ownerLabel, peerLabel: this.peerLabel, policy: this.policy }),
       allowedTools: [],
@@ -647,6 +787,9 @@ export class LocalDmAgent {
           // consent that changes nothing, and an error the peer cannot make sense of. The
           // list is exactly the shared folders, which is also the gate's own boundary.
           filesystem: {
+            // Absolute paths only — the SDK documents these as paths, not patterns, so the
+            // dotenv rule cannot be expressed here and lives in the gate alone. The gate is
+            // the mechanism either way; this list is the belt underneath it.
             denyRead: SENSITIVE_PATHS,
             ...(this.policy.can("write") ? { allowWrite: [...this.policy.folders] } : {}),
           },
@@ -673,6 +816,10 @@ export class LocalDmAgent {
     // Per message, not per session: a budget that carried over would leave a long-running
     // agent permanently unable to ask, for reasons nobody watching this message can see.
     this.#escalations = 0;
+    this.#conversationId = conversationId ?? null;
+    this.#resumeId = this.state.sessionFor
+      ? this.state.sessionFor(this.#conversationId)
+      : this.state.sessionId ?? null;
     const prompt = `[Aicoo DM] New message
 From: ${from} (authenticated via Aicoo, conversation ${conversationId}, ${createdAt})
 
@@ -685,9 +832,10 @@ Compose the reply to send back now.`;
     try {
       return await this.#runOnce(prompt);
     } catch (error) {
-      if (this.state.sessionId && /No conversation found/i.test(String(error))) {
+      if (this.#resumeId && /No conversation found/i.test(String(error))) {
         this.log(`[agent] resume failed (${String(error).slice(0, 120)}); retrying with a fresh session`);
-        this.state.sessionId = null;
+        this.state.clearSessionFor?.(this.#conversationId) ?? (this.state.sessionId = null);
+        this.#resumeId = null;
         return this.#runOnce(prompt);
       }
       throw error;
@@ -714,7 +862,13 @@ Compose the reply to send back now.`;
       let lastAssistantText = null;
       for await (const event of run) {
         if (event.type === "system" && event.subtype === "init" && event.session_id) {
-          if (this.state.sessionId !== event.session_id) this.state.sessionId = event.session_id;
+          // Recorded against THIS conversation, so the next visitor resumes their own
+          // thread and not this one.
+          if (this.#resumeId !== event.session_id) {
+            this.#resumeId = event.session_id;
+            if (this.state.setSessionFor) this.state.setSessionFor(this.#conversationId, event.session_id);
+            else this.state.sessionId = event.session_id;
+          }
         } else if (event.type === "assistant" && event.message?.content) {
           const texts = event.message.content.filter((b) => b.type === "text").map((b) => b.text);
           if (texts.length) lastAssistantText = texts.join("\n");

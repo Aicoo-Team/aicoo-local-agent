@@ -102,6 +102,7 @@ const check = (label, cond) => { checks.push([label, cond]); };
   });
 
   const n = () => asked.length;
+  const lastPrompt = () => asked[asked.length - 1];
   let before = n();
   await agent.decide("Bash", { command: "git status" });
   check("a first shell command asks", n() === before + 1);
@@ -124,12 +125,26 @@ const check = (label, cond) => { checks.push([label, cond]); };
   await agent.decide("Write", { file_path: join(ws, "b.md"), content: "x" });
   check("a different file is a new question", n() === before + 1);
 
-  // Reads may escalate outside the folders; writes may not. Changing a file outside what was
-  // shared is not recoverable the way reading one is, so there is no question to ask.
+  // A write outside the folders is the owner's call, like a read — but it must reach them as a
+  // write. Refusing it outright used to seem safer; in practice it left an owner who wanted one
+  // file written next door with no way to say so, and the prompt is where that belongs.
   before = n();
   const out = await agent.decide("Write", { file_path: join(outside, "c.md"), content: "x" });
-  check("write outside the shared folders is denied", out.allow === false);
-  check("...by rule, not by asking", out.rule === "write-outside-folders" && n() === before);
+  check("write outside the shared folders asks the owner", n() === before + 1);
+  check("...and this owner said yes", out.allow === true);
+  check("...recorded as a write escalation, not a read one", out.rule === "owner-escalated-write");
+  check("...and the prompt says it CHANGES a file", /CHANGES a file/.test(lastPrompt()?.summary ?? ""));
+  check("...and names the path", (lastPrompt()?.summary ?? "").includes(join(outside, "c.md")));
+
+  // What must never be asked is still never asked. These sit above the folder logic, so the
+  // change above cannot have opened them: a shell rc or the agent's own state being one `y`
+  // away is delayed code execution and a self-granted permission respectively.
+  before = n();
+  const rc = await agent.decide("Write", { file_path: join(homedir(), ".zshrc"), content: "x" });
+  check("a shell rc is refused without asking", rc.allow === false && rc.rule === "path-never-writable");
+  const own = await agent.decide("Write", { file_path: join(homedir(), ".aicoo-dm-agent", "state.json"), content: "x" });
+  check("the agent's own state is refused without asking", own.allow === false);
+  check("...and neither woke the owner", n() === before);
 
   // A capability the owner did NOT enable is refused, and says which one is missing.
   const bare = new LocalDmAgent({
@@ -322,6 +337,44 @@ for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   await agent.decide("Read", { file_path: join(ws, "ok.md") });
   await agent.decide("Read", { file_path: join(ws, "other.md") });
   check("different call prompts again", asked.length === 2);
+}
+
+// 9. The audit line has to stand on its own a year later. "peer: a visitor via your link" is a
+//    display label — it cannot tell two visitors apart, does not say whose machine or which
+//    one, and above all does not say how far the answer reached.
+{
+  const { Policy } = await import("../src/policy.js");
+  const { AgentState } = await import("../src/state.js");
+  const entries = [];
+  const policy = new Policy({ folders: [ws], commands: new Map(), capabilities: new Set(["write"]) });
+  const agent = new LocalDmAgent({
+    workspace: ws, policy,
+    state: new AgentState(join(root, `audit-${Math.random().toString(36).slice(2)}.json`)),
+    audit: { record: (e) => entries.push(e) },
+    approvals: { ask: async () => true },
+    ownerLabel: "@owner", peerLabel: 'a visitor via your "demo" link',
+    ownerId: "u_owner_1", deviceId: "dev_abc123", peerId: null,
+    log: () => {},
+  });
+  await agent.decide("Read", { file_path: join(ws, "ok.md") });
+  const e = entries[entries.length - 1];
+  check("the audit says whose machine", e.ownerId === "u_owner_1");
+  check("...and which machine", e.deviceId === "dev_abc123");
+  check("...and keeps the human label too", /visitor/.test(e.peer));
+  check("...and records no peer id for someone unidentified", e.peerId === null);
+  check("...and says how far the yes reaches", e.scope === "turn");
+
+  entries.length = 0;
+  await agent.decide("Read", { file_path: join(homedir(), ".ssh", "id_rsa") });
+  // A wall is not consent. Recording it with a consent scope would misread as the owner
+  // having agreed to something.
+  check("a wall is not recorded as a decision the owner made", entries[entries.length - 1].scope === "not-a-decision");
+
+  entries.length = 0;
+  await agent.decide("Write", { file_path: join(root, "outside", "z.md"), content: "x" });
+  const esc = entries[entries.length - 1];
+  check("an out-of-folder write is scoped to this once", esc.scope === "once");
+  check("...and named as a write escalation", esc.rule === "owner-escalated-write");
 }
 
 let failures = 0;
