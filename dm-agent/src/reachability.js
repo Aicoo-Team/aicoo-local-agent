@@ -145,12 +145,15 @@ export class ReachabilityWatch {
  * @param {Function} o.exit    process.exit, injected for tests
  * @returns {boolean} whether the replacement was started
  */
-export function respawn({ releaseLock, log, spawn, exit, argv = process.argv, execPath = process.execPath, env = process.env }) {
+export function respawn({ releaseLock, log, spawn, exit, stdio = "ignore", argv = process.argv, execPath = process.execPath, env = process.env }) {
   log("replacing this process with a fresh one — a new process is the only recovery that was ever verified to work");
   let child;
   try {
     releaseLock();
-    child = spawn(execPath, argv.slice(1), { detached: true, stdio: "ignore", env });
+    // stdio defaults to "ignore", but the caller should hand over the log: a replacement that
+    // crashes before it opens its own log file is otherwise completely silent, which is how a
+    // real restart left a machine with no agent and no explanation.
+    child = spawn(execPath, argv.slice(1), { detached: true, stdio, env });
     child.unref?.();
   } catch (error) {
     log(`could not start the replacement (${String(error.message ?? error)}) — staying up and continuing to retry`);

@@ -67,6 +67,17 @@ function log(line) {
   }
 }
 
+/**
+ * stdio for a spawned replacement: stderr into our log, stdout discarded.
+ *
+ * stdout would duplicate every line — log() already writes the file itself — but stderr is a
+ * genuine gap: console.error on a fatal, and anything Node prints on its way down, happen
+ * where log() cannot reach. Sending only stderr keeps the crash and loses the echo.
+ */
+function logStdio() {
+  return logFd === null ? "ignore" : ["ignore", "ignore", logFd];
+}
+
 function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -129,6 +140,35 @@ Options:
   --skip-preflight         start without checking the model is reachable first
   --state-dir <dir>        override state directory
 `);
+}
+
+/**
+ * Wait for Aicoo to be reachable rather than dying because it is not.
+ *
+ * The poll loop has always tolerated a failed request; startup did not, and `identity()` is the
+ * first thing it does. That asymmetry turned the self-restart into a killer: the agent replaces
+ * itself BECAUSE it cannot reach Aicoo, and the replacement then needs to reach Aicoo to boot.
+ * The first real one exited silently and left the machine with no agent at all — strictly worse
+ * than the outage it was recovering from.
+ *
+ * Retries forever on purpose. A process sitting here waiting is useful the moment the network
+ * comes back; a process that gave up is not, and nothing is going to restart it.
+ */
+async function reachAicoo(fn, { log, firstDelayMs = 2000, maxDelayMs = 60_000 } = {}) {
+  let wait = firstDelayMs;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      // A rejected key is not going to start working, and retrying it forever hides the one
+      // thing the owner has to fix.
+      if (error?.status === 401 || error?.status === 403) throw error;
+      log(`cannot reach Aicoo to start up (attempt ${attempt}): ${String(error.message ?? error)}`);
+      log(`   waiting ${Math.round(wait / 1000)}s and trying again — nothing is lost, and Ctrl-C still stops it`);
+      await delay(wait);
+      wait = Math.min(wait * 2, maxDelayMs);
+    }
+  }
 }
 
 /**
@@ -359,7 +399,7 @@ async function main() {
   const peer = args.peer ?? (earlyPolicy.isGuest ? "guest" : undefined);
   if (!peer) throw new Error("--peer is required (or set \"trust\": \"guest\" in the policy to answer share links)");
 
-  const me = await api.identity();
+  const me = await reachAicoo(() => api.identity(), { log });
   log(`agent online as @${me.username} (${me.userId}), ${earlyPolicy.isGuest ? "answering share links" : `peer=${peer}`}, workspace=${workspace}`);
 
   // An agent that is online but unreachable looks identical to one that is working, right up
@@ -412,6 +452,12 @@ async function main() {
     sandbox: args["no-sandbox"] ? false : undefined,
     ownerLabel: `@${me.username}`,
     peerLabel: peerLabelFor(peer, policy, args["link-label"]),
+    ownerId: me.userId,
+    deviceId: state.deviceId(),
+    // A share-link visitor has no identity to record — that is the point of the link, and
+    // writing the label in here would dress a guess up as one. The conversation id on each
+    // audit line is what distinguishes them.
+    peerId: policy.isGuest ? null : peer,
     model: args.model,
     log,
   });
@@ -599,7 +645,7 @@ async function main() {
     } else if (action === "restart") {
       log(`unreachable for ${mins} — that is no longer a blip.`);
       reach.noteRestart();
-      respawn({ releaseLock, log, spawn, exit: (code) => process.exit(code) });
+      respawn({ releaseLock, log, spawn, exit: (code) => process.exit(code), stdio: logStdio() });
     }
   };
 
@@ -749,6 +795,15 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`error: ${error.message ?? error}`);
+  const message = `error: ${error?.message ?? error}`;
+  // stderr for a person at a terminal — that is where CLI errors belong, and the tests read it
+  // there. The file as well, because a replacement process is spawned without one: a real
+  // self-restart died at startup and left seven lines in the log, no cause, and no agent.
+  console.error(message);
+  if (logFd !== null) {
+    try {
+      writeSync(logFd, `[${new Date().toISOString()}] FATAL: ${error?.stack ?? message}\n`);
+    } catch { /* the log is a convenience; the exit code is the contract */ }
+  }
   process.exit(1);
 });

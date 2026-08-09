@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
 /**
@@ -12,9 +13,9 @@ import { dirname } from "node:path";
 export class AgentState {
   constructor(file) {
     this.file = file;
-    this.data = { sessionId: null, cursors: {}, failures: {}, grants: {}, restarts: [] };
+    this.data = { sessionId: null, sessions: {}, cursors: {}, failures: {}, grants: {}, restarts: [] };
     try {
-      this.data = { sessionId: null, cursors: {}, failures: {}, grants: {}, restarts: [], ...JSON.parse(readFileSync(file, "utf8")) };
+      this.data = { sessionId: null, sessions: {}, cursors: {}, failures: {}, grants: {}, restarts: [], ...JSON.parse(readFileSync(file, "utf8")) };
     } catch {
       /* first run */
     }
@@ -35,6 +36,67 @@ export class AgentState {
 
   setGrant(key, decision) {
     this.data.grants[key] = { decision, at: new Date().toISOString() };
+    this.save();
+  }
+
+  /**
+   * A stable name for this installation, minted once and kept.
+   *
+   * The audit needs to say WHICH machine, and the hostname is not it — people rename laptops,
+   * and two people can share one. This is per state directory, which is the same granularity
+   * as the grants it sits beside: one agent, one relationship, one identity in the record.
+   */
+  deviceId() {
+    if (!this.data.deviceId) {
+      this.data.deviceId = `dev_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      this.save();
+    }
+    return this.data.deviceId;
+  }
+
+  /**
+   * The model session for one conversation, and only that one.
+   *
+   * There used to be a single sessionId for the whole agent, resumed for every message from
+   * anyone. On a share link that meant one visitor's turn ran with the previous visitor's
+   * messages in context — nothing in code stopped the model repeating them, so the only thing
+   * between two strangers was the model choosing to be discreet. Discretion is not isolation:
+   * it holds until someone phrases the question differently.
+   *
+   * Keyed by the conversation the message arrived in, which is per-visitor on a share link and
+   * per-thread for a named peer, so a returning visitor still gets continuity with themselves.
+   */
+  sessionFor(conversationId) {
+    if (!conversationId) return this.data.sessionId ?? null; // dry runs and one-shots
+    return this.data.sessions?.[String(conversationId)] ?? null;
+  }
+
+  setSessionFor(conversationId, sessionId) {
+    if (!conversationId) {
+      this.data.sessionId = sessionId;
+      this.save();
+      return;
+    }
+    this.data.sessions = { ...(this.data.sessions ?? {}), [String(conversationId)]: sessionId };
+    this.save();
+  }
+
+  clearSessionFor(conversationId) {
+    if (!conversationId) {
+      this.data.sessionId = null;
+    } else if (this.data.sessions) {
+      delete this.data.sessions[String(conversationId)];
+    }
+    this.save();
+  }
+
+  /**
+   * Forget every conversation — what the owner wants before handing a link to someone new.
+   * Cursors are deliberately left alone: dropping those replays the whole backlog.
+   */
+  clearAllSessions() {
+    this.data.sessionId = null;
+    this.data.sessions = {};
     this.save();
   }
 

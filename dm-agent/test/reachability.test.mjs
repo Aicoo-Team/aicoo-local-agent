@@ -225,6 +225,22 @@ function clock(start = 1_000_000) {
   check("...with the same arguments", got.args.join(" ") === "/x/cli.js start --peer bob --state-dir /s");
 }
 
+// 9. The replacement must not be spawned blind. A crash before it opens its own log file is
+//    otherwise invisible — which is exactly what happened: a real restart left seven lines in
+//    the log, no explanation, and no agent running.
+{
+  let got;
+  respawn({
+    releaseLock: () => {},
+    log: () => {},
+    spawn: (_e, _a, opts) => { got = opts; return { pid: 7, unref() {} } },
+    exit: () => {},
+    stdio: ["ignore", "ignore", 42],
+  });
+  check("the replacement's stderr lands in the log", JSON.stringify(got.stdio) === "[\"ignore\",\"ignore\",42]");
+  check("...and is detached so it outlives its parent", got.detached === true);
+}
+
 let failed = 0;
 for (const [label, ok] of checks) {
   if (!ok) failed += 1;

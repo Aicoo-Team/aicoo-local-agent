@@ -50,6 +50,60 @@ const DECISION_MEMO_MS = 120_000;
 // window to dedupe the two paths of one call.
 const EXEC_MEMO_MS = 10_000;
 
+/**
+ * How far a decision reaches, as a field rather than something to infer.
+ *
+ * "allow" answers three different questions depending on the rule and the trust level: this
+ * one call, this one file for the rest of the turn, or this capability from now on. An audit
+ * that records only allow/deny cannot tell an owner which of those they agreed to, which is
+ * the first thing they want to know when reviewing it months later.
+ */
+function scopeOf(rule, policy) {
+  switch (rule) {
+    // Out-of-folder access is never remembered, by construction — it asks every single time,
+    // for a named peer as much as for a stranger.
+    case "owner-escalated":
+    case "owner-escalated-write":
+    case "owner-declined-escalation":
+    case "owner-declined-escalation-write":
+      return "once";
+    // A guest relationship remembers nothing at all.
+    case "guest-allowed-once":
+    case "guest-refused":
+      return "once";
+    // Standing capability grants: the owner answered once and will not be asked again until
+    // they revoke it. `grant-remembered*` is that answer being reused later.
+    case "owner-granted":
+    case "owner-refused":
+    case "grant-remembered":
+    case "grant-remembered-deny":
+      return "until-revoked";
+    // An ordinary in-folder file decision. Memoized for a couple of minutes so one tool call
+    // does not ask twice, and gone after that — narrower than a grant, wider than a single call.
+    case "owner-approved":
+    case "owner-declined":
+      return "turn";
+    // Nobody decided these; they are walls, or the absence of a grant. Recording them as a
+    // scope of consent would be a lie in the one direction that matters.
+    case "path-wall-sensitive":
+    case "path-never-writable":
+    case "path-unresolvable":
+    case "escalation-budget":
+    case "write-without-path":
+    case "pattern-traversal":
+    case "command-not-declared":
+    case "tool-not-allowed":
+    case "capability-not-enabled":
+    case "write-outside-folders":
+    case "free-tool":
+      return "not-a-decision";
+    default:
+      // An unrecognised rule is recorded as unknown rather than guessed at. A wrong scope in
+      // an audit is worse than an absent one: it is a claim about what the owner agreed to.
+      return "unknown";
+  }
+}
+
 function describeCommands(policy) {
   if (!policy?.commandNames?.length) return "";
   const lines = policy.commandNames.map((name) => {
@@ -295,6 +349,11 @@ export class LocalDmAgent {
   #decisions = new Map();
   /** Out-of-folder asks used by the turn in flight. Reset per turn, never carried over. */
   #escalations = 0;
+  // Which conversation this turn belongs to, and the model session that belongs to IT. Held
+  // per turn rather than per agent: one sessionId for everyone meant a visitor's turn ran with
+  // the previous visitor's messages in context.
+  #conversationId = null;
+  #resumeId = null;
   /** In-process MCP server exposing the owner's declared commands, or null if none. */
   #commandServer = null;
   /** Set while a turn is in flight. Paused whenever the owner has a question in front of them. */
@@ -302,7 +361,7 @@ export class LocalDmAgent {
   /** The in-flight turn's abort handle, so Ctrl-C can end it rather than wait it out. */
   #abort = null;
 
-  constructor({ workspace, state, approvals, ownerLabel, peerLabel, model, policy, audit, sandbox, log = console.log }) {
+  constructor({ workspace, state, approvals, ownerLabel, peerLabel, ownerId, deviceId, peerId, model, policy, audit, sandbox, log = console.log }) {
     this.workspace = realpathSync(workspace);
     this.policy = policy ?? Policy.readOnly(workspace);
     // cwd is where relative paths resolve, so it must always be inside the wall even if a
@@ -311,6 +370,11 @@ export class LocalDmAgent {
       this.policy.folders = [this.workspace, ...this.policy.folders];
     }
     this.audit = audit;
+    // Identity for the record, separate from the labels used in prompts. A label is written to
+    // be read by a person mid-decision; these are written to be searched a year later.
+    this.ownerId = ownerId ?? null;
+    this.deviceId = deviceId ?? null;
+    this.peerId = peerId ?? null;
     this.sandbox = sandbox;
     this.state = state;
     this.approvals = approvals;
@@ -354,10 +418,21 @@ export class LocalDmAgent {
     }
     this.#decisions.set(key, { decision, expiresAt: now + ttl });
     this.audit?.record({
+      // WHO owns the machine, WHICH machine, and WHO was asking. "peer" alone was a display
+      // label — "a visitor via your link" — which is unusable as a record: it cannot tell two
+      // visitors apart, and it does not say whose machine or which one.
+      ownerId: this.ownerId ?? null,
+      deviceId: this.deviceId ?? null,
       peer: this.peerLabel,
+      peerId: this.peerId ?? null,
+      conversationId: this.#conversationId,
       tool: toolName,
       target: decision.target,
       decision: decision.allow ? "allow" : "deny",
+      // HOW FAR the answer reaches. Until now this was implicit in the rule and the trust
+      // level, which meant reading the audit could not distinguish "they waved one file
+      // through" from "they opened that capability permanently".
+      scope: scopeOf(decision.rule, this.policy),
       rule: decision.rule,
     });
     // An owner decision — however long it took — is progress: restart the idle clock
@@ -624,7 +699,7 @@ export class LocalDmAgent {
     return {
       cwd: this.workspace,
       abortController,
-      ...(this.state.sessionId ? { resume: this.state.sessionId } : {}),
+      ...(this.#resumeId ? { resume: this.#resumeId } : {}),
       ...(this.model ? { model: this.model } : {}),
       systemPrompt: buildSystemPrompt({ ownerLabel: this.ownerLabel, peerLabel: this.peerLabel, policy: this.policy }),
       allowedTools: [],
@@ -691,6 +766,10 @@ export class LocalDmAgent {
     // Per message, not per session: a budget that carried over would leave a long-running
     // agent permanently unable to ask, for reasons nobody watching this message can see.
     this.#escalations = 0;
+    this.#conversationId = conversationId ?? null;
+    this.#resumeId = this.state.sessionFor
+      ? this.state.sessionFor(this.#conversationId)
+      : this.state.sessionId ?? null;
     const prompt = `[Aicoo DM] New message
 From: ${from} (authenticated via Aicoo, conversation ${conversationId}, ${createdAt})
 
@@ -703,9 +782,10 @@ Compose the reply to send back now.`;
     try {
       return await this.#runOnce(prompt);
     } catch (error) {
-      if (this.state.sessionId && /No conversation found/i.test(String(error))) {
+      if (this.#resumeId && /No conversation found/i.test(String(error))) {
         this.log(`[agent] resume failed (${String(error).slice(0, 120)}); retrying with a fresh session`);
-        this.state.sessionId = null;
+        this.state.clearSessionFor?.(this.#conversationId) ?? (this.state.sessionId = null);
+        this.#resumeId = null;
         return this.#runOnce(prompt);
       }
       throw error;
@@ -732,7 +812,13 @@ Compose the reply to send back now.`;
       let lastAssistantText = null;
       for await (const event of run) {
         if (event.type === "system" && event.subtype === "init" && event.session_id) {
-          if (this.state.sessionId !== event.session_id) this.state.sessionId = event.session_id;
+          // Recorded against THIS conversation, so the next visitor resumes their own
+          // thread and not this one.
+          if (this.#resumeId !== event.session_id) {
+            this.#resumeId = event.session_id;
+            if (this.state.setSessionFor) this.state.setSessionFor(this.#conversationId, event.session_id);
+            else this.state.sessionId = event.session_id;
+          }
         } else if (event.type === "assistant" && event.message?.content) {
           const texts = event.message.content.filter((b) => b.type === "text").map((b) => b.text);
           if (texts.length) lastAssistantText = texts.join("\n");

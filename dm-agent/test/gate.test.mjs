@@ -339,6 +339,44 @@ for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   check("different call prompts again", asked.length === 2);
 }
 
+// 9. The audit line has to stand on its own a year later. "peer: a visitor via your link" is a
+//    display label — it cannot tell two visitors apart, does not say whose machine or which
+//    one, and above all does not say how far the answer reached.
+{
+  const { Policy } = await import("../src/policy.js");
+  const { AgentState } = await import("../src/state.js");
+  const entries = [];
+  const policy = new Policy({ folders: [ws], commands: new Map(), capabilities: new Set(["write"]) });
+  const agent = new LocalDmAgent({
+    workspace: ws, policy,
+    state: new AgentState(join(root, `audit-${Math.random().toString(36).slice(2)}.json`)),
+    audit: { record: (e) => entries.push(e) },
+    approvals: { ask: async () => true },
+    ownerLabel: "@owner", peerLabel: 'a visitor via your "demo" link',
+    ownerId: "u_owner_1", deviceId: "dev_abc123", peerId: null,
+    log: () => {},
+  });
+  await agent.decide("Read", { file_path: join(ws, "ok.md") });
+  const e = entries[entries.length - 1];
+  check("the audit says whose machine", e.ownerId === "u_owner_1");
+  check("...and which machine", e.deviceId === "dev_abc123");
+  check("...and keeps the human label too", /visitor/.test(e.peer));
+  check("...and records no peer id for someone unidentified", e.peerId === null);
+  check("...and says how far the yes reaches", e.scope === "turn");
+
+  entries.length = 0;
+  await agent.decide("Read", { file_path: join(homedir(), ".ssh", "id_rsa") });
+  // A wall is not consent. Recording it with a consent scope would misread as the owner
+  // having agreed to something.
+  check("a wall is not recorded as a decision the owner made", entries[entries.length - 1].scope === "not-a-decision");
+
+  entries.length = 0;
+  await agent.decide("Write", { file_path: join(root, "outside", "z.md"), content: "x" });
+  const esc = entries[entries.length - 1];
+  check("an out-of-folder write is scoped to this once", esc.scope === "once");
+  check("...and named as a write escalation", esc.rule === "owner-escalated-write");
+}
+
 let failures = 0;
 for (const [label, ok] of checks) {
   if (!ok) failures++;
