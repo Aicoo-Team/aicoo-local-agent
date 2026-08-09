@@ -1,4 +1,5 @@
 import { CodexAppServerTurn } from "./codex-app-server.js";
+import { resolveReal, isSensitivePath, isNeverWritePath, printableSafe } from "./agent.js";
 
 const TURN_TIMEOUT_MS = 300_000;
 
@@ -64,15 +65,17 @@ Compose the reply to send back now.`;
    */
   async decideApproval(request) {
     if (request.kind === "permissions") {
-      this.log(`[codex] refused a request to widen sandbox permissions`);
+      // Still refused, and not because it should be: the protocol's answer shape for this
+      // request is `{permissions, scope}`, and mapping a relationship policy onto a Codex
+      // permission profile has never been built. So there is nothing to grant even if the
+      // owner said yes — and asking someone a question whose "yes" does nothing is worse
+      // than not asking. This is the one place Codex is still narrower than Claude Code.
+      this.log(`[codex] cannot widen the sandbox — Codex asked to reach outside the shared folders,`);
+      this.log(`[codex]   and this runtime has no way to grant that yet. Refused without asking you.`);
       this.#audit("permissions", request.summary, "deny", "permissions-never-widened");
       return "decline";
     }
-    if (request.kind === "fileChange") {
-      this.log(`[codex] refused a file change: this relationship is read-only`);
-      this.#audit("fileChange", request.summary, "deny", "read-only");
-      return "decline";
-    }
+    if (request.kind === "fileChange") return this.#decideFileChange(request);
 
     const requested = innerCommand(request.command ?? "");
     const declared = this.#matchDeclared(requested);
@@ -88,6 +91,26 @@ Compose the reply to send back now.`;
         this.log(`[gate]   lexed to: ${JSON.stringify(lexArgv(requested))}`);
         for (const entry of this.offerable()) this.log(`[gate]   declared ${entry.name}: ${JSON.stringify(entry.argv)}`);
       }
+      if (this.policy?.can?.("bash")) {
+        // The owner enabled shell for this relationship, so an undeclared command is a
+        // question rather than a refusal — asked by its exact text and remembered as that
+        // text, exactly as the Claude path keys it. A near-miss is a different command.
+        const key = `bash:${requested}`;
+        const remembered = this.state.grant?.(key);
+        if (remembered) {
+          this.#audit("command", requested.slice(0, 200), remembered.decision === "allow" ? "allow" : "deny",
+            remembered.decision === "allow" ? "grant-remembered" : "grant-remembered-deny");
+          return remembered.decision === "allow" ? "accept" : "decline";
+        }
+        const ok = await this.approvals.ask({
+          toolName: "Bash",
+          summary: `run this exact command in ${this.workspace}:\n   ${printableSafe(requested)}`,
+          kind: "exec",
+        });
+        this.state.setGrant?.(key, ok ? "allow" : "deny");
+        this.#audit("command", requested.slice(0, 200), ok ? "allow" : "deny", ok ? "owner-granted" : "owner-refused");
+        return ok ? "accept" : "decline";
+      }
       this.#audit("command", requested.slice(0, 200), "deny", "command-not-declared");
       return "decline";
     }
@@ -96,6 +119,67 @@ Compose the reply to send back now.`;
     const allowed = await this.approvals.ask({ toolName: `command:${declared.name}`, summary, kind: "exec" });
     this.#audit("command", declared.name, allowed ? "allow" : "deny", allowed ? "owner-approved" : "owner-declined");
     return allowed ? "accept" : "decline";
+  }
+
+  /**
+   * A file change, decided the way the Claude path decides one.
+   *
+   * This used to be refused outright — "this relationship is read-only" — whatever the owner
+   * had enabled. The approval request itself carries no path, only an itemId, so the driver
+   * correlates it with the item/started payload that arrived moments earlier; without that
+   * the owner is shown "Modify files" and asked yes or no, which is not a decision.
+   */
+  async #decideFileChange(request) {
+    if (!this.policy?.can?.("write")) {
+      this.log(`[codex] refused a file change: the owner has not enabled writing here`);
+      this.#audit("fileChange", request.summary, "deny", "capability-not-enabled");
+      return "decline";
+    }
+    const paths = request.paths ?? [];
+    if (!paths.length) {
+      // Fail closed rather than hand over a blank cheque. If Codex ever stops sending the
+      // item, this is the line that keeps it from becoming an unconditional yes.
+      this.log(`[codex] refused a file change: Codex did not say which files (item ${request.itemId ?? "?"})`);
+      this.#audit("fileChange", request.summary, "deny", "write-without-path");
+      return "decline";
+    }
+
+    const reals = paths.map((p) => resolveReal(p, this.workspace) ?? p);
+    const walled = reals.find((r) => isSensitivePath(r) || isNeverWritePath(r));
+    if (walled) {
+      this.log(`[codex] refused without asking — never writable: ${printableSafe(walled)}`);
+      this.#audit("fileChange", walled, "deny", "path-never-writable");
+      return "decline";
+    }
+
+    const outside = reals.filter((r) => !this.#insideShared(r));
+    const summary = outside.length
+      ? [
+          "OUTSIDE the folders you shared — and this CHANGES a file",
+          ...reals.map((r) => `   path: ${printableSafe(r)}`),
+          `   asked by: ${this.peerLabel}${this.policy.isGuest ? " — identity not verified" : ""}`,
+        ].join("\n")
+      : `change ${reals.map((r) => printableSafe(r)).join(", ")}`;
+
+    const ok = await this.approvals.ask({
+      toolName: "Write",
+      summary,
+      kind: outside.length ? "escalation" : "exec",
+    });
+    this.#audit("fileChange", reals.join(", "), ok ? "allow" : "deny",
+      outside.length
+        ? (ok ? "owner-escalated-write" : "owner-declined-escalation-write")
+        : (ok ? "owner-approved" : "owner-declined"));
+    return ok ? "accept" : "decline";
+  }
+
+  /** Inside any folder the owner shared, after symlinks. */
+  #insideShared(real) {
+    const folders = this.policy?.folders ?? [this.workspace];
+    return folders.some((folder) => {
+      const base = resolveReal(folder, this.workspace) ?? folder;
+      return real === base || real.startsWith(`${base}/`);
+    });
   }
 
   /** Commands offerable on this runtime: unambiguous without quoting. */

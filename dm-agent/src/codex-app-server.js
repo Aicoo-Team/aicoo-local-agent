@@ -25,7 +25,7 @@ const APPROVAL_METHODS = {
  * that as a refusal: an approval we cannot describe to the owner is one we must not answer on
  * their behalf.
  */
-export function classifyApproval(method, params) {
+export function classifyApproval(method, params, item) {
   const kind = Object.keys(APPROVAL_METHODS).find((key) => APPROVAL_METHODS[key] === method);
   if (!kind) return null;
   const p = params ?? {};
@@ -33,16 +33,26 @@ export function classifyApproval(method, params) {
     ? p.command
     : Array.isArray(p.command)
       ? p.command.join(" ")
-      : undefined;
-  const cwd = typeof p.cwd === "string" ? p.cwd : undefined;
+      : (typeof item?.command === "string" ? item.command : undefined);
+  const cwd = typeof p.cwd === "string" ? p.cwd : (typeof item?.cwd === "string" ? item.cwd : undefined);
+  // A fileChange approval carries only ids — no path, no diff. Verified live against
+  // codex-cli 0.146.0: the params are {threadId, turnId, itemId, startedAtMs, reason,
+  // grantRoot}. What it is about arrives earlier, on item/started for the same id, which is
+  // where `changes[]` with path, kind and diff live. Without that correlation the owner is
+  // shown "Modify files" and asked yes or no, which is not a decision anyone can make.
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  const paths = changes.map((c) => c?.path).filter((x) => typeof x === "string");
   return {
     kind,
     command,
     cwd,
+    itemId: typeof p.itemId === "string" ? p.itemId : undefined,
+    paths,
+    changes,
     summary: kind === "commandExecution"
       ? (command ? `Run: ${command}` : "Run a shell command")
       : kind === "fileChange"
-        ? "Modify files"
+        ? (paths.length ? `Change ${paths.join(", ")}` : "Modify files (Codex did not say which)")
         : "Widen this session's sandbox permissions",
   };
 }
@@ -83,6 +93,12 @@ export class CodexAppServerTurn {
   #closed = false;
   #ended = false;
   #sawTerminal = false;
+  /**
+   * item/started payloads, by id. An approval request names only an itemId; everything the
+   * owner needs to judge it — the file path, the kind of change, the diff — arrived on this
+   * notification moments earlier. Kept for the life of the turn, which is short.
+   */
+  #items = new Map();
   #nextId = 1;
   #stderrTail = "";
 
@@ -182,6 +198,8 @@ export class CodexAppServerTurn {
     if (!method) return;
 
     const event = mapNotification(method, msg.params);
+    const item = msg.params?.item;
+    if (item?.id) this.#items.set(item.id, item);
     if (!TERMINAL.has(method)) {
       if (event) this.#push(event);
       return;
@@ -199,7 +217,7 @@ export class CodexAppServerTurn {
       this.#respond(id, {});
       return;
     }
-    const request = classifyApproval(method, params);
+    const request = classifyApproval(method, params, this.#items.get(params?.itemId));
     if (!request) {
       this.log?.(`[codex] approval of unknown kind refused: ${method}`);
       this.#respond(id, UNKNOWN_APPROVAL_RESPONSE);

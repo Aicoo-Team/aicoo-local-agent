@@ -19,6 +19,22 @@ const SENSITIVE_PATHS = [
   "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud", "~/.kube", "~/.npmrc", "~/.netrc",
   "~/.aicoo-dm-agent",
 ];
+// The credential store that travels INSIDE the shared folder rather than sitting next to it.
+// Every path above is somewhere an owner would never knowingly share; a dotenv file is the
+// opposite — sharing a project means sharing the .env sitting in it, and that file is where a
+// working repo keeps its database password and its API keys. Sharing the work is not consent
+// to the keys, so this is matched by shape (the basename) rather than by location, wherever
+// the file turns up: <repo>/.env, <repo>/.env.production, <repo>/.codex/.env.
+//
+// Until now the only thing standing here was a line in the system prompt asking the model not
+// to say a secret out loud. That is discretion, not a mechanism, and it is exactly the wrong
+// kind of defence against the pairing it has to survive: read the file, then hand the value to
+// WebFetch, where the owner approving "fetch from example.com" cannot see what is in the URL.
+const DOTENV_FILE = /^\.env(\..*)?$/;
+// …with the one exception that keeps ordinary work working. A `.env.example` is checked into
+// the repo precisely BECAUSE it has no values in it, and it is the file you actually want when
+// the question is "what does this need to be configured with?".
+const DOTENV_EXAMPLE = /\.example$/;
 // Additionally never WRITABLE: files whose contents get executed later, where a write is
 // remote code execution on a delay rather than a document change. ~/.claude is in here
 // because its settings and hooks configure the runtime this agent is running inside.
@@ -181,6 +197,11 @@ configuration: which variables are set, which are missing, how something is wire
 never emit is a **secret value**: an API key, token, password, private key, or the credential part
 of a connection string. Names, presence, absence, and shape are fine; the value never is. If a
 question can only be answered by quoting a secret, say that instead of quoting it.
+Dotenv files themselves — .env, .env.local, .env.production and the like — are refused by the
+runtime before you ever see them, wherever they sit. That is not your judgement to make and not
+something to route around: do not grep the folder for their contents, and do not ask the owner to
+paste them. Say plainly that those files are off limits to you, and answer from .env.example or
+from the code that reads the variables instead.
 
 Glob is case-sensitive. Before telling anyone a file is not there, try the obvious case
 variants (README / readme, HANDOVER / handover) or list the directory — "I searched and
@@ -317,8 +338,34 @@ function matchesAny(real, entries) {
   });
 }
 
-function isSensitivePath(real) {
-  return matchesAny(real, SENSITIVE_PATHS);
+/**
+ * A dotenv-style credential file, identified by name wherever it sits — see #DOTENV_FILE.
+ *
+ * Exported so the shape can be tested directly, and so anything else that has to reason about
+ * "is this file the keys?" answers it the same way rather than growing a second definition.
+ */
+export function isDotenvFile(real) {
+  // Lowercased because the owner's filesystem may well not care about case: on macOS a wall
+  // that `.ENV` walks straight through is not a wall.
+  const base = path.basename(real).toLowerCase();
+  return DOTENV_FILE.test(base) && !DOTENV_EXAMPLE.test(base);
+}
+
+export function isSensitivePath(real) {
+  return matchesAny(real, SENSITIVE_PATHS) || isDotenvFile(real);
+}
+
+/**
+ * Why a read was refused, in words that say what to do instead.
+ *
+ * Never quotes the file. A refusal that reported what it was protecting — even a byte count or
+ * a first line — would leak precisely the thing the wall exists to keep in, and the peer sees
+ * this text.
+ */
+function sensitiveReadReason(real) {
+  return isDotenvFile(real)
+    ? "That file holds this project's credentials and is never readable, even inside a folder the owner shared. Try its .env.example, or the code that reads the variables."
+    : "That path holds credentials and is never readable.";
 }
 
 /**
@@ -326,7 +373,7 @@ function isSensitivePath(real) {
  * matched by shape rather than location, since it is execution-on-next-commit in whichever
  * repository the owner happened to share.
  */
-function isNeverWritePath(real) {
+export function isNeverWritePath(real) {
   if (matchesAny(real, NEVER_WRITE_PATHS)) return true;
   const parts = real.split(path.sep);
   const git = parts.indexOf(".git");
@@ -340,7 +387,7 @@ function isNeverWritePath(real) {
  * Newlines survive: an approval prompt showing a shell command needs them to be legible, and
  * a newline cannot overwrite what is already on screen. A carriage return can, so it goes.
  */
-function printableSafe(value, max = 300) {
+export function printableSafe(value, max = 300) {
   const flat = String(value).replace(/\r/g, " ").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "?");
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
@@ -462,7 +509,7 @@ export class LocalDmAgent {
           allow: false,
           reason: writing
             ? "That path is never writable — it holds credentials, or its contents get executed."
-            : "That path holds credentials and is never readable.",
+            : sensitiveReadReason(real),
           rule: writing ? "path-never-writable" : "path-wall-sensitive",
           target: real,
         };
@@ -603,7 +650,7 @@ export class LocalDmAgent {
     }
     if (isSensitivePath(real)) {
       this.log(`[gate] credential path refused without asking: ${printableSafe(real)}`);
-      return { allow: false, reason: "That path holds credentials and is never readable.", rule: "path-wall-sensitive", target: real };
+      return { allow: false, reason: sensitiveReadReason(real), rule: "path-wall-sensitive", target: real };
     }
     if (this.#escalations >= MAX_ESCALATIONS_PER_TURN) {
       this.log(`[gate] escalation budget spent (${MAX_ESCALATIONS_PER_TURN}/turn); refusing without asking: ${printableSafe(real)}`);
@@ -740,6 +787,9 @@ export class LocalDmAgent {
           // consent that changes nothing, and an error the peer cannot make sense of. The
           // list is exactly the shared folders, which is also the gate's own boundary.
           filesystem: {
+            // Absolute paths only — the SDK documents these as paths, not patterns, so the
+            // dotenv rule cannot be expressed here and lives in the gate alone. The gate is
+            // the mechanism either way; this list is the belt underneath it.
             denyRead: SENSITIVE_PATHS,
             ...(this.policy.can("write") ? { allowWrite: [...this.policy.folders] } : {}),
           },
