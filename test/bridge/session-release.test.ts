@@ -370,7 +370,7 @@ describe("RuntimeBridge communication session release", () => {
       relationships: [{
         principalId: "prn_a",
         deviceId: "device-a1",
-        tools: ["Read"],
+        tools: ["GitDiff", "GitLog", "GitStatus", "Read"],
         folders: [realpathSync.native(folder)],
       }],
     });
@@ -426,7 +426,7 @@ describe("RuntimeBridge communication session release", () => {
         requesterPrincipalId: "prn_a",
         requesterDeviceId: "device-a1",
         canonicalFolder: folder,
-        normalizedTool: "GitStatus",
+        accessPreset: "read-project",
         scope: "bridge_run",
         bridgeInstanceId: "bridge-run-new",
         revision: 7,
@@ -439,7 +439,7 @@ describe("RuntimeBridge communication session release", () => {
     expect(readTrustedToolPolicies(trustedToolPolicyFile).policies).toEqual([
       expect.objectContaining({
         policyId: "ttp_server_1",
-        normalizedTool: "GitStatus",
+        accessPreset: "read-project",
         canonicalFolder: realpathSync.native(folder),
         scope: "bridge_run",
         status: "active",
@@ -466,7 +466,7 @@ describe("RuntimeBridge communication session release", () => {
       requesterPrincipalId: "prn_a",
       requesterDeviceId: "device-a1",
       folder,
-      normalizedTool: "Read",
+      accessPreset: "read-project",
       scope: "persistent",
       createdFrom: "settings",
       createdBy: "prn_b",
@@ -487,12 +487,54 @@ describe("RuntimeBridge communication session release", () => {
     await (bridge as unknown as { flushTrustedToolUsageReports(): Promise<void> })
       .flushTrustedToolUsageReports();
 
-    expect(reportTrustedToolPolicyUsage).toHaveBeenCalledWith(expect.objectContaining({
+    expect(reportTrustedToolPolicyUsage).toHaveBeenCalledWith({
       policyId: "ttp_usage_1",
       revision: 9,
       uses: [{ sequence: 1, usedAt: expect.any(String) }],
-    }));
+    });
     expect(readTrustedToolPolicies(trustedToolPolicyFile).policies[0]?.pendingUses).toEqual([]);
+  });
+
+  it("invalidates a stale local policy when hosted usage reports policy_not_found", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-missing-hosted-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const trustedToolPolicyFile = join(directory, "trusted-tools.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    upsertTrustedToolPolicy({
+      file: trustedToolPolicyFile,
+      policyId: "ttp_missing",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      requesterPrincipalId: "prn_a",
+      requesterDeviceId: "device-a1",
+      folder,
+      accessPreset: "read-project",
+      scope: "persistent",
+      createdFrom: "settings",
+      createdBy: "prn_b",
+      serverRevision: 2,
+    });
+    markTrustedToolPolicyUsed(trustedToolPolicyFile, "ttp_missing");
+    const reportTrustedToolPolicyUsage = vi.fn(async () => {
+      throw new ApiError(404, "policy_not_found", {});
+    });
+    const { bridge } = setup({
+      trustedToolPolicyFile,
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      transport: transport({ reportTrustedToolPolicyUsage }),
+    });
+
+    await (bridge as unknown as { flushTrustedToolUsageReports(): Promise<void> })
+      .flushTrustedToolUsageReports();
+
+    expect(reportTrustedToolPolicyUsage).toHaveBeenCalledTimes(1);
+    expect(readTrustedToolPolicies(trustedToolPolicyFile).policies[0]).toMatchObject({
+      status: "invalid",
+      pendingUses: [],
+      invalidatedReason: "Hosted policy no longer exists",
+    });
   });
 
   it("does not expand an explicit empty tool list from a folder-boundary update", async () => {

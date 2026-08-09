@@ -185,7 +185,7 @@ describe("RelationshipPolicy", () => {
     expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ version: 1, relationships: [] });
   });
 
-  it("validates a Git repository boundary without silently granting the Git tool", () => {
+  it("derives Git access from the project preset", () => {
     const directory = makeDirectory();
     const project = join(directory, "project");
     const config = join(directory, "config");
@@ -208,7 +208,7 @@ describe("RelationshipPolicy", () => {
     expect(permissions.authorize(
       { toolName: "GitStatus", input: { repository: project } },
       inbound(),
-    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("not allowed") });
+    )).toMatchObject({ behavior: "allow", updatedInput: { repository: realpathSync.native(project) } });
   });
 
   it("prevents peer edits from planting Git configuration or attribute execution", () => {

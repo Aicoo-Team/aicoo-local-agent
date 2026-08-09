@@ -17,13 +17,15 @@ import {
   type RelationshipAccessPreset,
 } from "../security/relationship-policy.js";
 import {
-  isTrustedToolName,
   readTrustedToolPolicies,
   revokeTrustedToolPolicy,
-  TRUSTED_TOOL_NAMES,
   upsertTrustedToolPolicy,
   type TrustedToolPolicyScope,
 } from "../security/trusted-tool-policy.js";
+import {
+  isFileAccessPreset,
+  type FileAccessPreset,
+} from "../security/relationship-access.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
 import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
@@ -173,13 +175,16 @@ program.command("start")
 
 program.command("whoami").action(async () => print(await makeClient().whoami()));
 
-const trustedTools = program.command("trusted-tools")
-  .description("manage narrow pre-approved collaborator tool access on this machine");
+const trustedTools = program.command("trusted-access")
+  .alias("trusted-tools")
+  .description("manage preset-based collaborator project access on this machine");
 
 trustedTools.command("allow")
-  .description("pre-approve one normalized tool for one verified collaborator device and folder")
+  .description("pre-approve read-only or read-write project access for one collaborator device and folder")
   .argument("<person>", "peer principal ID or @handle")
-  .requiredOption("--tool <tool>", `one of: ${TRUSTED_TOOL_NAMES.join(", ")}`)
+  .addOption(new Option("--preset <preset>", "project access preset")
+    .choices(["read-project", "edit-project"])
+    .default("read-project"))
   .requiredOption("--folder <dir>", "exact local folder boundary")
   .addOption(new Option("--scope <scope>", "permission lifetime")
     .choices(["bridge-run", "always"])
@@ -188,9 +193,7 @@ trustedTools.command("allow")
   .option("--spool <file>", "running bridge spool", DEFAULT_SPOOL)
   .option("--server <url>", "control-plane URL")
   .action(async (person, options) => {
-    if (!isTrustedToolName(options.tool)) {
-      throw new Error(`Unsupported trusted tool ${options.tool}; choose one of ${TRUSTED_TOOL_NAMES.join(", ")}`);
-    }
+    if (!isFileAccessPreset(options.preset)) throw new Error("Preset must be read-project or edit-project");
     const client = makeHostedClient(options.server, options.spool);
     const [owner, target, sessions] = await Promise.all([
       client.whoami(),
@@ -209,6 +212,7 @@ trustedTools.command("allow")
         ?? `${resolve(options.spool)}.trusted-tools.json`;
       const bridgeInstanceId = spool.getIdentity("bridgeInstanceId");
       const scope: TrustedToolPolicyScope = options.scope === "always" ? "persistent" : "bridge_run";
+      const accessPreset: FileAccessPreset = options.preset;
       if (scope === "bridge_run" && !bridgeInstanceId) {
         throw new Error("The bridge is not running for this spool; bridge-run access cannot be created.");
       }
@@ -219,7 +223,7 @@ trustedTools.command("allow")
         requesterPrincipalId: target.principalId,
         requesterDeviceId,
         folder: options.folder,
-        normalizedTool: options.tool,
+        accessPreset,
         scope,
         ...(scope === "bridge_run" ? { bridgeInstanceId } : {}),
         createdFrom: "cli",
@@ -230,7 +234,7 @@ trustedTools.command("allow")
         collaborator: target.displayName ?? target.name ?? target.handle ?? person,
         requesterDeviceId,
         folder: policy.canonicalFolder,
-        tool: policy.normalizedTool,
+        accessPreset: policy.accessPreset,
         lifetime: policy.scope === "persistent" ? "always" : "while bridge is running",
         status: policy.status,
       });
@@ -240,7 +244,7 @@ trustedTools.command("allow")
   });
 
 trustedTools.command("list")
-  .description("list saved per-tool collaborator policies")
+  .description("list saved collaborator access presets")
   .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
   .option("--all", "include revoked and invalid policies", false)
   .action((options) => {
@@ -266,7 +270,7 @@ trustedTools.command("list")
   });
 
 trustedTools.command("revoke")
-  .description("revoke one saved tool policy")
+  .description("revoke one saved access policy")
   .argument("<policyId>")
   .option("--spool <file>", "bridge spool", DEFAULT_SPOOL)
   .option("--server <url>", "control-plane URL")

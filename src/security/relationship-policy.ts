@@ -14,6 +14,12 @@ import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:p
 import { z } from "zod";
 import type { InboundMessage } from "../adapters/runtime-adapter.js";
 import {
+  accessPresetAllowsTool,
+  PRESET_TOOLS,
+  strongestAccessPreset,
+  type RelationshipAccessPreset,
+} from "./relationship-access.js";
+import {
   markTrustedToolPolicyUsed,
   policyMatchesOwner,
   readTrustedToolPolicies,
@@ -32,7 +38,7 @@ const policySchema = z.object({
 }).strict();
 
 export type RelationshipPolicyDocument = z.infer<typeof policySchema>;
-export type RelationshipAccessPreset = "chat-only" | "read-project" | "edit-project";
+export type { RelationshipAccessPreset } from "./relationship-access.js";
 
 export interface ToolPermissionDecision {
   behavior: "allow" | "deny";
@@ -89,12 +95,6 @@ const EXECUTION_ON_NEXT_USE_PATHS = new Set([
   "Makefile",
   "package.json",
 ]);
-
-const PRESET_TOOLS: Readonly<Record<RelationshipAccessPreset, readonly string[]>> = {
-  "chat-only": [],
-  "read-project": ["Read"],
-  "edit-project": ["Read", "Write", "Edit"],
-};
 
 export const DEFAULT_RELATIONSHIP_POLICY_FILE = join(
   homedir(),
@@ -161,26 +161,30 @@ export class RelationshipPolicy {
   enabledTools(): string[] {
     return [...new Set([
       ...this.#relationships.flatMap((relationship) => [...relationship.tools]),
-      ...this.#trustedPolicies.map((policy) => policy.normalizedTool),
+      ...this.#trustedPolicies.flatMap((policy) => PRESET_TOOLS[policy.accessPreset]),
     ])]
       .filter((tool) => POLICY_SUPPORTED_TOOL_SET.has(tool))
       .sort();
   }
 
-  grantedFolders(): string[] {
+  grantedFolders(message?: InboundMessage): string[] {
+    const relationships = message ? this.relationshipsFor(message) : this.#relationships;
+    const trustedPolicies = message ? this.trustedPoliciesFor(message) : this.#trustedPolicies;
     return [...new Set([
-      ...this.#relationships.flatMap((relationship) => relationship.folders),
-      ...this.#trustedPolicies.map((policy) => policy.canonicalFolder),
+      ...relationships.flatMap((relationship) => relationship.folders),
+      ...trustedPolicies.map((policy) => policy.canonicalFolder),
     ])].sort();
   }
 
-  writableFolders(): string[] {
+  writableFolders(message?: InboundMessage): string[] {
+    const relationships = message ? this.relationshipsFor(message) : this.#relationships;
+    const trustedPolicies = message ? this.trustedPoliciesFor(message) : this.#trustedPolicies;
     return [...new Set([
-      ...this.#relationships
-      .filter((relationship) => relationship.tools.has("Write") || relationship.tools.has("Edit"))
-      .flatMap((relationship) => relationship.folders),
-      ...this.#trustedPolicies
-        .filter((policy) => ["Write", "Edit", "GitAdd", "GitCommit"].includes(policy.normalizedTool))
+      ...relationships
+        .filter((relationship) => relationship.tools.has("Write") || relationship.tools.has("Edit"))
+        .flatMap((relationship) => relationship.folders),
+      ...trustedPolicies
+        .filter((policy) => policy.accessPreset === "edit-project")
         .map((policy) => policy.canonicalFolder),
     ])]
       .sort();
@@ -205,6 +209,38 @@ export class RelationshipPolicy {
         policy.requesterPrincipalId === message.senderPrincipalId
         && policy.requesterDeviceId === message.senderDeviceId),
     );
+  }
+
+  accessFor(message: InboundMessage | undefined, recordUsage = false): {
+    preset: RelationshipAccessPreset;
+    folders: string[];
+    writableFolders: string[];
+  } {
+    if (!message?.senderDeviceId) return { preset: "chat-only", folders: [], writableFolders: [] };
+    const relationships = this.relationshipsFor(message);
+    const trustedPolicies = this.trustedPoliciesFor(message);
+    const presets: RelationshipAccessPreset[] = [
+      ...relationships.map((relationship) => presetForTools(relationship.tools)),
+      ...trustedPolicies.map((policy) => policy.accessPreset),
+    ];
+    if (recordUsage && this.#trustedToolPolicyFile) {
+      for (const policy of trustedPolicies) markTrustedToolPolicyUsed(this.#trustedToolPolicyFile, policy.policyId);
+    }
+    return {
+      preset: strongestAccessPreset(presets),
+      folders: [...new Set([
+        ...relationships.flatMap((relationship) => relationship.folders),
+        ...trustedPolicies.map((policy) => policy.canonicalFolder),
+      ])].sort(),
+      writableFolders: [...new Set([
+        ...relationships
+          .filter((relationship) => relationship.tools.has("Write") || relationship.tools.has("Edit"))
+          .flatMap((relationship) => relationship.folders),
+        ...trustedPolicies
+          .filter((policy) => policy.accessPreset === "edit-project")
+          .map((policy) => policy.canonicalFolder),
+      ])].sort(),
+    };
   }
 
   authorize(
@@ -233,14 +269,12 @@ export class RelationshipPolicy {
     const relationship = this.#relationships.find((candidate) =>
       candidate.principalId === message.senderPrincipalId
       && candidate.deviceId === message.senderDeviceId);
-    const trustedPolicies = this.#trustedPolicies.filter((policy) =>
-      policy.requesterPrincipalId === message.senderPrincipalId
-      && policy.requesterDeviceId === message.senderDeviceId);
+    const trustedPolicies = this.trustedPoliciesFor(message);
     if (!relationship && trustedPolicies.length === 0) return deny("No policy for this user and device");
     if (!POLICY_SUPPORTED_TOOL_SET.has(action.toolName) || action.toolName.startsWith("mcp__")) {
       return deny(`Unsupported tool ${action.toolName}`);
     }
-    const trustedToolPolicies = trustedPolicies.filter((policy) => policy.normalizedTool === action.toolName);
+    const trustedToolPolicies = trustedPolicies.filter((policy) => accessPresetAllowsTool(policy.accessPreset, action.toolName));
     const relationshipAllowsTool = relationship?.tools.has(action.toolName) ?? false;
     if (requireToolGrant && !relationshipAllowsTool && trustedToolPolicies.length === 0) {
       const boundary = this.#authorize(action, message, false);
@@ -292,6 +326,26 @@ export class RelationshipPolicy {
     }
     return { behavior: "allow", updatedInput };
   }
+
+  private relationshipsFor(message: InboundMessage): CompiledRelationship[] {
+    if (!message.senderDeviceId) return [];
+    return this.#relationships.filter((candidate) =>
+      candidate.principalId === message.senderPrincipalId
+      && candidate.deviceId === message.senderDeviceId);
+  }
+
+  private trustedPoliciesFor(message: InboundMessage): TrustedToolPolicy[] {
+    if (!message.senderDeviceId) return [];
+    return this.#trustedPolicies.filter((policy) =>
+      policy.requesterPrincipalId === message.senderPrincipalId
+      && policy.requesterDeviceId === message.senderDeviceId);
+  }
+}
+
+function presetForTools(tools: ReadonlySet<string>): RelationshipAccessPreset {
+  if (["Write", "Edit", "GitAdd", "GitCommit"].some((tool) => tools.has(tool))) return "edit-project";
+  if (["Read", "GitStatus", "GitDiff", "GitLog"].some((tool) => tools.has(tool))) return "read-project";
+  return "chat-only";
 }
 
 function trustedPolicyIdentity(options: RelationshipPolicyOptions): TrustedToolPolicyIdentity | undefined {
@@ -330,7 +384,7 @@ export function resetRelationshipPolicy(file: string): void {
   writePolicyDocument(file, { version: 1, relationships: [] });
 }
 
-/** Persist the server's exact folder boundary and per-tool policy without expanding presets. */
+/** Persist the server's exact folder boundary and derive its tools from the selected preset. */
 export function upsertRelationshipPolicy(input: {
   file: string;
   principalId: string;

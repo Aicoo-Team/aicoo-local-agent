@@ -6,12 +6,13 @@ import {
   type RelationshipAccessPreset,
 } from "../security/relationship-policy.js";
 import {
-  isTrustedToolName,
+  invalidateTrustedToolPolicy,
   markTrustedToolPolicyUsesReported,
   pendingTrustedToolPolicyUses,
   revokeTrustedToolPolicy,
   upsertTrustedToolPolicy,
 } from "../security/trusted-tool-policy.js";
+import { isFileAccessPreset } from "../security/relationship-access.js";
 import type {
   CollaborationTurnInput,
   LocalAgentDelegationInput,
@@ -290,14 +291,21 @@ export class RuntimeBridge {
     try {
       const pending = pendingTrustedToolPolicyUses(file, ownerPrincipalId, ownerDeviceId);
       for (const { policy, serverRevision, uses } of pending) {
-        const result = await this.options.transport.reportTrustedToolPolicyUsage({
-          policyId: policy.policyId,
-          revision: serverRevision,
-          normalizedTool: policy.normalizedTool,
-          canonicalFolder: policy.canonicalFolder,
-          uses,
-        });
-        markTrustedToolPolicyUsesReported(file, policy.policyId, result.acceptedThroughSequence);
+        try {
+          const result = await this.options.transport.reportTrustedToolPolicyUsage({
+            policyId: policy.policyId,
+            revision: serverRevision,
+            uses,
+          });
+          markTrustedToolPolicyUsesReported(file, policy.policyId, result.acceptedThroughSequence);
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 404 && error.code === "policy_not_found") {
+            invalidateTrustedToolPolicy(file, policy.policyId, "Hosted policy no longer exists");
+            this.options.log?.(`trusted tool policy invalidated after hosted deletion: ${policy.policyId}`);
+            continue;
+          }
+          throw error;
+        }
       }
     } catch (error) {
       this.options.log?.(`trusted tool usage report deferred: ${String(error)}`);
@@ -394,7 +402,7 @@ export class RuntimeBridge {
     const requesterPrincipalId = stringField(data, "requesterPrincipalId");
     const requesterDeviceId = stringField(data, "requesterDeviceId");
     const folder = stringField(data, "canonicalFolder");
-    const tool = stringField(data, "normalizedTool");
+    const accessPreset = stringField(data, "accessPreset");
     const scope = stringField(data, "scope");
     const createdFrom = stringField(data, "createdFrom");
     const createdBy = stringField(data, "createdBy");
@@ -403,7 +411,7 @@ export class RuntimeBridge {
     const revision = numberField(data, "revision");
     if (
       !file || !policyId || !ownerPrincipalId || !ownerDeviceId || !requesterPrincipalId
-      || !requesterDeviceId || !folder || !tool || !isTrustedToolName(tool) || revision === undefined
+      || !requesterDeviceId || !folder || !accessPreset || !isFileAccessPreset(accessPreset) || revision === undefined
       || (createdFrom !== "settings" && createdFrom !== "approval_prompt") || !createdBy
       || (scope !== "bridge_run" && scope !== "persistent")
       || ownerPrincipalId !== this.options.ownerPrincipalId
@@ -422,7 +430,7 @@ export class RuntimeBridge {
         requesterPrincipalId,
         requesterDeviceId,
         folder,
-        normalizedTool: tool,
+        accessPreset,
         scope,
         ...(scope === "bridge_run" ? { bridgeInstanceId } : {}),
         createdFrom,
@@ -435,7 +443,7 @@ export class RuntimeBridge {
         revision,
         canonicalFolder: policy.canonicalFolder,
       });
-      this.options.log?.(`trusted tool policy applied: ${tool} for ${requesterPrincipalId}`);
+      this.options.log?.(`trusted tool policy applied: ${accessPreset} for ${requesterPrincipalId}`);
     } catch (error) {
       this.options.log?.(`trusted tool policy update failed: ${String(error)}`);
     }

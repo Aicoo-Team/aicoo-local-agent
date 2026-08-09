@@ -196,7 +196,9 @@ export function buildArgs(input: CodexTurnStartInput): string[] {
     ...(profile ? [] : ["--ignore-user-config"]),
     "--ignore-rules",
     ...(profile
-      ? ["-P", profile.profileName]
+      // `codex exec` selects a permissions profile through the config override. `-P` belongs
+      // only to `codex sandbox` (Codex 0.147) and makes exec exit before accepting the turn.
+      ? ["-c", `permission_profile=${JSON.stringify(profile.profileName)}`]
       : [
         "-c", writableRoots.length > 0 ? 'sandbox_mode="workspace-write"' : 'sandbox_mode="read-only"',
         ...(writableRoots.length > 0

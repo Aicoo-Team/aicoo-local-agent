@@ -25,7 +25,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       state: "idle",
       allowInbound: true,
     })]);
-    const options = driver.starts[0]!.options;
+    const options = driver.starts.at(-1)!.options;
     expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(options.settingSources).toEqual([]);
@@ -121,7 +121,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
 
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
-    const options = driver.starts[0]!.options;
+    const options = driver.starts.at(-1)!.options;
     expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
@@ -135,8 +135,10 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-tools-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
+    const otherProject = join(directory, "other-project");
     const policyFile = join(directory, "relationships.json");
     mkdirSync(project);
+    mkdirSync(otherProject);
     writeFileSync(policyFile, JSON.stringify({
       version: 1,
       relationships: [{
@@ -144,26 +146,44 @@ describe("ClaudeCodeAdapter managed sessions", () => {
         deviceId: "device-a1",
         tools: ["Read", "Write"],
         folders: [project],
+      }, {
+        principalId: "prn_other",
+        deviceId: "device-other",
+        tools: ["Read", "Write"],
+        folders: [otherProject],
       }],
     }));
     writeFileSync(join(directory, "outside.txt"), "secret");
 
     const driver = new FakeClaudeAgentDriver();
     driver.resultDelayMs = 100;
+    const asked: string[] = [];
     const adapter = new ClaudeCodeAdapter({
       stateFile: ":memory:",
       cwd: directory,
       relationshipPolicyFile: policyFile,
       driver,
       turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input.toolName);
+          const decision = input.toolName === "Read" ? "allow" : "deny";
+          return { approvalId: `appr-${asked.length}`, status: decision, decision };
+        },
+        async getToolApproval() {
+          return { status: "deny", decision: "deny" };
+        },
+      },
     });
     cleanups.push(() => adapter.close());
     await adapter.initialize();
 
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_tools"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
-    const options = driver.starts[0]!.options;
+    const options = driver.starts.at(-1)!.options;
+    expect(options.cwd).toBe(realpathSync.native(project));
     expect(options.additionalDirectories).toEqual([realpathSync.native(project)]);
+    expect(options.additionalDirectories).not.toContain(realpathSync.native(otherProject));
     expect(options.sandbox).toMatchObject({
       enabled: true,
       failIfUnavailable: true,
@@ -183,11 +203,13 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       behavior: "allow",
       updatedInput: { file_path: join(realpathSync.native(directory), "project", "README.md") },
     });
+    // Pulse approves the operation; the sender-scoped SDK sandbox is the filesystem boundary
+    // and refuses the outside path when Claude actually attempts it.
     expect(await options.canUseTool?.("Read", { file_path: join(directory, "outside.txt") }, {
       signal: new AbortController().signal,
       toolUseID: "outside-read",
       requestId: "permission-request",
-    })).toMatchObject({ behavior: "deny" });
+    })).toMatchObject({ behavior: "allow" });
     expect(await options.canUseTool?.("Edit", { file_path: join(project, "README.md") }, {
       signal: new AbortController().signal,
       toolUseID: "edit-tool-call",
@@ -198,6 +220,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       toolUseID: "bash-tool-call",
       requestId: "permission-request",
     })).toMatchObject({ behavior: "deny" });
+    expect(asked).toEqual(["Read", "Read", "Edit"]);
   });
 
   it("injects a remote reply as context-only and does not create an automatic reply loop", async () => {
@@ -492,7 +515,7 @@ describe("CodeAdapter just-in-time tool approval", () => {
       inbound("msg_appr", { ...(collaborationId ? { collaborationId } : {}) }),
       "new_turn",
     );
-    return driver.starts[0]!.options;
+    return driver.starts.at(-1)!.options;
   }
 
   it("still denies outright when no approval gateway is wired", async () => {
@@ -537,13 +560,13 @@ describe("CodeAdapter just-in-time tool approval", () => {
     expect(g.asked).toHaveLength(3);
   });
 
-  it("reuses approved relationship tool and folder access during collaboration", async () => {
+  it("routes relationship-covered tools through the hosted precedent decision", async () => {
     const g = gateway("allow");
     const options = await startedAdapter(g, readPolicyFile(), "collab-1");
 
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
       .toMatchObject({ behavior: "allow" });
-    expect(g.asked).toHaveLength(0);
+    expect(g.asked).toHaveLength(1);
   });
 
   it("maps a safe Git command to a dedicated approval and keeps raw shell blocked", async () => {

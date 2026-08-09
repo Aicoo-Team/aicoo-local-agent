@@ -11,22 +11,15 @@ import {
 } from "node:fs";
 import { dirname, parse, resolve } from "node:path";
 import { z } from "zod";
+import {
+  accessPresetForTool,
+  isFileAccessPreset,
+  type FileAccessPreset,
+} from "./relationship-access.js";
 
-export const TRUSTED_TOOL_NAMES = [
-  "Read",
-  "Write",
-  "Edit",
-  "GitStatus",
-  "GitDiff",
-  "GitLog",
-  "GitAdd",
-  "GitCommit",
-] as const;
-
-export type TrustedToolName = typeof TRUSTED_TOOL_NAMES[number];
 export type TrustedToolPolicyScope = "bridge_run" | "persistent";
 
-const trustedToolNameSchema = z.enum(TRUSTED_TOOL_NAMES);
+const fileAccessPresetSchema = z.enum(["read-project", "edit-project"]);
 const pendingUseSchema = z.object({
   sequence: z.number().int().positive(),
   usedAt: z.string().datetime(),
@@ -38,7 +31,7 @@ const policySchema = z.object({
   requesterPrincipalId: z.string().trim().min(1),
   requesterDeviceId: z.string().trim().min(1),
   canonicalFolder: z.string().trim().min(1),
-  normalizedTool: trustedToolNameSchema,
+  accessPreset: fileAccessPresetSchema,
   scope: z.enum(["bridge_run", "persistent"]),
   bridgeInstanceId: z.string().trim().min(1).optional(),
   status: z.enum(["active", "revoked", "invalid"]),
@@ -54,16 +47,27 @@ const policySchema = z.object({
 }).strict();
 
 const documentSchema = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   revision: z.number().int().nonnegative(),
   serverRevisions: z.record(z.string(), z.number().int().nonnegative()),
   policies: z.array(policySchema),
 }).strict();
 
+const versionTwoPolicySchema = policySchema.omit({ accessPreset: true }).extend({
+  normalizedTool: z.enum(["Read", "Write", "Edit", "GitStatus", "GitDiff", "GitLog", "GitAdd", "GitCommit"]),
+});
+
+const versionTwoDocumentSchema = z.object({
+  version: z.literal(2),
+  revision: z.number().int().nonnegative(),
+  serverRevisions: z.record(z.string(), z.number().int().nonnegative()),
+  policies: z.array(versionTwoPolicySchema),
+}).strict();
+
 const legacyDocumentSchema = z.object({
   version: z.literal(1),
   revision: z.number().int().nonnegative(),
-  policies: z.array(policySchema),
+  policies: z.array(versionTwoPolicySchema),
 }).strict();
 
 export type TrustedToolPolicy = z.infer<typeof policySchema>;
@@ -76,12 +80,8 @@ export interface TrustedToolPolicyIdentity {
   bridgeInstanceId: string;
 }
 
-export function isTrustedToolName(value: string): value is TrustedToolName {
-  return (TRUSTED_TOOL_NAMES as readonly string[]).includes(value);
-}
-
 export function readTrustedToolPolicies(file: string): TrustedToolPolicyDocument {
-  if (!existsSync(file)) return { version: 2, revision: 0, serverRevisions: {}, policies: [] };
+  if (!existsSync(file)) return { version: 3, revision: 0, serverRevisions: {}, policies: [] };
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(file, "utf8"));
@@ -90,8 +90,10 @@ export function readTrustedToolPolicies(file: string): TrustedToolPolicyDocument
   }
   const parsed = documentSchema.safeParse(raw);
   if (parsed.success) return parsed.data;
+  const versionTwo = versionTwoDocumentSchema.safeParse(raw);
+  if (versionTwo.success) return migrateToolPolicies(versionTwo.data);
   const legacy = legacyDocumentSchema.safeParse(raw);
-  if (legacy.success) return { ...legacy.data, version: 2, serverRevisions: {} };
+  if (legacy.success) return migrateToolPolicies({ ...legacy.data, version: 2, serverRevisions: {} });
   throw new Error(`Invalid trusted tool policies ${file}: ${z.prettifyError(parsed.error)}`);
 }
 
@@ -103,7 +105,7 @@ export function upsertTrustedToolPolicy(input: {
   requesterPrincipalId: string;
   requesterDeviceId: string;
   folder: string;
-  normalizedTool: TrustedToolName;
+  accessPreset: FileAccessPreset;
   scope: TrustedToolPolicyScope;
   bridgeInstanceId?: string;
   createdFrom: "cli" | "settings" | "approval_prompt";
@@ -136,7 +138,7 @@ export function upsertTrustedToolPolicy(input: {
     && policy.requesterPrincipalId === input.requesterPrincipalId
     && policy.requesterDeviceId === input.requesterDeviceId
     && policy.canonicalFolder === canonicalFolder
-    && policy.normalizedTool === input.normalizedTool
+    && policy.accessPreset === input.accessPreset
     && policy.scope === input.scope
     && (!input.policyId || policy.policyId === input.policyId)
     && (input.scope !== "bridge_run" || policy.bridgeInstanceId === input.bridgeInstanceId));
@@ -149,7 +151,7 @@ export function upsertTrustedToolPolicy(input: {
     requesterPrincipalId: input.requesterPrincipalId,
     requesterDeviceId: input.requesterDeviceId,
     canonicalFolder,
-    normalizedTool: input.normalizedTool,
+    accessPreset: input.accessPreset,
     scope: input.scope,
     ...(input.scope === "bridge_run" ? { bridgeInstanceId: input.bridgeInstanceId } : {}),
     status: "active",
@@ -160,7 +162,7 @@ export function upsertTrustedToolPolicy(input: {
     pendingUses: [],
   };
   writeTrustedToolPolicies(input.file, {
-    version: 2,
+    version: 3,
     revision: document.revision + 1,
     serverRevisions: input.policyId
       ? { ...document.serverRevisions, [input.policyId]: serverRevision }
@@ -201,12 +203,27 @@ export function revokeTrustedToolPolicy(input: {
   const policies = [...document.policies];
   policies[index] = revoked;
   writeTrustedToolPolicies(input.file, {
-    version: 2,
+    version: 3,
     revision: document.revision + 1,
     serverRevisions: { ...document.serverRevisions, [input.policyId]: serverRevision },
     policies,
   });
   return revoked;
+}
+
+function migrateToolPolicies(document: z.infer<typeof versionTwoDocumentSchema>): TrustedToolPolicyDocument {
+  const policies = document.policies.flatMap((policy) => {
+    const accessPreset = accessPresetForTool(policy.normalizedTool);
+    if (!accessPreset || !isFileAccessPreset(accessPreset)) return [];
+    const { normalizedTool: _normalizedTool, ...rest } = policy;
+    return [{ ...rest, accessPreset }];
+  });
+  return {
+    version: 3,
+    revision: document.revision,
+    serverRevisions: document.serverRevisions,
+    policies,
+  };
 }
 
 export function markTrustedToolPolicyUsed(file: string, policyId: string, now = new Date()): void {
@@ -263,6 +280,25 @@ export function markTrustedToolPolicyUsesReported(
   if (pendingUses.length === current.pendingUses.length) return;
   const policies = [...document.policies];
   policies[index] = { ...current, pendingUses };
+  writeTrustedToolPolicies(file, { ...document, revision: document.revision + 1, policies });
+}
+
+export function invalidateTrustedToolPolicy(
+  file: string,
+  policyId: string,
+  reason: string,
+): void {
+  const document = readTrustedToolPolicies(file);
+  const index = document.policies.findIndex((policy) => policy.policyId === policyId);
+  if (index < 0) return;
+  const current = document.policies[index]!;
+  const policies = [...document.policies];
+  policies[index] = {
+    ...current,
+    status: "invalid",
+    pendingUses: [],
+    invalidatedReason: reason,
+  };
   writeTrustedToolPolicies(file, { ...document, revision: document.revision + 1, policies });
 }
 
