@@ -267,10 +267,12 @@ export class CodexAdapter implements RuntimeAdapter {
     let grantedFolders: string[] = [];
     let writableFolders: string[] = [];
     let accessPreset: "chat-only" | "read-project" | "edit-project" = "chat-only";
+    let projectAccessStatus: "none" | "selected" | "selection_required" | "not_found" = "none";
     if (this.#config.relationshipPolicyFile) {
       try {
         const policy = this.relationshipPolicy();
         const access = policy.accessFor(message, !contextOnly);
+        projectAccessStatus = access.status;
         accessPreset = access.preset;
         grantedFolders = access.folders;
         writableFolders = access.writableFolders;
@@ -287,6 +289,15 @@ export class CodexAdapter implements RuntimeAdapter {
         // Invalid intent must never weaken Codex's text-only isolation.
         this.#config.log?.(`codex relationship policy could not be loaded; continuing chat-only: ${String(error)}`);
       }
+    }
+
+    if (!contextOnly && message.kind === "task_invite" && projectAccessStatus === "selection_required") {
+      this.#config.log?.("codex project access denied: multiple projects are available and none was selected");
+      return { status: "project_selection_required" } as const;
+    }
+    if (!contextOnly && message.kind === "task_invite" && projectAccessStatus === "not_found") {
+      this.#config.log?.("codex project access denied: the requested project grant was not found");
+      return { status: "project_access_not_found" } as const;
     }
 
     const runtimeTurnId = randomUUID();

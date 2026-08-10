@@ -271,6 +271,51 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     });
   });
 
+  it("fails closed for ambiguous project tasks and launches the explicitly selected folder", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-project-selection-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeClaudeAgentDriver("Selected project inspected.");
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_ambiguous", {
+      kind: "task_invite",
+    }), "queue")).toEqual({ status: "project_selection_required" });
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_selected", {
+      kind: "task_invite",
+      payload: {
+        task: { text: "Inspect this project", projectAccessId: second },
+      },
+    }), "queue")).toMatchObject({ status: "runtime_acked" });
+    const options = driver.starts.at(-1)!.options;
+    expect(options.cwd).toBe(realpathSync.native(second));
+    expect(options.additionalDirectories).toEqual([realpathSync.native(second)]);
+  });
+
   it("binds a managed Claude conversation to one communication session", async () => {
     const driver = new FakeClaudeAgentDriver();
     const adapter = makeAdapter(driver);
@@ -390,6 +435,7 @@ function inbound(
   overrides: Partial<Pick<
     InboundMessage,
     "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId" | "collaborationTurn"
+    | "payload" | "kind"
   >> = {},
 ): InboundMessage {
   return {

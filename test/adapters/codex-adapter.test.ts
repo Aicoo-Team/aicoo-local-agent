@@ -130,6 +130,53 @@ describe("CodexAdapter managed sessions", () => {
     expect(profile).toContain(`${JSON.stringify(realpathSync.native(project))} = true`);
   });
 
+  it("fails closed for ambiguous projects and uses the explicitly selected folder", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-project-selection-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeCodexDriver("Selected project inspected.");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_ambiguous", {
+      kind: "task_invite",
+    }), "queue"))
+      .toEqual({ status: "project_selection_required" });
+    expect(driver.turns).toHaveLength(0);
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_selected", {
+      kind: "task_invite",
+      payload: {
+        task: { text: "Inspect this project", projectAccessId: second },
+      },
+    }), "queue")).toMatchObject({ status: "runtime_acked" });
+    expect(driver.turns[0]?.cwd).toBe(realpathSync.native(second));
+    expect(driver.turns[0]?.prompt).toContain(realpathSync.native(second));
+    expect(driver.turns[0]?.prompt).not.toContain(`- ${realpathSync.native(first)}`);
+  });
+
   it("uses the kernel profile without a second local approval layer", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-collab-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -596,7 +643,7 @@ function inbound(
   overrides: Partial<Pick<
     InboundMessage,
     "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId" | "collaborationTurn"
-    | "senderPrincipalId" | "senderDeviceId"
+    | "senderPrincipalId" | "senderDeviceId" | "payload" | "kind"
   >> = {},
 ): InboundMessage {
   return {

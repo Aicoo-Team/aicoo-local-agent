@@ -189,6 +189,20 @@ working on" map to:
 ccd delegate @teammate "Summarize the README in the shared repo"
 ```
 
+When the teammate has shared more than one project with the same local-agent
+device, select the exact project grant ID provided by the access flow, or its
+approved absolute folder. The owner can inspect local grants with `ccd
+trusted-access list`. The receiver fails closed instead of guessing:
+
+```bash
+ccd delegate @teammate "Summarize the README" --project ttp_project_grant_id
+```
+
+Successful handle resolutions are cached per bridge spool. If the hosted
+directory is temporarily unavailable, an existing collaboration can still use
+the cached principal. Expired device credentials produce a spool-specific
+`ccd login` recovery command instead of a generic person-not-found error.
+
 If the peer has not approved a relationship yet, Aicoo creates a pending grant
 and the local bridge parks the delegation in its durable spool. After the peer
 approves in Aicoo or with `ccd accept`, the running bridge retries the same

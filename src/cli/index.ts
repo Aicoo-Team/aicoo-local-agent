@@ -197,7 +197,7 @@ trustedTools.command("allow")
     const client = makeHostedClient(options.server, options.spool);
     const [owner, target, sessions] = await Promise.all([
       client.whoami(),
-      resolvePerson(client, person),
+      resolvePerson(client, person, options.spool),
       client.listCommunicationSessions(),
     ]);
     const requesterDeviceId = selectVerifiedCollaboratorDevice({
@@ -342,7 +342,7 @@ connect
     let targetPrincipalId = person;
     if (person.startsWith("@") || !isUuid(person)) {
       try {
-        const resolved = await client.resolvePerson(person);
+        const resolved = await resolvePerson(client, person, options.spool);
         targetPrincipalId = resolved.principalId;
         console.log(`Resolved ${person} -> ${resolved.principalId} (${resolved.name ?? resolved.displayName ?? resolved.handle ?? "user"})`);
       } catch (error) {
@@ -505,7 +505,7 @@ program.command("send-to")
     let targetPrincipalId = person;
     if (person.startsWith("@") || !isUuid(person)) {
       try {
-        const resolved = await client.resolvePerson(person);
+        const resolved = await resolvePerson(client, person, options.spool);
         targetPrincipalId = resolved.principalId;
       } catch (error) {
         console.error(`Could not resolve person '${person}': ${errorMessage(error)}`);
@@ -539,6 +539,7 @@ program.command("delegate")
   .option("--timeout <seconds>", "local pending-delegation timeout", "1800")
   .option("--request-timeout <seconds>", "delegation HTTP submission timeout", "30")
   .option("--context-file <path>", "bounded JSON context capsule prepared by your local agent")
+  .option("--project <id-or-folder>", "exact shared-project grant ID or approved absolute folder")
   .option("--no-wait", "return after dispatch instead of waiting for the peer reply")
   .option("--server <url>", "control-plane URL")
   .action(async (person, taskParts, options) => {
@@ -546,7 +547,7 @@ program.command("delegate")
     let targetPrincipalId = person;
     if (person.startsWith("@") || !isUuid(person)) {
       try {
-        const resolved = await client.resolvePerson(person);
+        const resolved = await resolvePerson(client, person, options.spool);
         targetPrincipalId = resolved.principalId;
       } catch (error) {
         console.error(`Could not resolve person '${person}': ${errorMessage(error)}`);
@@ -556,7 +557,10 @@ program.command("delegate")
     }
 
     const route = await resolveRoute({ spool: options.spool });
-    const task = taskParts.join(" ");
+    const taskText = taskParts.join(" ");
+    const task = options.project
+      ? { text: taskText, projectAccessId: String(options.project).trim() }
+      : taskText;
     let context: CollaborationContext | undefined;
     if (options.contextFile) {
       try {
@@ -960,8 +964,51 @@ function isUuid(str: string): boolean {
 async function resolvePerson(
   client: HttpMessageTransport,
   person: string,
+  spoolFile?: string,
 ): Promise<ResolvedPersonResponse> {
-  return isUuid(person) ? { principalId: person.trim() } : client.resolvePerson(person);
+  if (isUuid(person)) return { principalId: person.trim() };
+  const normalizedHandle = person.trim().replace(/^@/, "");
+  const cacheKey = `peerPrincipal:${normalizedHandle.toLowerCase()}`;
+  let lookupError: unknown;
+  const queries = [...new Set([person.trim(), normalizedHandle])];
+  for (const query of queries) {
+    try {
+      const resolved = await client.resolvePerson(query);
+      if (spoolFile) {
+        const spool = new BridgeSpool(spoolFile);
+        try {
+          spool.setIdentity(cacheKey, resolved.principalId);
+        } finally {
+          spool.close();
+        }
+      }
+      return resolved;
+    } catch (error) {
+      lookupError = error;
+      if (error instanceof ApiError && error.status === 401) {
+        throw new Error(
+          `Device login expired for this spool. Run 'ccd login${spoolFile ? ` --spool ${spoolFile}` : ""}' and retry.`,
+        );
+      }
+      if (!(error instanceof ApiError) || error.status !== 404) break;
+    }
+  }
+  if (spoolFile) {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      const principalId = spool.getIdentity(cacheKey);
+      if (principalId) return { principalId, handle: normalizedHandle };
+    } finally {
+      spool.close();
+    }
+  }
+  if (lookupError instanceof ApiError && lookupError.status === 404) {
+    throw new Error(
+      `Aicoo could not resolve '${person}' and no cached collaboration identity exists. `
+      + "Confirm the username and complete Collaborate in Aicoo first.",
+    );
+  }
+  throw lookupError;
 }
 
 function selectVerifiedCollaboratorDevice(input: {

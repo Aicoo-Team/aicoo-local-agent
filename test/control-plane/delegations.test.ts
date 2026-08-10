@@ -72,7 +72,10 @@ describe("local-agent delegations", () => {
 
     const input = {
       target: { kind: "person_default_runtime" as const, principalId: "prn_b" },
-      task: { prompt: "Run this in your local runtime." },
+      task: {
+        text: "Run this in your local runtime.",
+        projectAccessId: "ttp_selected_project",
+      },
       sessionHandle: a.session.sessionHandle,
       clientMessageId: "delegate-after-grant",
       correlationId: "corr-after-grant",
@@ -125,7 +128,10 @@ describe("local-agent delegations", () => {
     expect(row.kind).toBe("task_invite");
     expect(row.correlation_id).toBe("corr-after-grant");
     expect(JSON.parse(row.payload_json)).toMatchObject({
-      task: { prompt: "Run this in your local runtime." },
+      task: {
+        text: "Run this in your local runtime.",
+        projectAccessId: "ttp_selected_project",
+      },
       delegation: {
         clientMessageId: "delegate-after-grant",
         correlationId: "corr-after-grant",

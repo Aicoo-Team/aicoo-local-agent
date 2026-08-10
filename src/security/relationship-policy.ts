@@ -46,6 +46,16 @@ export interface ToolPermissionDecision {
   updatedInput?: Record<string, unknown>;
 }
 
+export type ProjectAccessStatus = "none" | "selected" | "selection_required" | "not_found";
+
+export interface ProjectAccess {
+  status: ProjectAccessStatus;
+  preset: RelationshipAccessPreset;
+  folders: string[];
+  writableFolders: string[];
+  requestedProject?: string;
+}
+
 interface CompiledRelationship {
   principalId: string;
   deviceId: string;
@@ -211,35 +221,92 @@ export class RelationshipPolicy {
     );
   }
 
-  accessFor(message: InboundMessage | undefined, recordUsage = false): {
-    preset: RelationshipAccessPreset;
-    folders: string[];
-    writableFolders: string[];
-  } {
-    if (!message?.senderDeviceId) return { preset: "chat-only", folders: [], writableFolders: [] };
+  accessFor(message: InboundMessage | undefined, recordUsage = false): ProjectAccess {
+    if (!message?.senderDeviceId) {
+      return { status: "none", preset: "chat-only", folders: [], writableFolders: [] };
+    }
     const relationships = this.relationshipsFor(message);
     const trustedPolicies = this.trustedPoliciesFor(message);
+    const requestedProject = projectAccessSelector(message);
+    const requestedFolder = requestedProject && isAbsolute(requestedProject)
+      ? canonicalPath(requestedProject)
+      : undefined;
+    const availableFolders = [...new Set([
+      ...relationships.flatMap((relationship) => relationship.folders),
+      ...trustedPolicies.map((policy) => policy.canonicalFolder),
+    ])].sort();
+
+    let selectedFolders: string[];
+    if (requestedProject) {
+      selectedFolders = availableFolders.filter((folder) => folder === requestedFolder)
+        .concat(trustedPolicies
+          .filter((policy) => policy.policyId === requestedProject)
+          .map((policy) => policy.canonicalFolder));
+      selectedFolders = [...new Set(selectedFolders)].sort();
+      if (selectedFolders.length !== 1) {
+        return {
+          status: "not_found",
+          preset: "chat-only",
+          folders: [],
+          writableFolders: [],
+          requestedProject,
+        };
+      }
+    } else {
+      if (availableFolders.length > 1) {
+        return {
+          status: "selection_required",
+          preset: "chat-only",
+          folders: [],
+          writableFolders: [],
+        };
+      }
+      selectedFolders = availableFolders;
+    }
+
+    if (selectedFolders.length === 0) {
+      return {
+        status: "none",
+        preset: "chat-only",
+        folders: [],
+        writableFolders: [],
+        ...(requestedProject ? { requestedProject } : {}),
+      };
+    }
+
+    const selectedFolder = selectedFolders[0]!;
+    const selectedPolicyId = requestedProject
+      ? trustedPolicies.find((policy) => policy.policyId === requestedProject)?.policyId
+      : undefined;
+    const selectedRelationships = selectedPolicyId
+      ? []
+      : relationships.filter((relationship) => relationship.folders.includes(selectedFolder));
+    const selectedTrustedPolicies = trustedPolicies.filter((policy) =>
+      policy.canonicalFolder === selectedFolder
+      && (!requestedProject
+        || (selectedPolicyId ? policy.policyId === selectedPolicyId : requestedFolder === selectedFolder)));
     const presets: RelationshipAccessPreset[] = [
-      ...relationships.map((relationship) => presetForTools(relationship.tools)),
-      ...trustedPolicies.map((policy) => policy.accessPreset),
+      ...selectedRelationships.map((relationship) => presetForTools(relationship.tools)),
+      ...selectedTrustedPolicies.map((policy) => policy.accessPreset),
     ];
     if (recordUsage && this.#trustedToolPolicyFile) {
-      for (const policy of trustedPolicies) markTrustedToolPolicyUsed(this.#trustedToolPolicyFile, policy.policyId);
+      for (const policy of selectedTrustedPolicies) {
+        markTrustedToolPolicyUsed(this.#trustedToolPolicyFile, policy.policyId);
+      }
     }
     return {
+      status: "selected",
       preset: strongestAccessPreset(presets),
-      folders: [...new Set([
-        ...relationships.flatMap((relationship) => relationship.folders),
-        ...trustedPolicies.map((policy) => policy.canonicalFolder),
-      ])].sort(),
+      folders: [selectedFolder],
       writableFolders: [...new Set([
-        ...relationships
+        ...selectedRelationships
           .filter((relationship) => relationship.tools.has("Write") || relationship.tools.has("Edit"))
           .flatMap((relationship) => relationship.folders),
-        ...trustedPolicies
+        ...selectedTrustedPolicies
           .filter((policy) => policy.accessPreset === "edit-project")
           .map((policy) => policy.canonicalFolder),
-      ])].sort(),
+      ])].filter((folder) => folder === selectedFolder),
+      ...(requestedProject ? { requestedProject } : {}),
     };
   }
 
@@ -266,16 +333,35 @@ export class RelationshipPolicy {
     if (!message) return deny("No active verified c2c message");
     if (!message.senderDeviceId) return deny("Sender device identity is unavailable");
 
-    const relationship = this.#relationships.find((candidate) =>
-      candidate.principalId === message.senderPrincipalId
-      && candidate.deviceId === message.senderDeviceId);
-    const trustedPolicies = this.trustedPoliciesFor(message);
-    if (!relationship && trustedPolicies.length === 0) return deny("No policy for this user and device");
+    const projectAccess = this.accessFor(message);
+    if (projectAccess.status === "selection_required") {
+      return deny("Multiple project folders are available; the delegation must select a project");
+    }
+    if (projectAccess.status === "not_found") {
+      return deny("The requested project is not allowed for this relationship");
+    }
+
+    const matchingTrustedPolicies = this.trustedPoliciesFor(message);
+    const selectedPolicyId = projectAccess.requestedProject
+      ? matchingTrustedPolicies.find((policy) => policy.policyId === projectAccess.requestedProject)?.policyId
+      : undefined;
+    const relationships = selectedPolicyId
+      ? []
+      : this.#relationships.filter((candidate) =>
+        candidate.principalId === message.senderPrincipalId
+        && candidate.deviceId === message.senderDeviceId
+        && candidate.folders.some((folder) => projectAccess.folders.includes(folder)));
+    const trustedPolicies = matchingTrustedPolicies.filter((policy) =>
+      projectAccess.folders.includes(policy.canonicalFolder)
+      && (!selectedPolicyId || policy.policyId === selectedPolicyId));
+    if (relationships.length === 0 && trustedPolicies.length === 0) {
+      return deny("No policy for this user and device");
+    }
     if (!POLICY_SUPPORTED_TOOL_SET.has(action.toolName) || action.toolName.startsWith("mcp__")) {
       return deny(`Unsupported tool ${action.toolName}`);
     }
     const trustedToolPolicies = trustedPolicies.filter((policy) => accessPresetAllowsTool(policy.accessPreset, action.toolName));
-    const relationshipAllowsTool = relationship?.tools.has(action.toolName) ?? false;
+    const relationshipAllowsTool = relationships.some((relationship) => relationship.tools.has(action.toolName));
     if (requireToolGrant && !relationshipAllowsTool && trustedToolPolicies.length === 0) {
       const boundary = this.#authorize(action, message, false);
       return boundary.behavior === "allow"
@@ -286,7 +372,9 @@ export class RelationshipPolicy {
     const pathKeys = PATH_INPUTS[action.toolName as keyof typeof PATH_INPUTS];
     const relationshipFolders = requireToolGrant && !relationshipAllowsTool
       ? []
-      : relationship?.folders ?? [];
+      : relationships
+        .flatMap((relationship) => relationship.folders)
+        .filter((folder) => projectAccess.folders.includes(folder));
     const trustedFolders = (requireToolGrant ? trustedToolPolicies : trustedPolicies)
       .map((policy) => policy.canonicalFolder);
     const allowedFolders = [...new Set([...relationshipFolders, ...trustedFolders])];
@@ -340,6 +428,17 @@ export class RelationshipPolicy {
       policy.requesterPrincipalId === message.senderPrincipalId
       && policy.requesterDeviceId === message.senderDeviceId);
   }
+}
+
+/**
+ * Project selection travels inside the structured delegation task so both the
+ * reference server and older hosted relays can forward it without a new route.
+ */
+export function projectAccessSelector(message: InboundMessage | undefined): string | undefined {
+  const task = message?.payload.task;
+  if (!task || typeof task !== "object" || Array.isArray(task)) return undefined;
+  const selector = (task as Record<string, unknown>).projectAccessId;
+  return typeof selector === "string" && selector.trim() ? selector.trim() : undefined;
 }
 
 function presetForTools(tools: ReadonlySet<string>): RelationshipAccessPreset {

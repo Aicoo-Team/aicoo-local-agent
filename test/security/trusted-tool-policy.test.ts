@@ -64,6 +64,54 @@ describe("trusted collaborator access presets", () => {
     });
   });
 
+  it("selects one trusted project by policy ID and refuses ambiguous access", () => {
+    const fixture = setup();
+    const secondProject = join(fixture.directory, "second-project");
+    mkdirSync(secondProject);
+    const first = upsertTrustedToolPolicy({
+      file: fixture.trustedFile,
+      ownerPrincipalId: "owner",
+      ownerDeviceId: "owner-device",
+      requesterPrincipalId: "requester",
+      requesterDeviceId: "requester-device",
+      folder: fixture.project,
+      accessPreset: "edit-project",
+      scope: "persistent",
+      createdFrom: "cli",
+      createdBy: "owner",
+    });
+    const second = upsertTrustedToolPolicy({
+      file: fixture.trustedFile,
+      ownerPrincipalId: "owner",
+      ownerDeviceId: "owner-device",
+      requesterPrincipalId: "requester",
+      requesterDeviceId: "requester-device",
+      folder: secondProject,
+      accessPreset: "read-project",
+      scope: "persistent",
+      createdFrom: "cli",
+      createdBy: "owner",
+    });
+    const policy = load(fixture, "bridge-new");
+
+    expect(policy.accessFor(message())).toMatchObject({ status: "selection_required", folders: [] });
+    const selected = message({
+      payload: { task: { text: "Inspect it", projectAccessId: second.policyId } },
+    });
+    expect(policy.accessFor(selected)).toMatchObject({
+      status: "selected",
+      preset: "read-project",
+      folders: [realpathSync.native(secondProject)],
+    });
+    expect(policy.authorize(
+      { toolName: "Write", input: { file_path: join(secondProject, "notes.txt") } },
+      selected,
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("not allowed") });
+    expect(policy.accessFor(message({
+      payload: { task: { text: "Inspect it", projectAccessId: `${first.policyId}-unknown` } },
+    }))).toMatchObject({ status: "not_found", folders: [] });
+  });
+
   it("expires bridge-run access on restart while persistent access survives", () => {
     const fixture = setup();
     upsertTrustedToolPolicy({

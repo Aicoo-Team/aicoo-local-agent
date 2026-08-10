@@ -68,6 +68,7 @@ interface ManagedSession {
   boundCommunicationSessionId?: string;
   sandboxPrincipalId?: string;
   sandboxDeviceId?: string;
+  sandboxProjectFolder?: string;
   acceptedTurns: AcceptedTurn[];
   pendingAcks: Map<string, PendingAck>;
 }
@@ -256,9 +257,20 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     ) {
       return { status: "permission_required" } as const;
     }
+    const projectAccess = this.relationshipPolicy()?.accessFor(message);
+    if (message.kind === "task_invite" && projectAccess?.status === "selection_required") {
+      this.#config.log?.("claude project access denied: multiple projects are available and none was selected");
+      return { status: "project_selection_required" } as const;
+    }
+    if (message.kind === "task_invite" && projectAccess?.status === "not_found") {
+      this.#config.log?.("claude project access denied: the requested project grant was not found");
+      return { status: "project_access_not_found" } as const;
+    }
+    const selectedProjectFolder = projectAccess?.folders[0];
     if (
       session.sandboxPrincipalId !== message.senderPrincipalId
       || session.sandboxDeviceId !== message.senderDeviceId
+      || session.sandboxProjectFolder !== selectedProjectFolder
     ) {
       try {
         await this.relaunchForSender(session, message);
@@ -439,6 +451,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     session.boundCommunicationSessionId = undefined;
     session.sandboxPrincipalId = undefined;
     session.sandboxDeviceId = undefined;
+    session.sandboxProjectFolder = undefined;
     session.state = "idle";
     this.#db.prepare(
       `UPDATE managed_sessions
@@ -464,6 +477,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     session.state = "idle";
     session.sandboxPrincipalId = message.senderPrincipalId;
     session.sandboxDeviceId = message.senderDeviceId;
+    session.sandboxProjectFolder = this.relationshipPolicy()?.accessFor(message).folders[0];
     this.#db.prepare(
       `UPDATE managed_sessions
        SET provider_session_id = ?, initialized = 0, state = 'idle', last_active_at = ?
@@ -479,8 +493,9 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   private async launchSession(session: ManagedSession, message?: InboundMessage): Promise<void> {
     const managedTools = ["Bash", "Edit", "Read", "Write"];
     const policy = this.relationshipPolicy();
-    const additionalDirectories = policy?.grantedFolders(message) ?? [];
-    const writableFolders = policy?.writableFolders(message) ?? [];
+    const projectAccess = policy?.accessFor(message);
+    const additionalDirectories = projectAccess?.folders ?? [];
+    const writableFolders = projectAccess?.writableFolders ?? [];
     const denyRead = policy?.sandboxDenyReadPaths() ?? [];
     const denyWrite = policy?.sandboxDenyWritePaths() ?? [];
 
