@@ -263,6 +263,47 @@ check(
   check("...and the diff is kept for the prompt", withItem.changes[0].diff.startsWith("@@"));
 }
 
+// The same walls, on the Codex side. This is where it was found: Codex's memory plugin reaches
+// into ~/Desktop/codex memory on an ordinary question, and the prompt showed it as just
+// another command with the path buried in shell text.
+{
+  const outside2 = join(root, "outside-cx");
+  mkdirSync(outside2, { recursive: true });
+  const shellPolicy = new Policy({ folders: [ws], commands: new Map(), capabilities: new Set(["bash"]) });
+  const runCx = async (command) => {
+    const asked = [];
+    const audited = [];
+    const grants = new Map();
+    const responder = new CodexResponder({
+      workspace: ws,
+      state: { data: {}, save() {}, grant: (k) => grants.get(k) ?? null, setGrant: (k, d) => grants.set(k, { decision: d }) },
+      approvals: { ask: async (r) => { asked.push(r); return true } },
+      audit: { record: (e) => audited.push(e) },
+      policy: shellPolicy, ownerLabel: "@owner", peerLabel: "@peer", log: () => {},
+    });
+    const d = await responder.decideApproval({ kind: "commandExecution", command });
+    return { d, asked, audited };
+  };
+
+  {
+    const { d, asked, audited } = await runCx(`/bin/zsh -lc 'cat ~/.ssh/id_rsa'`);
+    check("codex: a credential path in a command is refused", d === "decline");
+    check("codex: ...without asking", asked.length === 0);
+    check("codex: ...by the wall", audited.at(-1)?.rule === "path-wall-sensitive");
+  }
+  {
+    const { asked } = await runCx(`/bin/zsh -lc 'ls -1 ${outside2}/notes.json'`);
+    check("codex: reaching outside the shared folders escalates", asked[0]?.kind === "escalation");
+    check("codex: ...with the banner", /OUTSIDE the folders you shared/.test(asked[0]?.summary ?? ""));
+    check("codex: ...naming the path", /outside path:/.test(asked[0]?.summary ?? ""));
+  }
+  {
+    const { asked } = await runCx(`/bin/zsh -lc 'git status'`);
+    check("codex: an ordinary command stays ordinary", asked[0]?.kind === "exec");
+    check("codex: ...with no outside-path noise", !/OUTSIDE/.test(asked[0]?.summary ?? ""));
+  }
+}
+
 let failures = 0;
 for (const [label, ok] of checks) {
   if (!ok) failures++;
