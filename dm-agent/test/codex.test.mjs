@@ -1,4 +1,4 @@
-import { realpathSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { realpathSync, mkdtempSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { CodexResponder, innerCommand, lexArgv, shellQuote, isShellSafe } from "../src/codex.js";
@@ -302,6 +302,22 @@ check(
     check("codex: an ordinary command stays ordinary", asked[0]?.kind === "exec");
     check("codex: ...with no outside-path noise", !/OUTSIDE/.test(asked[0]?.summary ?? ""));
   }
+}
+
+// The prompt has to match what the gate does. It said "anything else is refused before the
+// owner sees it" long after the bash capability made that false — Codex believed it, never
+// tried, and the capability the owner had switched on was dead on this runtime. A live
+// credential-wall test "passed" for exactly that reason: the model refused before the gate
+// ever ran, so the wall was never exercised and the pass meant nothing.
+{
+  const src = readFileSync(new URL("../src/codex.js", import.meta.url), "utf8");
+  check("the prompt branches on whether shell is enabled", src.includes("const canShell"));
+  check("the flat refusal claim survives only on the no-shell branch",
+    src.includes('anything else is refused before the owner sees it') && /canShell\s*\?/.test(src));
+  check("the shell branch says other commands may be proposed", /may propose other commands/.test(src));
+  check("...that each distinct one asks the owner", /suspends for their approval/.test(src));
+  check("...that reaching outside the folders is shown as such", /reaching outside the shared folders/.test(src));
+  check("...and that a credential path is refused without asking", /refused without them being asked/.test(src));
 }
 
 let failures = 0;
