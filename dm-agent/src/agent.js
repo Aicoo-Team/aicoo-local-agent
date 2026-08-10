@@ -392,6 +392,74 @@ export function printableSafe(value, max = 300) {
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
+/**
+ * Paths a shell command appears to reach for.
+ *
+ * The credential wall and the folder check both hang off `input.file_path`, and a Bash call
+ * has no such field — so with `bash` enabled, `cat ~/.ssh/id_rsa` reached the owner as an
+ * ordinary y/N prompt with no wall and no out-of-folder banner. The wall says those paths are
+ * never readable "whatever folder the owner shared"; it was not true through a shell.
+ *
+ * This is a heuristic and cannot be anything else: a shell can build a path from variables,
+ * base64, or a file it just read, and no amount of scanning catches that. It is here to make
+ * the OBVIOUS cases behave like the file tools do — which is most of them, including every
+ * one seen in practice — and to put the right words in front of the owner. The command text
+ * is still shown in full, because reading it remains the real defence.
+ *
+ * Only tokens that assert a location are considered: absolute, `~`-rooted, or explicitly
+ * relative. A bare word is a filename in the workspace or not a path at all, and treating
+ * every word as a path would flag `git status` as reaching outside.
+ */
+export function pathsInCommand(command, workspace) {
+  const text = String(command ?? "");
+  const found = new Set();
+  const tokens = [];
+  // Quoted runs first, and whole: a path with a space in it — `'~/Desktop/codex memory/x'` —
+  // would otherwise be cut at the space, and the owner shown a truncated path that does not
+  // exist. The verdict happened to survive that; the prompt did not, and a prompt naming the
+  // wrong file is the failure mode this whole pass exists to prevent.
+  let rest = text.replace(/'([^']*)'|"([^"]*)"/g, (_m, single, double) => {
+    tokens.push(single ?? double);
+    return " ";
+  });
+  // Then the unquoted remainder, split on whitespace and shell punctuation that cannot appear
+  // in a path.
+  tokens.push(...rest.split(/[\s;|&<>()]+/));
+
+  for (const raw of tokens) {
+    let token = raw;
+    const eq = token.indexOf("=");
+    if (eq > 0 && !token.slice(0, eq).includes("/")) token = token.slice(eq + 1);
+    token = token.replace(/^["']/, "");
+    if (!token) continue;
+    // A URL is not a filesystem path, and its slashes would otherwise read as one.
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token)) continue;
+    const expanded = token
+      .replace(/^\$HOME\b/, homedir())
+      .replace(/^~(?=\/|$)/, homedir());
+    if (!/^(\/|\.\.?\/)/.test(expanded)) continue;
+    const real = resolveReal(expanded, workspace);
+    if (real) found.add(real);
+  }
+  return [...found];
+}
+
+/**
+ * What a command's paths mean for the decision: refuse outright, escalate, or ask normally.
+ * Shared by both runtimes so the shell cannot be a way around the walls on either one.
+ */
+export function classifyCommandPaths(command, { workspace, folders }) {
+  const paths = pathsInCommand(command, workspace);
+  const roots = (folders?.length ? folders : [workspace])
+    .map((f) => resolveReal(f, workspace) ?? f);
+  const inside = (real) => roots.some((r) => real === r || real.startsWith(`${r}/`));
+  return {
+    paths,
+    walled: paths.filter((p) => isSensitivePath(p)),
+    outside: paths.filter((p) => !inside(p)),
+  };
+}
+
 export class LocalDmAgent {
   #decisions = new Map();
   /** Out-of-folder asks used by the turn in flight. Reset per turn, never carried over. */
@@ -592,6 +660,27 @@ export class LocalDmAgent {
     const guest = this.policy.isGuest;
     const { key, summary, oneOff } = grantIdentity(capability, toolName, input, guest);
 
+    // A shell command names its own paths, and until now nothing looked at them: the credential
+    // wall and the folder check both key off input.file_path, which a Bash call does not have.
+    // So `cat ~/.ssh/id_rsa` arrived as an ordinary y/N prompt — no wall, no banner — while the
+    // wall's own comment promised those paths were never readable whatever folder was shared.
+    let shellPaths = null;
+    if (capability === "bash") {
+      shellPaths = classifyCommandPaths(input?.command, {
+        workspace: this.workspace,
+        folders: this.policy?.folders,
+      });
+      if (shellPaths.walled.length) {
+        this.log(`[gate] credential path refused without asking (in a command): ${printableSafe(shellPaths.walled[0])}`);
+        return {
+          allow: false,
+          reason: "That command reaches a path that holds credentials, which is never readable.",
+          rule: "path-wall-sensitive",
+          target: shellPaths.walled[0],
+        };
+      }
+    }
+
     // A guest keeps no standing grants. "Remembered for whom?" has no answer when the link is
     // one-time and the only thing distinguishing holders is a fingerprint they control.
     if (!guest) {
@@ -604,12 +693,22 @@ export class LocalDmAgent {
       this.log(`[gate] first time ${this.peerLabel} has asked for this — ${printableSafe(key)}`);
     }
 
+    // A command that reaches outside the shared folders is the same decision as a file read
+    // outside them, and has to look like one. Presented as an ordinary command the owner has
+    // to spot the path themselves, buried in shell text — which is exactly what happened with
+    // Codex's memory plugin reaching into ~/Desktop/codex memory on an ordinary question.
+    const escaping = shellPaths?.outside ?? [];
     const allowed = await this.#askOwner({
       toolName,
       // The prompt must not promise persistence a guest relationship will not deliver, and
       // must not imply the owner knows who is asking when they do not.
-      summary: `${printableSafe(guest ? oneOff : summary, 600)}\n   asked by: ${this.peerLabel}`,
-      kind: "capability",
+      summary: [
+        escaping.length ? "OUTSIDE the folders you shared — this command reaches out of them" : null,
+        printableSafe(guest ? oneOff : summary, 600),
+        ...escaping.map((p) => `   outside path: ${printableSafe(p)}`),
+        `   asked by: ${this.peerLabel}`,
+      ].filter(Boolean).join("\n"),
+      kind: escaping.length ? "escalation" : "capability",
     });
 
     if (guest) {

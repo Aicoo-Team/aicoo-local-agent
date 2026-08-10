@@ -1,5 +1,5 @@
 import { CodexAppServerTurn } from "./codex-app-server.js";
-import { resolveReal, isSensitivePath, isNeverWritePath, printableSafe } from "./agent.js";
+import { resolveReal, isSensitivePath, isNeverWritePath, printableSafe, classifyCommandPaths } from "./agent.js";
 
 const TURN_TIMEOUT_MS = 300_000;
 
@@ -95,6 +95,18 @@ Compose the reply to send back now.`;
         // The owner enabled shell for this relationship, so an undeclared command is a
         // question rather than a refusal — asked by its exact text and remembered as that
         // text, exactly as the Claude path keys it. A near-miss is a different command.
+        // Same walls as the file tools, applied to the paths the command names. Without this
+        // the shell is a way around them, and on Codex it is not hypothetical: its memory
+        // plugin reaches into ~/Desktop/codex memory on an ordinary question.
+        const reach = classifyCommandPaths(requested, {
+          workspace: this.workspace,
+          folders: this.policy?.folders,
+        });
+        if (reach.walled.length) {
+          this.log(`[gate] credential path refused without asking (in a command): ${printableSafe(reach.walled[0])}`);
+          this.#audit("command", reach.walled[0], "deny", "path-wall-sensitive");
+          return "decline";
+        }
         const key = `bash:${requested}`;
         const remembered = this.state.grant?.(key);
         if (remembered) {
@@ -104,8 +116,14 @@ Compose the reply to send back now.`;
         }
         const ok = await this.approvals.ask({
           toolName: "Bash",
-          summary: `run this exact command in ${this.workspace}:\n   ${printableSafe(requested)}`,
-          kind: "exec",
+          summary: [
+            reach.outside.length
+              ? "OUTSIDE the folders you shared — this command reaches out of them"
+              : `run this exact command in ${this.workspace}:`,
+            `   ${printableSafe(requested)}`,
+            ...reach.outside.map((p) => `   outside path: ${printableSafe(p)}`),
+          ].join("\n"),
+          kind: reach.outside.length ? "escalation" : "exec",
         });
         this.state.setGrant?.(key, ok ? "allow" : "deny");
         this.#audit("command", requested.slice(0, 200), ok ? "allow" : "deny", ok ? "owner-granted" : "owner-refused");

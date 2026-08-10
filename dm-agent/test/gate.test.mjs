@@ -1,6 +1,6 @@
 import { realpathSync, mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { LocalDmAgent } from "../src/agent.js";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "dm-agent-gate-")));
@@ -375,6 +375,97 @@ for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   const esc = entries[entries.length - 1];
   check("an out-of-folder write is scoped to this once", esc.scope === "once");
   check("...and named as a write escalation", esc.rule === "owner-escalated-write");
+}
+
+// 10. A shell command names its own paths, and nothing used to look at them. The credential
+//     wall and the folder check both key off input.file_path, which a Bash call does not have,
+//     so `cat ~/.ssh/id_rsa` reached the owner as an ordinary y/N with no wall and no banner —
+//     while the wall's own comment promised those paths were never readable whatever folder
+//     was shared. Found by watching Codex's memory plugin reach into ~/Desktop on a plain
+//     question, which the prompt presented as just another command.
+{
+  const { Policy } = await import("../src/policy.js");
+  const { AgentState } = await import("../src/state.js");
+  const shellPolicy = new Policy({ folders: [ws], commands: new Map(), capabilities: new Set(["bash"]) });
+  const run = async (command) => {
+    const asked = [];
+    const agent = new LocalDmAgent({
+      workspace: ws, policy: shellPolicy,
+      state: new AgentState(join(root, `sh-${Math.random().toString(36).slice(2)}.json`)),
+      audit: { record() {} },
+      approvals: { ask: async (r) => { asked.push(r); return true } },
+      ownerLabel: "@owner", peerLabel: "@peer", log: () => {},
+    });
+    const d = await agent.decide("Bash", { command });
+    return { d, asked };
+  };
+
+  {
+    const { d, asked } = await run("cat ~/.ssh/id_rsa");
+    check("a credential path in a command is refused", d.allow === false);
+    check("...by the wall, not by the owner", d.rule === "path-wall-sensitive");
+    check("...and the owner is never asked", asked.length === 0);
+  }
+  {
+    const { d, asked } = await run("cat $HOME/.aws/credentials");
+    check("$HOME is expanded before the wall looks", d.rule === "path-wall-sensitive" && asked.length === 0);
+  }
+  {
+    // Relative paths resolve against the workspace, so the escape has to actually land on the
+    // credential store to be one — spelled out here rather than assumed, because an earlier
+    // version of this test used `../../.ssh` from a temp dir, which lands nowhere near it and
+    // "passed" for the wrong reason in both directions.
+    const escape = relative(ws, join(homedir(), ".ssh", "id_rsa"));
+    const { d, asked } = await run(`cat ${escape}`);
+    check("a relative path that lands on the credential store hits the wall", d.rule === "path-wall-sensitive");
+    check("...without asking", asked.length === 0);
+  }
+  {
+    // The assignment form is caught, because the value after `=` is scanned like any token.
+    const { d, asked } = await run('p=~/.ssh/id_rsa; cat "$p"');
+    check("a path hidden in a variable ASSIGNMENT is still caught", d.rule === "path-wall-sensitive" && asked.length === 0);
+  }
+  {
+    const { asked } = await run(`ls -1 ${join(root, "elsewhere")}/notes.json`);
+    check("a command reaching outside the shared folders escalates", asked[0]?.kind === "escalation");
+    check("...with the banner the owner reads first", /OUTSIDE the folders you shared/.test(asked[0]?.summary ?? ""));
+    check("...naming the path, not just burying it in the command", /outside path:/.test(asked[0]?.summary ?? ""));
+  }
+  {
+    // A path with a space has to survive whole. Cut at the space it becomes a path that does
+    // not exist, and the owner is asked to approve a file they were never shown — which is the
+    // failure this entire pass exists to prevent. Found by probing the packaged build.
+    const spaced = join(root, "outside dir", "notes.json");
+    const { asked } = await run(`ls "${spaced}"`);
+    check("a quoted path with a space is shown whole", (asked[0]?.summary ?? "").includes(spaced));
+    const { asked: single } = await run(`ls '${spaced}'`);
+    check("...single quotes too", (single[0]?.summary ?? "").includes(spaced));
+  }
+  {
+    const { asked } = await run("git status");
+    check("an ordinary command is still an ordinary question", asked[0]?.kind === "capability");
+    check("...with no outside-path noise", !/OUTSIDE/.test(asked[0]?.summary ?? ""));
+  }
+  {
+    const { asked } = await run(`cat ${join(ws, "ok.md")}`);
+    check("a path inside the shared folder does not escalate", asked[0]?.kind === "capability");
+  }
+  {
+    // A URL's slashes are not a filesystem path, and treating them as one would flag every
+    // curl as reaching outside.
+    const { asked } = await run("curl https://example.com/a/b/c");
+    check("a URL is not mistaken for a path", asked[0]?.kind === "capability");
+  }
+  {
+    // The limit, recorded rather than implied away. A shell can build a path out of nothing a
+    // scanner can read, and this one does: the command below reaches a path that never appears
+    // as text. It is asked as an ordinary command, which is why the full command text is still
+    // put in front of the owner — reading it remains the real defence, and this pass only
+    // makes the OBVIOUS cases behave the way the file tools do.
+    const { asked } = await run('cat "$(echo Li9zZWNyZXQ= | base64 -d)"');
+    check("a path assembled at runtime is NOT caught (known limit)", asked.length === 1);
+    check("...so it arrives as an ordinary command, text and all", (asked[0]?.summary ?? "").includes("base64"));
+  }
 }
 
 let failures = 0;
