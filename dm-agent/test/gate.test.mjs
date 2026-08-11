@@ -468,6 +468,35 @@ for (const tool of ["Bash", "Write", "Edit", "WebFetch", "Task"]) {
   }
 }
 
+// 11. The row has to name the goal. Recording the tool and the path and nothing about why
+//     leaves a table you can eyeball but cannot learn from — and the Codex runtime was writing
+//     six fields where Claude wrote eleven, so which half you got depended on who answered.
+{
+  const { Policy } = await import("../src/policy.js");
+  const { AgentState } = await import("../src/state.js");
+  const entries = [];
+  const agent = new LocalDmAgent({
+    workspace: ws,
+    policy: new Policy({ folders: [ws], commands: new Map(), capabilities: new Set() }),
+    state: new AgentState(join(root, `goal-${Math.random().toString(36).slice(2)}.json`)),
+    audit: { record: (e) => entries.push(e) },
+    approvals: { ask: async () => true },
+    ownerLabel: "@owner", peerLabel: "@peer",
+    ownerId: "u_1", deviceId: "dev_1", peerId: "bob",
+    log: () => {},
+  });
+  // decide() is reachable without a model; runTurn is not. beginTurn is the same call runTurn
+  // makes, so this exercises the real path rather than a test-only shortcut.
+  const turn = agent.beginTurn({ text: "what does this project do?", conversationId: "conv-7" });
+  await agent.decide("Read", { file_path: join(ws, "ok.md") });
+  const e = entries.at(-1);
+  check("the decision row names the runtime that made it", e.runtime === "claude");
+  check("...carries the goal that produced it", e.goal === "what does this project do?");
+  check("...grouped under the turn it belongs to", e.turnId === turn.turnId);
+  check("...and the conversation", e.conversationId === "conv-7");
+  check("...and still has the identity fields", e.ownerId === "u_1" && e.deviceId === "dev_1" && e.peerId === "bob");
+}
+
 let failures = 0;
 for (const [label, ok] of checks) {
   if (!ok) failures++;

@@ -475,6 +475,9 @@ async function main() {
         audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
         ownerLabel: `@${me.username}`,
         peerLabel: peerLabelFor(peer, policy, args["link-label"]),
+        ownerId: me.userId,
+        deviceId: state.deviceId(),
+        peerId: policy.isGuest ? null : peer,
         codexPath: args["codex-path"],
         log,
       })

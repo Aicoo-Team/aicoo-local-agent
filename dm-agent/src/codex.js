@@ -1,5 +1,6 @@
 import { CodexAppServerTurn } from "./codex-app-server.js";
-import { resolveReal, isSensitivePath, isNeverWritePath, printableSafe, classifyCommandPaths } from "./agent.js";
+import { resolveReal, isSensitivePath, isNeverWritePath, printableSafe, classifyCommandPaths, scopeOf } from "./agent.js";
+import { newTurnContext, turnSummary } from "./turn-context.js";
 
 const TURN_TIMEOUT_MS = 300_000;
 
@@ -17,7 +18,7 @@ const TURN_TIMEOUT_MS = 300_000;
  * defensible — the folder is the thing the owner shared — but it is not the same promise.
  */
 export class CodexResponder {
-  constructor({ workspace, state, approvals, policy, audit, ownerLabel, peerLabel, codexPath = "codex", log = console.log }) {
+  constructor({ workspace, state, approvals, policy, audit, ownerLabel, peerLabel, ownerId, deviceId, peerId, codexPath = "codex", log = console.log }) {
     this.workspace = workspace;
     this.state = state;
     this.approvals = approvals;
@@ -26,6 +27,11 @@ export class CodexResponder {
     this.ownerLabel = ownerLabel;
     this.peerLabel = peerLabel;
     this.codexPath = codexPath;
+    this.ownerId = ownerId ?? null;
+    this.deviceId = deviceId ?? null;
+    this.peerId = peerId ?? null;
+    this.turn = null;
+    this.turnDecisions = 0;
     this.log = log;
   }
 
@@ -88,7 +94,7 @@ Compose the reply to send back now.`;
       // than not asking. This is the one place Codex is still narrower than Claude Code.
       this.log(`[codex] cannot widen the sandbox — Codex asked to reach outside the shared folders,`);
       this.log(`[codex]   and this runtime has no way to grant that yet. Refused without asking you.`);
-      this.#audit("permissions", request.summary, "deny", "permissions-never-widened");
+      this.#audit("permissions", request.summary, "deny", "permissions-never-widened", "not-a-decision");
       return "decline";
     }
     if (request.kind === "fileChange") return this.#decideFileChange(request);
@@ -123,7 +129,7 @@ Compose the reply to send back now.`;
         });
         if (reach.walled.length) {
           this.log(`[gate] credential path refused without asking (in a command): ${printableSafe(reach.walled[0])}`);
-          this.#audit("command", reach.walled[0], "deny", "path-wall-sensitive");
+          this.#audit("command", reach.walled[0], "deny", "path-wall-sensitive", "not-a-decision");
           return "decline";
         }
         const key = `bash:${requested}`;
@@ -148,13 +154,13 @@ Compose the reply to send back now.`;
         this.#audit("command", requested.slice(0, 200), ok ? "allow" : "deny", ok ? "owner-granted" : "owner-refused");
         return ok ? "accept" : "decline";
       }
-      this.#audit("command", requested.slice(0, 200), "deny", "command-not-declared");
+      this.#audit("command", requested.slice(0, 200), "deny", "command-not-declared", "not-a-decision");
       return "decline";
     }
 
     const summary = `run "${declared.name}" (${declared.argv.join(" ")}) in ${this.workspace}`;
     const allowed = await this.approvals.ask({ toolName: `command:${declared.name}`, summary, kind: "exec" });
-    this.#audit("command", declared.name, allowed ? "allow" : "deny", allowed ? "owner-approved" : "owner-declined");
+    this.#audit("command", declared.name, allowed ? "allow" : "deny", allowed ? "owner-approved" : "owner-declined", "once");
     return allowed ? "accept" : "decline";
   }
 
@@ -206,7 +212,8 @@ Compose the reply to send back now.`;
     this.#audit("fileChange", reals.join(", "), ok ? "allow" : "deny",
       outside.length
         ? (ok ? "owner-escalated-write" : "owner-declined-escalation-write")
-        : (ok ? "owner-approved" : "owner-declined"));
+        : (ok ? "owner-approved" : "owner-declined"),
+      "once");
     return ok ? "accept" : "decline";
   }
 
@@ -240,8 +247,32 @@ Compose the reply to send back now.`;
     return undefined;
   }
 
-  #audit(tool, target, decision, rule) {
-    this.audit?.record({ peer: this.peerLabel, runtime: "codex", tool, target, decision, rule });
+  /**
+   * The same row the Claude path writes. It used to be six fields — no identity, no goal, no
+   * scope — so half the audit was unusable for anything except eyeballing, and the half that
+   * was usable depended on which runtime happened to answer.
+   *
+   * `scope` is passed rather than inferred: the rule names overlap with the Claude path but do
+   * not always mean the same thing here. `owner-approved` there is memoised for a couple of
+   * minutes; here there is no memo, so it is a single call.
+   */
+  #audit(tool, target, decision, rule, scope) {
+    this.audit?.record({
+      runtime: "codex",
+      ownerId: this.ownerId,
+      deviceId: this.deviceId,
+      peer: this.peerLabel,
+      peerId: this.peerId,
+      conversationId: this.turn?.conversationId ?? null,
+      turnId: this.turn?.turnId ?? null,
+      goal: this.turn?.goal ?? null,
+      tool,
+      target,
+      decision,
+      scope: scope ?? scopeOf(rule, this.policy),
+      rule,
+    });
+    this.turnDecisions += 1;
   }
 
   /**
@@ -260,14 +291,27 @@ Compose the reply to send back now.`;
   async runTurn(inbound) {
     const key = this.#threadKey(inbound);
     const existing = this.state.sessionFor(key);
+    this.turn = newTurnContext({
+      text: inbound?.text,
+      conversationId: inbound?.conversationId,
+      from: inbound?.from,
+      runtime: "codex",
+      sanitize: printableSafe,
+    });
+    this.turnDecisions = 0;
     try {
-      return await this.#runOnce(inbound, existing);
+      const reply = await this.#runOnce(inbound, existing);
+      this.audit?.record(turnSummary(this.turn, { outcome: "answered", decisions: this.turnDecisions }));
+      return reply;
     } catch (error) {
       if (existing) {
         this.log(`[codex] resume failed (${String(error).slice(0, 120)}); retrying with a fresh thread`);
         this.state.clearSessionFor(key);
-        return this.#runOnce(inbound, null);
+        const reply = await this.#runOnce(inbound, null);
+        this.audit?.record(turnSummary(this.turn, { outcome: "answered", decisions: this.turnDecisions }));
+        return reply;
       }
+      this.audit?.record(turnSummary(this.turn, { outcome: "failed", error, decisions: this.turnDecisions }));
       throw error;
     }
   }

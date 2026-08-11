@@ -5,6 +5,7 @@ import path from "node:path";
 import { createCommandServer, MCP_SERVER_NAME, RUN_COMMAND_TOOL } from "./commands.js";
 import { Policy, CAPABILITIES } from "./policy.js";
 import { IdleClock } from "./idle.js";
+import { newTurnContext, turnSummary } from "./turn-context.js";
 
 const READ_TOOLS = ["Read", "Glob", "Grep"];
 const WRITE_TOOLS = ["Write", "Edit", "NotebookEdit"];
@@ -74,7 +75,7 @@ const EXEC_MEMO_MS = 10_000;
  * that records only allow/deny cannot tell an owner which of those they agreed to, which is
  * the first thing they want to know when reviewing it months later.
  */
-function scopeOf(rule, policy) {
+export function scopeOf(rule, policy) {
   switch (rule) {
     // Out-of-folder access is never remembered, by construction — it asks every single time,
     // for a named peer as much as for a stranger.
@@ -469,6 +470,9 @@ export class LocalDmAgent {
   // the previous visitor's messages in context.
   #conversationId = null;
   #resumeId = null;
+  /** What this turn is for, and how many decisions it has produced. See turn-context.js. */
+  #turn = null;
+  #turnDecisions = 0;
   /** In-process MCP server exposing the owner's declared commands, or null if none. */
   #commandServer = null;
   /** Set while a turn is in flight. Paused whenever the owner has a question in front of them. */
@@ -536,11 +540,17 @@ export class LocalDmAgent {
       // WHO owns the machine, WHICH machine, and WHO was asking. "peer" alone was a display
       // label — "a visitor via your link" — which is unusable as a record: it cannot tell two
       // visitors apart, and it does not say whose machine or which one.
+      runtime: "claude",
       ownerId: this.ownerId ?? null,
       deviceId: this.deviceId ?? null,
       peer: this.peerLabel,
       peerId: this.peerId ?? null,
       conversationId: this.#conversationId,
+      // The goal, so a row says what was being attempted and not only what was touched.
+      // Grouped by turnId because three approvals for one question mean something different
+      // from three separate questions.
+      turnId: this.#turn?.turnId ?? null,
+      goal: this.#turn?.goal ?? null,
       tool: toolName,
       target: decision.target,
       decision: decision.allow ? "allow" : "deny",
@@ -550,6 +560,7 @@ export class LocalDmAgent {
       scope: scopeOf(decision.rule, this.policy),
       rule: decision.rule,
     });
+    this.#turnDecisions += 1;
     // An owner decision — however long it took — is progress: restart the idle clock
     // so a slow approval never causes the turn to be killed mid-flight.
     this.#idle?.refresh();
@@ -911,11 +922,25 @@ export class LocalDmAgent {
   }
 
   /** Run one turn for an inbound DM. Returns the reply text. */
-  async runTurn({ text, from, conversationId, createdAt }) {
+  /**
+   * Open a turn: reset the per-message budget and record what this one is for.
+   *
+   * Public because a turn's boundaries are part of this object's contract, not an internal
+   * detail — anything driving it needs to say where one message ends and the next begins, and
+   * every decision written from here on is stamped with the goal this opened.
+   */
+  beginTurn({ text, from, conversationId }) {
     // Per message, not per session: a budget that carried over would leave a long-running
     // agent permanently unable to ask, for reasons nobody watching this message can see.
     this.#escalations = 0;
     this.#conversationId = conversationId ?? null;
+    this.#turn = newTurnContext({ text, conversationId, from, runtime: "claude", sanitize: printableSafe });
+    this.#turnDecisions = 0;
+    return this.#turn;
+  }
+
+  async runTurn({ text, from, conversationId, createdAt }) {
+    this.beginTurn({ text, from, conversationId });
     this.#resumeId = this.state.sessionFor
       ? this.state.sessionFor(this.#conversationId)
       : this.state.sessionId ?? null;
@@ -929,14 +954,21 @@ ${text}
 Compose the reply to send back now.`;
 
     try {
-      return await this.#runOnce(prompt);
+      const reply = await this.#runOnce(prompt);
+      this.audit?.record(turnSummary(this.#turn, { outcome: "answered", decisions: this.#turnDecisions }));
+      return reply;
     } catch (error) {
       if (this.#resumeId && /No conversation found/i.test(String(error))) {
         this.log(`[agent] resume failed (${String(error).slice(0, 120)}); retrying with a fresh session`);
         this.state.clearSessionFor?.(this.#conversationId) ?? (this.state.sessionId = null);
         this.#resumeId = null;
-        return this.#runOnce(prompt);
+        const reply = await this.#runOnce(prompt);
+        this.audit?.record(turnSummary(this.#turn, { outcome: "answered", decisions: this.#turnDecisions }));
+        return reply;
       }
+      // A turn that produced four approvals and then failed anyway is the most useful row
+      // there is, and it does not exist unless the failure is written down too.
+      this.audit?.record(turnSummary(this.#turn, { outcome: "failed", error, decisions: this.#turnDecisions }));
       throw error;
     }
   }
