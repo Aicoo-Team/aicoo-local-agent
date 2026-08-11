@@ -14,6 +14,7 @@ import { AuditLog } from "./audit.js";
 import { acquireLock, LockError } from "./lock.js";
 import { checkModelReachable, explainUnreachable } from "./preflight.js";
 import { ReachabilityWatch, respawn } from "./reachability.js";
+import { Outbox } from "./outbox.js";
 import { collectSecrets, redact } from "./redact.js";
 
 const DEFAULT_SERVER = "https://www.aicoo.io";
@@ -423,6 +424,13 @@ async function main() {
   // From here on, everything logged is also readable from outside this process — see setLogFile.
   setLogFile(join(stateDir, "agent.log"));
 
+  // Decision rows ride the message poll rather than a second uploader — see api.guestMessages.
+  // Defined here because the audit logs below take it: `const` is not hoisted, and putting it
+  // near its use in the poll loop threw a TDZ error that `node --check` cannot see.
+  // --no-upload keeps everything local; the audit file is unaffected either way.
+  const outbox = args["no-upload"] ? null : new Outbox(join(stateDir, "outbox.jsonl"), { log });
+  if (outbox?.size) log(`[outbox] ${outbox.size} row(s) waiting from a previous run`);
+
   // One agent per state directory, claimed before anything else touches it.
   let releaseLock = () => {};
   try {
@@ -448,7 +456,7 @@ async function main() {
     state,
     approvals,
     policy,
-    audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
+    audit: new AuditLog(join(stateDir, "audit.jsonl"), { log, outbox }),
     sandbox: args["no-sandbox"] ? false : undefined,
     ownerLabel: `@${me.username}`,
     peerLabel: peerLabelFor(peer, policy, args["link-label"]),
@@ -472,7 +480,7 @@ async function main() {
         state,
         approvals,
         policy,
-        audit: new AuditLog(join(stateDir, "audit.jsonl"), { log }),
+        audit: new AuditLog(join(stateDir, "audit.jsonl"), { log, outbox }),
         ownerLabel: `@${me.username}`,
         peerLabel: peerLabelFor(peer, policy, args["link-label"]),
         ownerId: me.userId,
@@ -662,8 +670,14 @@ async function main() {
     while (!stopping) {
       try {
         const cursor = state.cursor("guest") ?? 0;
-        const { links, messages } = await api.guestMessages(cursor);
+        const batch = outbox?.nextBatch() ?? [];
+        const { links, messages, decisions } = await api.guestMessages(cursor, batch);
         notePollOk();
+        // Only on an answer. A failed poll leaves the batch queued, which is the entire retry
+        // policy — there is no second one to get wrong.
+        if (batch.length && decisions) {
+          outbox.settle({ ...decisions, attempted: batch.map((r) => r.clientEventId) });
+        }
         if (!announced) {
           announced = true;
           log(links.length

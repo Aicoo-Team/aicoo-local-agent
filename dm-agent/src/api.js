@@ -101,10 +101,27 @@ export class AicooApi {
    * Returns { links, messages } — messages include our own past replies so the agent can tell
    * where it left off rather than treating every restart as a backlog.
    */
-  async guestMessages(since = 0) {
+  /**
+   * The poll, optionally carrying decision rows the other way.
+   *
+   * With nothing to send this stays a GET — the shape every published agent already speaks, and
+   * a method change would take them all offline. With a backlog it becomes a POST on the same
+   * route, so the upload inherits the poll's authentication, its schedule, and its retry
+   * behaviour instead of needing three of its own.
+   */
+  async guestMessages(since = 0, decisions = []) {
     const params = new URLSearchParams({ since: String(since) });
-    const res = await this.request(`/api/v1/local-agent/guest-messages?${params}`);
-    return { links: res.links ?? [], messages: res.messages ?? [] };
+    const path = `/api/v1/local-agent/guest-messages?${params}`;
+    const res = decisions.length
+      ? await this.request(path, { method: "POST", body: { since, decisions } })
+      : await this.request(path);
+    return {
+      links: res.links ?? [],
+      messages: res.messages ?? [],
+      // Absent means the server did not look at them — an older deploy, say. That is not the
+      // same as "looked and stored none", and the caller must not treat it as delivery.
+      decisions: res.decisions ?? null,
+    };
   }
 
   /** Post an answer back into a guest conversation, where the visitor's own UI picks it up. */
