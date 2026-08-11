@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { RelationshipAccessPreset } from "../../security/relationship-policy.js";
 
@@ -34,7 +35,11 @@ export interface CodexPermissionProfileInput {
   preset: RelationshipAccessPreset;
   /** Absolute folder paths granted for this relationship. */
   folders: readonly string[];
+  /** Subset of `folders` that may be modified. All remaining folders stay read-only. */
+  writableFolders?: readonly string[];
   profileName?: string;
+  /** Override used by tests; defaults to the active Codex login's auth.json. */
+  authFile?: string;
 }
 
 /**
@@ -50,11 +55,17 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   const name = input.profileName ?? CODEX_PROFILE_NAME;
   // read-project may only read; edit-project may also write. Codex resolves "deny" ahead of any
   // broader grant, so ":root" = "deny" survives the more specific workspace-root entry below.
-  const writable = input.preset === "edit-project";
+  const requestedWritable = input.writableFolders
+    ?? (input.preset === "edit-project" ? folders : []);
+  const folderSet = new Set(folders);
+  const writableFolders = [...new Set(requestedWritable)].filter((folder) => folderSet.has(folder));
+  const writable = writableFolders.length > 0;
   const base = writable ? ":workspace" : ":read-only";
-  const workspaceAccess = writable ? "write" : "read";
+  const workspaceAccess = writableFolders.length === folders.length ? "write" : "read";
 
   return [
+    `default_permissions = ${tomlString(name)}`,
+    "",
     `[permissions.${name}]`,
     `description = "Aicoo c2c relationship (${input.preset})"`,
     `extends = "${base}"`,
@@ -67,6 +78,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     // then add back only what a process needs to start.
     '":root" = "deny"',
     '":minimal" = "read"',
+    ...writableFolders.map((folder) => `${tomlString(folder)} = "write"`),
     "",
     `[permissions.${name}.filesystem.":workspace_roots"]`,
     `"." = "${workspaceAccess}"`,
@@ -96,8 +108,18 @@ export function writeCodexPermissionProfile(
 ): PreparedCodexProfile | undefined {
   const profile = renderCodexPermissionProfile(input);
   if (!profile) return undefined;
-  mkdirSync(directory, { recursive: true });
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
   writeFileSync(join(directory, "config.toml"), profile, { mode: 0o600 });
+  // CODEX_HOME isolates the owner's settings, plugins and MCP configuration, but Codex also
+  // locates its login there. Copy only the credential file into the private home; the generated
+  // filesystem profile denies the model access to this directory.
+  const authFile = input.authFile
+    ?? join(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "auth.json");
+  if (existsSync(authFile) && authFile !== join(directory, "auth.json")) {
+    copyFileSync(authFile, join(directory, "auth.json"));
+    chmodSync(join(directory, "auth.json"), 0o600);
+  }
   return { codexHome: directory, profileName: input.profileName ?? CODEX_PROFILE_NAME };
 }
 

@@ -187,8 +187,6 @@ export interface RuntimeEvent<T = Record<string, unknown>> {
 export interface TrustedToolPolicyUsageInput {
   policyId: string;
   revision: number;
-  normalizedTool: string;
-  canonicalFolder: string;
   uses: Array<{ sequence: number; usedAt: string }>;
 }
 

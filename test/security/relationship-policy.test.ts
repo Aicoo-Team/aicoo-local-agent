@@ -163,6 +163,55 @@ describe("RelationshipPolicy", () => {
     expect(document.relationships).toHaveLength(1);
   });
 
+  it("requires explicit project selection when one verified device has multiple folders", () => {
+    const directory = makeDirectory();
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const file = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+
+    expect(permissions.accessFor(inbound())).toMatchObject({
+      status: "selection_required",
+      preset: "chat-only",
+      folders: [],
+    });
+    expect(permissions.authorize(
+      { toolName: "Read", input: { file_path: join(first, "README.md") } },
+      inbound(),
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("must select") });
+
+    const selected = inbound({
+      payload: {
+        task: { text: "Inspect the selected project", projectAccessId: second },
+      },
+    });
+    expect(permissions.accessFor(selected)).toMatchObject({
+      status: "selected",
+      preset: "read-project",
+      folders: [realpathSync.native(second)],
+    });
+    expect(permissions.authorize(
+      { toolName: "Read", input: { file_path: join(second, "README.md") } },
+      selected,
+    )).toMatchObject({ behavior: "allow" });
+    expect(permissions.authorize(
+      { toolName: "Read", input: { file_path: join(first, "README.md") } },
+      selected,
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("outside") });
+  });
+
   it("forgets generated peer permissions when a bridge run resets its policy", () => {
     const directory = makeDirectory();
     const project = join(directory, "project");
@@ -185,7 +234,7 @@ describe("RelationshipPolicy", () => {
     expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ version: 1, relationships: [] });
   });
 
-  it("validates a Git repository boundary without silently granting the Git tool", () => {
+  it("derives Git access from the project preset", () => {
     const directory = makeDirectory();
     const project = join(directory, "project");
     const config = join(directory, "config");
@@ -208,7 +257,7 @@ describe("RelationshipPolicy", () => {
     expect(permissions.authorize(
       { toolName: "GitStatus", input: { repository: project } },
       inbound(),
-    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("not allowed") });
+    )).toMatchObject({ behavior: "allow", updatedInput: { repository: realpathSync.native(project) } });
   });
 
   it("prevents peer edits from planting Git configuration or attribute execution", () => {

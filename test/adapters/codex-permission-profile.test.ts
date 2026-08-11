@@ -30,6 +30,7 @@ describe("codex permission profile", () => {
 
   it("denies the root read the built-in presets grant, and restores only :minimal", () => {
     const profile = renderCodexPermissionProfile({ preset: "read-project", folders: ["/srv/project"] })!;
+    expect(profile).toContain(`default_permissions = ${JSON.stringify(CODEX_PROFILE_NAME)}`);
     // Without ":root" = "deny" the session can read the whole disk: the built-in presets grant
     // root-level read, and writable_roots scopes writes only.
     expect(profile).toContain('":root" = "deny"');
@@ -49,6 +50,17 @@ describe("codex permission profile", () => {
     expect(edit).toContain('extends = ":workspace"');
   });
 
+  it("does not widen read-only folders when one relationship has mixed folder presets", () => {
+    const profile = renderCodexPermissionProfile({
+      preset: "edit-project",
+      folders: ["/srv/read-only", "/srv/writable"],
+      writableFolders: ["/srv/writable"],
+    })!;
+    expect(profile).toContain('"." = "read"');
+    expect(profile).toContain('"/srv/writable" = "write"');
+    expect(profile).not.toContain('"/srv/read-only" = "write"');
+  });
+
   it("keeps network closed for every preset", () => {
     for (const preset of ["read-project", "edit-project"] as const) {
       const profile = renderCodexPermissionProfile({ preset, folders: ["/srv/p"] })!;
@@ -58,11 +70,15 @@ describe("codex permission profile", () => {
 
   it("writes a private CODEX_HOME so the owner's own config cannot leak in", () => {
     const dir = tempDir("codex-profile-");
+    const authFile = join(dir, "source-auth.json");
+    writeFileSync(authFile, '{"token":"test-only"}', { mode: 0o600 });
     const prepared = writeCodexPermissionProfile(join(dir, "home"), {
       preset: "read-project",
       folders: ["/srv/project"],
+      authFile,
     })!;
     expect(prepared.profileName).toBe(CODEX_PROFILE_NAME);
+    expect(readFileSync(join(prepared.codexHome, "auth.json"), "utf8")).toBe('{"token":"test-only"}');
     expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain('":root" = "deny"');
   });
 });
@@ -163,8 +179,8 @@ describe("codex argv", () => {
       ...base,
       permissionProfile: { codexHome: "/tmp/home", profileName: CODEX_PROFILE_NAME },
     });
-    expect(args).toContain("-P");
-    expect(args).toContain(CODEX_PROFILE_NAME);
+    expect(args).toContain("-c");
+    expect(args).toContain(`permission_profile=${JSON.stringify(CODEX_PROFILE_NAME)}`);
     expect(args).not.toContain("--ignore-user-config");
     // The profile pins read, write and network, so the coarse sandbox_mode flags must not also
     // be present — they grant root-level read and would widen what the profile just narrowed.
@@ -176,6 +192,6 @@ describe("codex argv", () => {
     const args = buildArgs(base);
     expect(args).toContain("--ignore-user-config");
     expect(args.join(" ")).toContain('sandbox_mode="read-only"');
-    expect(args).not.toContain("-P");
+    expect(args.join(" ")).not.toContain("permission_profile=");
   });
 });

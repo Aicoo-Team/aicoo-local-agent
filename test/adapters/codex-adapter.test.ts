@@ -82,7 +82,7 @@ describe("CodexAdapter managed sessions", () => {
     expect(asked).toEqual(["GitStatus"]);
   });
 
-  it("brokers Codex Read through the shared relationship policy", async () => {
+  it("turns a read-project relationship preset into a Codex sandbox profile", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
@@ -98,13 +98,7 @@ describe("CodexAdapter managed sessions", () => {
       preset: "read-project",
       folder: project,
     });
-    const driver = new FakeCodexDriver((prompt) => {
-      if (prompt.includes("[Aicoo brokered file-operation request]")) {
-        return JSON.stringify({ operations: [{ tool: "Read", file_path: "README.md" }] });
-      }
-      expect(prompt).toContain("# Demo\\n\\nRun npm test.");
-      return "README says to run npm test.";
-    });
+    const driver = new FakeCodexDriver("README says to run npm test.");
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
       cwd: project,
@@ -123,18 +117,67 @@ describe("CodexAdapter managed sessions", () => {
       expect.objectContaining({
         type: "reply",
         inReplyTo: "msg_policy",
-        payload: expect.objectContaining({ text: "README says to run npm test.", provider: "codex", brokered: true }),
+        payload: expect.objectContaining({ text: "README says to run npm test.", provider: "codex" }),
       }),
     ]);
-    expect(driver.turns[0]?.prompt).toContain("[Aicoo brokered file-operation request]");
-    expect(driver.turns[0]?.prompt).toContain(
-      `Allowed folders (use these exact absolute paths for every operation):\n- ${realpathSync.native(project)}`,
-    );
-    expect(driver.turns[0]?.writableRoots).toEqual([]);
-    expect(driver.turns[1]?.prompt).toContain("[Aicoo brokered file-operation results]");
+    expect(driver.turns).toHaveLength(1);
+    expect(driver.turns[0]?.prompt).toContain("[Aicoo sandboxed collaboration request]");
+    expect(driver.turns[0]?.cwd).toBe(realpathSync.native(project));
+    expect(driver.turns[0]?.permissionProfile).toMatchObject({ profileName: "aicoo-c2c" });
+    const profile = readFileSync(join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"), "utf8");
+    expect(profile).toContain("Aicoo c2c relationship (read-project)");
+    expect(profile).toContain('extends = ":read-only"');
+    expect(profile).toContain(`${JSON.stringify(realpathSync.native(project))} = true`);
   });
 
-  it("reuses approved relationship tool and folder access during collaboration", async () => {
+  it("fails closed for ambiguous projects and uses the explicitly selected folder", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-project-selection-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeCodexDriver("Selected project inspected.");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_ambiguous", {
+      kind: "task_invite",
+    }), "queue"))
+      .toEqual({ status: "project_selection_required" });
+    expect(driver.turns).toHaveLength(0);
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_selected", {
+      kind: "task_invite",
+      payload: {
+        task: { text: "Inspect this project", projectAccessId: second },
+      },
+    }), "queue")).toMatchObject({ status: "runtime_acked" });
+    expect(driver.turns[0]?.cwd).toBe(realpathSync.native(second));
+    expect(driver.turns[0]?.prompt).toContain(realpathSync.native(second));
+    expect(driver.turns[0]?.prompt).not.toContain(`- ${realpathSync.native(first)}`);
+  });
+
+  it("uses the kernel profile without a second local approval layer", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-collab-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
@@ -150,9 +193,7 @@ describe("CodexAdapter managed sessions", () => {
       preset: "read-project",
       folder: project,
     });
-    const driver = new FakeCodexDriver((prompt) => prompt.includes("[Aicoo brokered file-operation request]")
-      ? JSON.stringify({ operations: [{ tool: "Read", file_path: "README.md" }] })
-      : "done");
+    const driver = new FakeCodexDriver("done");
     const asked: Array<{ toolName: string; toolInputSummary: string }> = [];
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
@@ -182,9 +223,10 @@ describe("CodexAdapter managed sessions", () => {
     await events;
 
     expect(asked).toEqual([]);
+    expect(driver.turns[0]?.permissionProfile).toBeDefined();
   });
 
-  it("brokers GitStatus through its dedicated owner approval", async () => {
+  it("derives Git read access from the read-project preset", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-git-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
@@ -201,13 +243,7 @@ describe("CodexAdapter managed sessions", () => {
       preset: "read-project",
       folder: project,
     });
-    const driver = new FakeCodexDriver((prompt) => {
-      if (prompt.includes("[Aicoo brokered file-operation request]")) {
-        return JSON.stringify({ operations: [{ tool: "GitStatus", repository: project }] });
-      }
-      expect(prompt).toContain("untracked.txt");
-      return "The repository has one untracked file.";
-    });
+    const driver = new FakeCodexDriver("The repository has one untracked file.");
     const asked: string[] = [];
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
@@ -232,10 +268,12 @@ describe("CodexAdapter managed sessions", () => {
     await adapter.deliverToSession("codex-managed-1", inbound("msg_git"), "queue");
     await events;
 
-    expect(asked).toEqual(["GitStatus"]);
+    expect(asked).toEqual([]);
+    expect(driver.turns[0]?.prompt).toContain("read-project");
+    expect(driver.turns[0]?.permissionProfile).toBeDefined();
   });
 
-  it("passes edit-project folders as Codex writable roots", async () => {
+  it("turns edit-project folders into writable Codex sandbox roots", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-writable-roots-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
@@ -264,10 +302,14 @@ describe("CodexAdapter managed sessions", () => {
     expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_edit_policy"), "queue")).status)
       .toBe("runtime_acked");
 
-    expect(driver.turns[0]?.writableRoots).toEqual([realpathSync.native(project)]);
+    expect(driver.turns[0]?.writableRoots).toBeUndefined();
+    const profile = readFileSync(join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"), "utf8");
+    expect(profile).toContain("Aicoo c2c relationship (edit-project)");
+    expect(profile).toContain('extends = ":workspace"');
+    expect(profile).toContain('"." = "write"');
   });
 
-  it("denies brokered Codex file operations outside the granted folder", async () => {
+  it("does not create a project sandbox for a different sender device", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-policy-deny-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const project = join(directory, "project");
@@ -285,13 +327,7 @@ describe("CodexAdapter managed sessions", () => {
       preset: "edit-project",
       folder: project,
     });
-    const driver = new FakeCodexDriver((prompt) => {
-      if (prompt.includes("[Aicoo brokered file-operation request]")) {
-        return JSON.stringify({ operations: [{ tool: "Read", file_path: join(outside, "secret.txt") }] });
-      }
-      expect(prompt).toContain("Path is outside the folders allowed for this relationship");
-      return "Denied: outside the granted folder.";
-    });
+    const driver = new FakeCodexDriver("No project access.");
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
       cwd: project,
@@ -303,15 +339,19 @@ describe("CodexAdapter managed sessions", () => {
 
     await adapter.initialize();
     const events = collectEvents(adapter, "codex-managed-1", 2);
-    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_denied"), "queue")).status)
+    expect((await adapter.deliverToSession("codex-managed-1", inbound("msg_denied", {
+      senderDeviceId: "device_b",
+    }), "queue")).status)
       .toBe("runtime_acked");
     expect(await events).toEqual([
       expect.objectContaining({ type: "turn_started", inReplyTo: "msg_denied" }),
       expect.objectContaining({
         type: "reply",
-        payload: expect.objectContaining({ text: "Denied: outside the granted folder.", brokered: true }),
+        payload: expect.objectContaining({ text: "No project access." }),
       }),
     ]);
+    expect(driver.turns[0]?.permissionProfile).toBeUndefined();
+    expect(driver.turns[0]?.prompt).toContain("Do not run commands, read or write files");
     expect(readFileSync(join(outside, "secret.txt"), "utf8")).toBe("secret");
   });
 
@@ -603,6 +643,7 @@ function inbound(
   overrides: Partial<Pick<
     InboundMessage,
     "replyTo" | "correlationId" | "communicationSessionId" | "collaborationId" | "collaborationTurn"
+    | "senderPrincipalId" | "senderDeviceId" | "payload" | "kind"
   >> = {},
 ): InboundMessage {
   return {

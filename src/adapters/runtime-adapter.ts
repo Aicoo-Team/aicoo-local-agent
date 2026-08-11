@@ -49,7 +49,9 @@ export interface RuntimeAdapter {
           | "steer_not_allowed"
           | "runtime_unavailable"
           | "unsupported"
-          | "permission_required";
+          | "permission_required"
+          | "project_selection_required"
+          | "project_access_not_found";
       }
   >;
 }
