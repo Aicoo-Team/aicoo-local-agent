@@ -13,6 +13,9 @@ export class AicooApi {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.token = token;
     this.timeoutMs = timeoutMs;
+    // Set once a deployment has answered 405/404 to an upload, so a backlog does not retry it
+    // on every single poll for the life of the process.
+    this.uploadUnsupported = false;
     this.log = log;
   }
 
@@ -112,9 +115,25 @@ export class AicooApi {
   async guestMessages(since = 0, decisions = []) {
     const params = new URLSearchParams({ since: String(since) });
     const path = `/api/v1/local-agent/guest-messages?${params}`;
-    const res = decisions.length
-      ? await this.request(path, { method: "POST", body: { since, decisions } })
-      : await this.request(path);
+    let res;
+    if (decisions.length && !this.uploadUnsupported) {
+      try {
+        res = await this.request(path, { method: "POST", body: { since, decisions } });
+      } catch (error) {
+        // A server that predates the upload half answers 405, and Next.js gives 404 for a route
+        // that does not exist at all. Either way the messages still have to arrive: without
+        // this, an agent with a backlog turns every poll into a failing POST, stops receiving
+        // anything, and — because the poll is also the reachability signal — decides it cannot
+        // reach Aicoo and restarts itself. Verified against production before the server half
+        // shipped: POST 405, GET 200.
+        if (error?.status !== 405 && error?.status !== 404) throw error;
+        this.uploadUnsupported = true;
+        this.log(`[api] this Aicoo deployment does not accept decision uploads yet (HTTP ${error.status}) — polling normally and keeping them queued`);
+        res = await this.request(path);
+      }
+    } else {
+      res = await this.request(path);
+    }
     return {
       links: res.links ?? [],
       messages: res.messages ?? [],
