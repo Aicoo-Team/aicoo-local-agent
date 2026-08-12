@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
 import { RelationshipPolicy } from "../../src/security/relationship-policy.js";
 import {
+  invalidateTrustedToolPolicy,
+  markTrustedToolPolicyUsed,
   readTrustedToolPolicies,
   markTrustedToolPolicyUsesReported,
   pendingTrustedToolPolicyUses,
@@ -12,14 +14,14 @@ import {
   upsertTrustedToolPolicy,
 } from "../../src/security/trusted-tool-policy.js";
 
-describe("trusted collaborator tool policies", () => {
+describe("trusted collaborator access presets", () => {
   const cleanups: string[] = [];
 
   afterEach(() => {
     for (const directory of cleanups.splice(0)) rmSync(directory, { recursive: true, force: true });
   });
 
-  it("matches one verified device, normalized tool, canonical folder, and owner identity", () => {
+  it("matches one verified device, access preset, canonical folder, and owner identity", () => {
     const fixture = setup();
     upsertTrustedToolPolicy({
       file: fixture.trustedFile,
@@ -28,7 +30,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "Read",
+      accessPreset: "read-project",
       scope: "persistent",
       createdFrom: "cli",
       createdBy: "owner",
@@ -56,10 +58,58 @@ describe("trusted collaborator tool policies", () => {
     )).toMatchObject({ behavior: "deny", message: expect.stringContaining("No policy") });
 
     expect(readTrustedToolPolicies(fixture.trustedFile).policies[0]).toMatchObject({
-      normalizedTool: "Read",
+      accessPreset: "read-project",
       useCount: 1,
       lastUsedAt: expect.any(String),
     });
+  });
+
+  it("selects one trusted project by policy ID and refuses ambiguous access", () => {
+    const fixture = setup();
+    const secondProject = join(fixture.directory, "second-project");
+    mkdirSync(secondProject);
+    const first = upsertTrustedToolPolicy({
+      file: fixture.trustedFile,
+      ownerPrincipalId: "owner",
+      ownerDeviceId: "owner-device",
+      requesterPrincipalId: "requester",
+      requesterDeviceId: "requester-device",
+      folder: fixture.project,
+      accessPreset: "edit-project",
+      scope: "persistent",
+      createdFrom: "cli",
+      createdBy: "owner",
+    });
+    const second = upsertTrustedToolPolicy({
+      file: fixture.trustedFile,
+      ownerPrincipalId: "owner",
+      ownerDeviceId: "owner-device",
+      requesterPrincipalId: "requester",
+      requesterDeviceId: "requester-device",
+      folder: secondProject,
+      accessPreset: "read-project",
+      scope: "persistent",
+      createdFrom: "cli",
+      createdBy: "owner",
+    });
+    const policy = load(fixture, "bridge-new");
+
+    expect(policy.accessFor(message())).toMatchObject({ status: "selection_required", folders: [] });
+    const selected = message({
+      payload: { task: { text: "Inspect it", projectAccessId: second.policyId } },
+    });
+    expect(policy.accessFor(selected)).toMatchObject({
+      status: "selected",
+      preset: "read-project",
+      folders: [realpathSync.native(secondProject)],
+    });
+    expect(policy.authorize(
+      { toolName: "Write", input: { file_path: join(secondProject, "notes.txt") } },
+      selected,
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("not allowed") });
+    expect(policy.accessFor(message({
+      payload: { task: { text: "Inspect it", projectAccessId: `${first.policyId}-unknown` } },
+    }))).toMatchObject({ status: "not_found", folders: [] });
   });
 
   it("expires bridge-run access on restart while persistent access survives", () => {
@@ -71,7 +121,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "Read",
+      accessPreset: "edit-project",
       scope: "bridge_run",
       bridgeInstanceId: "bridge-old",
       createdFrom: "cli",
@@ -84,7 +134,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "GitStatus",
+      accessPreset: "read-project",
       scope: "persistent",
       createdFrom: "cli",
       createdBy: "owner",
@@ -92,7 +142,7 @@ describe("trusted collaborator tool policies", () => {
 
     const restarted = load(fixture, "bridge-new");
     expect(restarted.authorize(
-      { toolName: "Read", input: { file_path: fixture.notes } },
+      { toolName: "Write", input: { file_path: fixture.notes } },
       message(),
     )).toMatchObject({ behavior: "deny" });
     expect(restarted.authorize(
@@ -101,7 +151,7 @@ describe("trusted collaborator tool policies", () => {
     )).toMatchObject({ behavior: "allow" });
   });
 
-  it("revokes the exact tool on the next policy load and deduplicates exact active records", () => {
+  it("revokes the exact preset on the next policy load and deduplicates exact active records", () => {
     const fixture = setup();
     const first = upsertTrustedToolPolicy({
       file: fixture.trustedFile,
@@ -110,7 +160,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "Edit",
+      accessPreset: "edit-project",
       scope: "persistent",
       createdFrom: "cli",
       createdBy: "owner",
@@ -122,7 +172,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "Edit",
+      accessPreset: "edit-project",
       scope: "persistent",
       createdFrom: "cli",
       createdBy: "owner",
@@ -147,11 +197,64 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: parse(fixture.project).root,
-      normalizedTool: "Read",
+      accessPreset: "read-project",
       scope: "persistent",
       createdFrom: "cli",
       createdBy: "owner",
     })).toThrow("Filesystem roots");
+  });
+
+  it("migrates legacy per-tool policy files to access presets", () => {
+    const fixture = setup();
+    const createdAt = new Date().toISOString();
+    writeFileSync(fixture.trustedFile, JSON.stringify({
+      version: 2,
+      revision: 4,
+      serverRevisions: { "legacy-read": 7, "legacy-write": 8 },
+      policies: [
+        {
+          policyId: "legacy-read",
+          ownerPrincipalId: "owner",
+          ownerDeviceId: "owner-device",
+          requesterPrincipalId: "requester",
+          requesterDeviceId: "requester-device",
+          canonicalFolder: realpathSync.native(fixture.project),
+          normalizedTool: "GitDiff",
+          scope: "persistent",
+          status: "active",
+          createdFrom: "settings",
+          createdAt,
+          createdBy: "owner",
+          useCount: 0,
+          pendingUses: [],
+        },
+        {
+          policyId: "legacy-write",
+          ownerPrincipalId: "owner",
+          ownerDeviceId: "owner-device",
+          requesterPrincipalId: "requester",
+          requesterDeviceId: "requester-device",
+          canonicalFolder: realpathSync.native(fixture.project),
+          normalizedTool: "GitCommit",
+          scope: "persistent",
+          status: "active",
+          createdFrom: "settings",
+          createdAt,
+          createdBy: "owner",
+          useCount: 0,
+          pendingUses: [],
+        },
+      ],
+    }));
+
+    expect(readTrustedToolPolicies(fixture.trustedFile)).toMatchObject({
+      version: 3,
+      revision: 4,
+      policies: [
+        { policyId: "legacy-read", accessPreset: "read-project" },
+        { policyId: "legacy-write", accessPreset: "edit-project" },
+      ],
+    });
   });
 
   it("keeps a newer revocation ahead of a delayed allow event", () => {
@@ -164,7 +267,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "Read" as const,
+      accessPreset: "read-project" as const,
       scope: "persistent" as const,
       createdFrom: "settings" as const,
       createdBy: "owner",
@@ -194,7 +297,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "Read",
+      accessPreset: "read-project",
       scope: "persistent",
       createdFrom: "cli",
       createdBy: "owner",
@@ -207,7 +310,7 @@ describe("trusted collaborator tool policies", () => {
       requesterPrincipalId: "requester",
       requesterDeviceId: "requester-device",
       folder: fixture.project,
-      normalizedTool: "Read",
+      accessPreset: "read-project",
       scope: "persistent",
       createdFrom: "settings",
       createdBy: "owner",
@@ -229,6 +332,34 @@ describe("trusted collaborator tool policies", () => {
     });
 
     markTrustedToolPolicyUsesReported(fixture.trustedFile, "ttp-hosted-usage", 1);
+    expect(pendingTrustedToolPolicyUses(fixture.trustedFile, "owner", "owner-device")).toEqual([]);
+  });
+
+  it("invalidates a cached hosted policy and drops unsendable usage", () => {
+    const fixture = setup();
+    upsertTrustedToolPolicy({
+      file: fixture.trustedFile,
+      policyId: "ttp-deleted-hosted",
+      ownerPrincipalId: "owner",
+      ownerDeviceId: "owner-device",
+      requesterPrincipalId: "requester",
+      requesterDeviceId: "requester-device",
+      folder: fixture.project,
+      accessPreset: "read-project",
+      scope: "persistent",
+      createdFrom: "settings",
+      createdBy: "owner",
+      serverRevision: 3,
+    });
+    markTrustedToolPolicyUsed(fixture.trustedFile, "ttp-deleted-hosted");
+
+    invalidateTrustedToolPolicy(fixture.trustedFile, "ttp-deleted-hosted", "Hosted policy no longer exists");
+
+    expect(readTrustedToolPolicies(fixture.trustedFile).policies[0]).toMatchObject({
+      status: "invalid",
+      pendingUses: [],
+      invalidatedReason: "Hosted policy no longer exists",
+    });
     expect(pendingTrustedToolPolicyUses(fixture.trustedFile, "owner", "owner-device")).toEqual([]);
   });
 

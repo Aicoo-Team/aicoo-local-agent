@@ -32,6 +32,16 @@ current shell:
 ccd delegate @username "task for the peer local agent"
 ```
 
+If more than one project has been shared for the relationship, pass the exact
+project grant ID (preferred) or approved absolute folder. Never guess a folder:
+
+```bash
+ccd delegate @username "summarize the project" --project ttp_project_grant_id
+```
+
+The receiver deliberately returns `project_selection_required` when multiple
+projects are available and no project was selected.
+
 Use the exact peer handle/name the user gave when possible. Keep the task text
 faithful to the user's request. If the request names files or folders, include
 that detail in the delegated task; the peer's bridge will enforce any approved
