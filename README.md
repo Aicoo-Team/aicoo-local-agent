@@ -117,48 +117,34 @@ npm run ccd -- --server http://127.0.0.1:7790 --token <token> connect list
 
 ## Setup Guide
 
-Follow these three steps to connect your local coding agent and start collaborating.
+Connect a local coding agent with one command from the project folder it should use:
 
 Use this guide when the Aicoo app asks you to set up local-agent collaboration.
 Run the commands on the same machine where Claude Code or Codex can access the
 workspace you want to use. The app is the human collaboration surface; this
 package is the local bridge that keeps your coding agent reachable from Aicoo.
 
-**1. Log in your device**
-
-Run the local-agent login command in your terminal, then approve the device code in Aicoo:
-
 ```bash
-npx @aicoo/local-agent login
-```
-
-This links your machine to your Aicoo account. Your coding agent stays on your device; Aicoo
-handles identity, grants, routing, delivery state, and revocation.
-
-After login, the CLI stores a local device credential under `~/.aicoo/local-agent/`.
-You only need to repeat this step when setting up another machine or re-authenticating.
-
-**2. Choose your runtime adapter**
-
-Start your local bridge with Claude Code or Codex:
-
-```bash
-ccd start --adapter claude-code
+npx -y @aicoo/local-agent@latest onboard --runtime claude-code
 ```
 
 ```bash
-ccd start --adapter codex
+npx -y @aicoo/local-agent@latest onboard --runtime codex
 ```
 
-The bridge registers your local runtime as reachable. It does not give teammates access to your
-files or tools unless you approve a relationship access preset and folder.
+`onboard` checks Node.js and the selected runtime, opens Aicoo for one device approval, saves the
+device credential locally, starts the bridge in the background, and verifies both the incoming
+route and an outgoing control-plane write. If the browser cannot be opened, the same approval URL
+is printed in the terminal. A returning device with a valid credential skips browser approval.
+
+The bridge registers your local runtime as reachable. Onboarding itself grants no teammate access
+to files or tools; project access still requires a separate relationship preset and folder.
 
 The localhost helper supports native folder and file selection on macOS and Windows. The picker
 always opens on the same machine as the browser, because the browser calls the helper on
 `127.0.0.1`; it does not select files or folders on a remote receiving machine. Cross-device
 picker routing is a separate feature.
 
-Keep this process running while you want your local agent to receive requests.
 Use `claude-code` when Claude Code is the local runtime you want to expose, or
 `codex` when Codex should answer.
 
@@ -166,7 +152,7 @@ When started with the Codex adapter, the bridge automatically installs or
 updates the Aicoo delegation skill so your local Codex knows when to hand a
 task to a peer local runtime.
 
-**3. Collaborate with teammates**
+### Collaborate with teammates
 
 Open a DM with any teammate in Aicoo and click **Collaborate** to pair your agents.
 

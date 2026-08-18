@@ -35,6 +35,14 @@ import {
   parseCollaborationContext,
   type CollaborationContext,
 } from "../shared/collaboration-context.js";
+import {
+  assertRuntimeAvailable,
+  authorizeDevice,
+  launchDetachedBridge,
+  nodeMeetsMinimumVersion,
+  readRunningProcessId,
+  waitForBridgeReady,
+} from "./onboarding.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
@@ -115,6 +123,105 @@ program.command("login")
         throw error;
       }
     }
+  });
+
+program.command("onboard")
+  .description("connect this machine to Aicoo and start a verified local-agent bridge")
+  .addOption(new Option("--runtime <adapter>", "runtime adapter")
+    .choices(["claude-code", "codex"])
+    .makeOptionMandatory())
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--workspace <dir>", "workspace exposed to the local runtime", process.cwd())
+  .option("--server <url>", "control-plane URL")
+  .option("--ready-timeout <milliseconds>", "time to wait for bidirectional readiness", "30000")
+  .option("--no-open", "print the approval URL instead of opening a browser")
+  .action(async (options) => {
+    if (!nodeMeetsMinimumVersion(process.version)) {
+      throw new Error(`Node.js 22.5 or newer is required; this machine is running ${process.version}.`);
+    }
+    assertRuntimeAvailable(options.runtime);
+
+    const server = hostedServerUrl(options.server);
+    const deviceId = resolveDeviceId(undefined, options.spool);
+    const savedToken = loadSavedToken(options.spool);
+    let authenticated = false;
+    if (savedToken) {
+      try {
+        await makeHostedClient(server, options.spool).whoami();
+        authenticated = true;
+        console.log("✓ Existing Aicoo device authorization is valid");
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 401) throw error;
+        console.log("The saved device authorization expired; opening Aicoo again.");
+      }
+    }
+
+    if (!authenticated) {
+      const unauthenticatedClient = new AicooTransport({
+        baseUrl: server,
+        token: "anonymous",
+        deviceId,
+      });
+      const credentials = await authorizeDevice({
+        client: unauthenticatedClient,
+        deviceId,
+        runtime: options.runtime,
+        serverUrl: server,
+        ...(options.open ? {} : { openUrl: async () => false }),
+        log: console.log,
+      });
+      saveSavedCredentials(credentials, options.spool);
+      console.log("✓ Identity verified and device authorization saved");
+    }
+
+    const localAgentDirectory = dirname(resolve(options.spool));
+    const logFile = join(localAgentDirectory, "bridge.log");
+    const pidFile = join(localAgentDirectory, "bridge.pid");
+    const runningPid = readRunningProcessId(pidFile);
+    if (runningPid) {
+      console.log(`✓ Existing local bridge process found (${runningPid})`);
+    } else {
+      const cliEntry = process.argv[1];
+      if (!cliEntry) throw new Error("Cannot determine the ccd CLI entry point.");
+      const started = launchDetachedBridge({
+        cliEntry,
+        runtime: options.runtime,
+        spoolFile: options.spool,
+        logFile,
+        pidFile,
+        serverUrl: server,
+        workspace: options.workspace,
+      });
+      console.log(`✓ Local bridge started in the background (${started.pid})`);
+    }
+
+    const readLocalEndpointId = () => {
+      try {
+        const spool = new BridgeSpool(options.spool);
+        try {
+          return spool.listSessionMappings().length > 0 ? spool.getIdentity("endpointId") : undefined;
+        } finally {
+          spool.close();
+        }
+      } catch {
+        return undefined;
+      }
+    };
+    const readyTimeoutMs = Number.parseInt(options.readyTimeout, 10);
+    if (!Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs <= 0) {
+      throw new Error("--ready-timeout must be a positive number of milliseconds.");
+    }
+    const ready = await waitForBridgeReady({
+      clientFactory: () => makeHostedClient(server, options.spool),
+      localEndpointId: readLocalEndpointId,
+      timeoutMs: readyTimeoutMs,
+    });
+
+    console.log("\nAicoo Local Agent is ready.");
+    console.log(`Runtime: ${options.runtime}`);
+    console.log(`Endpoint: ${ready.endpointId}`);
+    console.log(`Logs: ${logFile}`);
+    console.log("Next: open an Aicoo conversation and click Collaborate.");
   });
 
 program.command("serve")
