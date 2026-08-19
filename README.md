@@ -192,6 +192,11 @@ than a transcript of agent conversations. If the team directory is empty, it
 still produces the goal brief and identifies the exact missing role instead of
 waiting on the network.
 
+The agent executes its validated plan with `ccd goal --plan-file <path>`. The
+runner dispatches independent subtasks with stable goal correlation IDs, waits
+for their approvals and replies concurrently, and returns structured completed,
+needs-owner, pending, or failed states for final synthesis.
+
 When the teammate has shared more than one project with the same local-agent
 device, select the exact project grant ID provided by the access flow, or its
 approved absolute folder. The owner can inspect local grants with `ccd

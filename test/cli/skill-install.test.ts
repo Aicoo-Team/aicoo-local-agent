@@ -30,6 +30,7 @@ describe("Codex skill installer", () => {
     expect(installed).toContain("transcript of agent conversations");
     expect(installed).toContain("Local first result:");
     expect(installed).toContain("goal:enterprise-proposal:engineering");
+    expect(installed).toContain("ccd goal --plan-file <path>");
   });
 
   it("can be safely ensured during bridge start", () => {

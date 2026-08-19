@@ -49,8 +49,10 @@ Network state: ready | approvals needed | empty
    authority boundaries. Never infer access merely from team membership.
 4. Show a compact plan containing each selected agent, its bounded subtask,
    and the expected artifact or decision.
-5. Delegate independent subtasks with separate `ccd delegate` calls. Keep the
-   same goal prefix in their correlation IDs so their replies remain traceable.
+5. Save the plan as bounded JSON and run `ccd goal --plan-file <path>`. The
+   runner validates unique routes, delegates independent subtasks, waits for
+   correlated replies, and returns one result bundle for synthesis. Use
+   separate `ccd delegate` calls only for a single direct handoff or follow-up.
 6. Gather the replies, resolve any explicit `needs_owner` escalation, and
    produce one completed deliverable. Present evidence and decisions, not a
    transcript of agent conversations.
@@ -72,6 +74,27 @@ Example correlation IDs for one goal are `goal:enterprise-proposal:bd`,
 `goal:enterprise-proposal:engineering`, and
 `goal:enterprise-proposal:executive-approval`. Each route must remain unique;
 never reuse a client message ID across different subtasks.
+
+The goal-plan JSON shape is:
+
+```json
+{
+  "goalId": "enterprise-proposal",
+  "objective": "Prepare an approved proposal for Acme",
+  "subtasks": [
+    {
+      "id": "engineering",
+      "target": "@engineering",
+      "task": "Assess SSO and private-deployment feasibility and timeline",
+      "expectedOutput": "Technical feasibility report"
+    }
+  ]
+}
+```
+
+Use lowercase stable IDs. Include `project` only when an exact approved project
+grant is known. Include `contextFile` only for a bounded context capsule that
+passes the same secret and size checks as direct delegation.
 
 ## How To Delegate
 

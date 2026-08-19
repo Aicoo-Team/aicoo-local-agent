@@ -40,6 +40,8 @@ import {
   parseCollaborationContext,
   type CollaborationContext,
 } from "../shared/collaboration-context.js";
+import { parseGoalPlan } from "../shared/goal-plan.js";
+import { runGoalPlan } from "./goal-runner.js";
 import {
   assertRuntimeAvailable,
   authorizeDevice,
@@ -249,6 +251,91 @@ program.command("agents")
       return;
     }
     for (const line of formatTeamAgentWelcome(directory)) console.log(line);
+  });
+
+program.command("goal")
+  .description("execute a validated multi-agent goal plan and collect correlated results")
+  .requiredOption("--plan-file <path>", "JSON goal plan prepared by the initiating agent")
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--ttl <minutes>", "per-subtask grant TTL", "30")
+  .option("--timeout <seconds>", "per-subtask approval and execution timeout", "1800")
+  .option("--request-timeout <seconds>", "delegation HTTP submission timeout", "30")
+  .option("--server <url>", "control-plane URL")
+  .action(async (options) => {
+    if (statSync(options.planFile).size > 256 * 1024) throw new Error("goal plan is too large");
+    const plan = parseGoalPlan(JSON.parse(readFileSync(options.planFile, "utf8")) as unknown);
+    const client = makeHostedClient(options.server, options.spool);
+    const route = await resolveRoute({ spool: options.spool });
+    const spool = new BridgeSpool(options.spool);
+    const timeoutMs = Number.parseInt(options.timeout, 10) * 1_000;
+    const requestedTtlMinutes = Number.parseInt(options.ttl, 10);
+    const requestTimeoutMs = Number.parseInt(options.requestTimeout, 10) * 1_000;
+
+    try {
+      const result = await runGoalPlan(plan, {
+        runSubtask: async (subtask, identifiers) => {
+          const resolved = await resolvePerson(client, subtask.target, options.spool);
+          const task = subtask.project
+            ? { text: subtask.task, projectAccessId: subtask.project }
+            : subtask.task;
+          let context: CollaborationContext | undefined;
+          if (subtask.contextFile) {
+            if (statSync(subtask.contextFile).size > COLLABORATION_CONTEXT_MAX_BYTES) {
+              throw new Error(`context_too_large: ${subtask.id}`);
+            }
+            context = parseCollaborationContext(
+              JSON.parse(readFileSync(subtask.contextFile, "utf8")) as unknown,
+              subtask.task,
+            );
+          }
+          const delegation = await requestRuntimeDelegation({
+            transport: client,
+            spool,
+            target: { kind: "person_default_runtime", principalId: resolved.principalId },
+            task,
+            ...(context ? { context } : {}),
+            sessionHandle: route.sessionHandle,
+            clientMessageId: identifiers.clientMessageId,
+            correlationId: identifiers.correlationId,
+            requestedTtlMinutes,
+            timeoutMs,
+            requestTimeoutMs,
+          });
+          const reply = await waitForDelegationReplyOrUndefined(
+            spool,
+            identifiers.correlationId,
+            timeoutMs,
+          );
+          if (!reply) {
+            return {
+              status: delegation.status === "collaboration_requested"
+                ? "awaiting_approval" as const
+                : "timed_out" as const,
+              error: delegation.status === "collaboration_requested"
+                ? "The teammate has not approved this collaboration yet."
+                : "The delegated agent did not reply before the timeout.",
+            };
+          }
+          const outcome = reply.envelope.collaborationTurn?.outcome;
+          const text = reply.envelope.payload.text;
+          const resultText = typeof text === "string" ? text : JSON.stringify(reply.envelope.payload);
+          if (outcome === "needs_owner") {
+            return { status: "needs_owner" as const, outcome, result: resultText };
+          }
+          if (outcome === "failed") {
+            return { status: "failed" as const, outcome, result: resultText };
+          }
+          return {
+            status: "completed" as const,
+            ...(outcome ? { outcome } : {}),
+            result: resultText,
+          };
+        },
+      });
+      print(result);
+    } finally {
+      spool.close();
+    }
   });
 
 program.command("serve")
@@ -1330,10 +1417,32 @@ async function waitForDelegationReply(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const reply = spool.findReplyByCorrelation(correlationId);
-    if (reply) return reply;
+    // A bounded collaboration can exchange follow-up turns. Do not surface a completion
+    // proposal or question as the final subtask artifact while another reply is expected.
+    if (isFinalDelegationReply(reply)) return reply;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Timed out waiting for the peer reply (${correlationId})`);
+}
+
+async function waitForDelegationReplyOrUndefined(
+  spool: BridgeSpool,
+  correlationId: string,
+  timeoutMs: number,
+): Promise<ReturnType<BridgeSpool["findReplyByCorrelation"]>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const reply = spool.findReplyByCorrelation(correlationId);
+    if (isFinalDelegationReply(reply)) return reply;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return undefined;
+}
+
+function isFinalDelegationReply(
+  reply: ReturnType<BridgeSpool["findReplyByCorrelation"]>,
+): reply is NonNullable<ReturnType<BridgeSpool["findReplyByCorrelation"]>> {
+  return Boolean(reply && reply.envelope.collaborationTurn?.expectsReply !== true);
 }
 
 function resolveDeviceId(explicit: string | undefined, spoolFile: string): string {
