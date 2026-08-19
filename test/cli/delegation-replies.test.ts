@@ -1,0 +1,58 @@
+import { describe, expect, it } from "vitest";
+import type { MessageEnvelope } from "../../src/shared/contracts.js";
+import {
+  authorityDecisionFromEnvelope,
+  isFinalDelegationReplyEnvelope,
+} from "../../src/cli/delegation-replies.js";
+
+function envelope(overrides: Partial<MessageEnvelope> = {}): MessageEnvelope {
+  return {
+    id: "msg-reply",
+    clientMessageId: "reply-1",
+    senderPrincipalId: "owner-b",
+    target: { kind: "person_default_runtime", principalId: "owner-a" },
+    kind: "text",
+    payload: { text: "result" },
+    replyTo: "msg-task",
+    correlationId: "goal:acme:approval",
+    sequence: 2,
+    createdAt: "2026-08-19T10:00:00.000Z",
+    expiresAt: "2026-08-19T10:30:00.000Z",
+    ...overrides,
+  };
+}
+
+describe("delegation reply completion", () => {
+  it("keeps waiting when the peer agent reaches a human authority boundary", () => {
+    expect(isFinalDelegationReplyEnvelope(envelope({
+      collaborationTurn: {
+        turnId: "turn-2",
+        clientTurnId: "peer-2",
+        parentTurnId: "turn-1",
+        sequence: 2,
+        type: "response",
+        expectsReply: false,
+        outcome: "needs_owner",
+      },
+    }))).toBe(false);
+  });
+
+  it.each(["allow", "deny"] as const)("accepts a synchronized %s decision as final", (decision) => {
+    const reply = envelope({
+      payload: {
+        text: `Human authority ${decision}`,
+        source: "local_agent_authority_decision",
+        authorityDecision: decision,
+      },
+    });
+
+    expect(isFinalDelegationReplyEnvelope(reply)).toBe(true);
+    expect(authorityDecisionFromEnvelope(reply)).toBe(decision);
+  });
+
+  it("does not trust an authorityDecision field without the server source marker", () => {
+    expect(authorityDecisionFromEnvelope(envelope({
+      payload: { authorityDecision: "allow", source: "peer_text" },
+    }))).toBeNull();
+  });
+});

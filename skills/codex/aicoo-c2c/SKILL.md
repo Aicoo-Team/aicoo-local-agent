@@ -53,7 +53,9 @@ Network state: ready | approvals needed | empty
    runner validates unique routes, delegates independent subtasks, waits for
    correlated replies, and returns one result bundle for synthesis. Use
    separate `ccd delegate` calls only for a single direct handoff or follow-up.
-6. Gather the replies, resolve any explicit `needs_owner` escalation, and
+6. Gather the replies. A `needs_owner` outcome automatically creates an Aicoo
+   approval for the responsible human and the runner keeps waiting on the same
+   correlation. Do not create a second delegation. When the decision arrives,
    produce one completed deliverable. Present evidence and decisions, not a
    transcript of agent conversations.
 
@@ -163,6 +165,22 @@ For a multi-agent goal, do not use `--no-wait` unless the user explicitly asks
 for asynchronous execution. The final answer must distinguish completed,
 pending approval, unavailable, and failed subtasks; it must never present a
 partially collected result as the finished deliverable.
+
+## Final Delivery
+
+After `ccd goal` returns, synthesize its result bundle into exactly one user-facing
+artifact with this shape:
+
+```text
+Outcome: <the completed proposal, launch artifact, or decision>
+Evidence: <only the facts that materially support it>
+Approvals: <human decisions and their scope>
+Open risks: <remaining blockers, or "none">
+```
+
+Do not paste the result bundle or peer-agent transcript. If any required subtask
+is denied, unavailable, or timed out, label the output as incomplete and name the
+missing authority or capability rather than claiming completion.
 
 ## Safety
 

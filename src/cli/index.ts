@@ -43,6 +43,10 @@ import {
 import { parseGoalPlan } from "../shared/goal-plan.js";
 import { runGoalPlan } from "./goal-runner.js";
 import {
+  authorityDecisionFromEnvelope,
+  isFinalDelegationReplyEnvelope,
+} from "./delegation-replies.js";
+import {
   assertRuntimeAvailable,
   authorizeDevice,
   formatTeamAgentWelcome,
@@ -317,8 +321,15 @@ program.command("goal")
             };
           }
           const outcome = reply.envelope.collaborationTurn?.outcome;
+          const authorityDecision = authorityDecisionFromEnvelope(reply.envelope);
           const text = reply.envelope.payload.text;
           const resultText = typeof text === "string" ? text : JSON.stringify(reply.envelope.payload);
+          if (authorityDecision === "deny") {
+            return { status: "failed" as const, outcome: "failed" as const, result: resultText };
+          }
+          if (authorityDecision === "allow") {
+            return { status: "completed" as const, outcome: "respond" as const, result: resultText };
+          }
           if (outcome === "needs_owner") {
             return { status: "needs_owner" as const, outcome, result: resultText };
           }
@@ -1442,7 +1453,7 @@ async function waitForDelegationReplyOrUndefined(
 function isFinalDelegationReply(
   reply: ReturnType<BridgeSpool["findReplyByCorrelation"]>,
 ): reply is NonNullable<ReturnType<BridgeSpool["findReplyByCorrelation"]>> {
-  return Boolean(reply && reply.envelope.collaborationTurn?.expectsReply !== true);
+  return Boolean(reply && isFinalDelegationReplyEnvelope(reply.envelope));
 }
 
 function resolveDeviceId(explicit: string | undefined, spoolFile: string): string {
