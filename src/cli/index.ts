@@ -646,8 +646,10 @@ connect.command("accept")
   )
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--server <url>", "control-plane URL")
-  .action(async (sessionId, options) => {
-    const grant = await makeHostedClient(options.server, options.spool).acceptCommunicationSession(sessionId);
+  .action(async (sessionId, options, command) => {
+    const server = commandLineOption(command, "server", options.server);
+    const spoolFile = required(commandLineOption(command, "spool", options.spool), "--spool");
+    const grant = await makeCollaborationClient(server, spoolFile).acceptCommunicationSession(sessionId);
     if (!options.access) {
       print(grant);
       return;
@@ -663,7 +665,7 @@ connect.command("accept")
       });
       return;
     }
-    const policyFile = resolveRunningRelationshipPolicy(options.policy, options.spool);
+    const policyFile = resolveRunningRelationshipPolicy(options.policy, spoolFile);
     upsertRelationshipPreset({
       file: policyFile,
       principalId: grant.requester.principalId,
@@ -1304,6 +1306,31 @@ function makeHostedClient(server?: string, spool?: string): HttpMessageTransport
   return makeClient({ hosted: true, server: hostedServerUrl(server), spool });
 }
 
+function commandLineOption(command: Command, name: string, fallback?: string): string | undefined {
+  let current: Command | null = command;
+  while (current) {
+    if (current.getOptionValueSource(name) === "cli") {
+      const value = current.opts<Record<string, unknown>>()[name];
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    current = current.parent;
+  }
+  return fallback;
+}
+
+function makeCollaborationClient(server?: string, spool?: string): HttpMessageTransport {
+  const rootServer = program.opts<{ server?: string }>().server;
+  const rootServerSource = program.getOptionValueSource("server");
+  const environmentServer = process.env.CCD_SERVER_URL?.trim() || undefined;
+  const selectedServer = server
+    ?? (rootServerSource === "cli" ? rootServer : undefined)
+    ?? environmentServer;
+  if (selectedServer) {
+    return makeClient({ server: normalizeHostedServerUrl(selectedServer), spool });
+  }
+  return makeHostedClient(undefined, spool);
+}
+
 function hostedServerUrl(explicitServer?: string): string {
   const serverCandidate = explicitServer ?? process.env.CCD_SERVER_URL ?? program.opts<{ server?: string }>().server;
   if (!serverCandidate || serverCandidate === LOCAL_SERVER_URL) return PRODUCT_AICOO_SERVER_URL;
@@ -1366,7 +1393,7 @@ async function requestConnection(
 }
 
 async function latestPendingSessionId(server?: string, spool?: string): Promise<string> {
-  const client = makeHostedClient(server, spool);
+  const client = makeCollaborationClient(server, spool);
   const me = await client.whoami();
   const pending = (await client.listCommunicationSessions())
     .filter((session) => session.status === "pending" && session.recipient.principalId === me.principalId)
@@ -1387,7 +1414,7 @@ async function acceptConnection(
   grant: CommunicationGrant;
   accessPolicy: { status: "saved"; preset: RelationshipAccessPreset; policyFile: string; folder?: string } | { status: "not_applied"; reason: string };
 }> {
-  const grant = await makeHostedClient(server, spool).acceptCommunicationSession(sessionId);
+  const grant = await makeCollaborationClient(server, spool).acceptCommunicationSession(sessionId);
   const deviceId = grant.requester.deviceId;
   if (!deviceId) {
     return {
