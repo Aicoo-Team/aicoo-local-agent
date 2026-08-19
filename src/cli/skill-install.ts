@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_CODEX_SKILL_DIR = join(process.env.HOME ?? "", ".codex", "skills", "aicoo-c2c");
+const DEFAULT_CLAUDE_SKILL_DIR = join(process.env.HOME ?? "", ".claude", "skills", "aicoo-c2c");
 
 export interface InstallCodexSkillResult {
   targetDir: string;
@@ -10,8 +11,18 @@ export interface InstallCodexSkillResult {
   overwritten: boolean;
 }
 
+export type InstallAgentSkillResult = InstallCodexSkillResult;
+
 export function installCodexSkill(options: { targetDir?: string } = {}): InstallCodexSkillResult {
-  const targetDir = resolve(options.targetDir ?? DEFAULT_CODEX_SKILL_DIR);
+  return installAgentSkill(options.targetDir ?? DEFAULT_CODEX_SKILL_DIR);
+}
+
+export function installClaudeSkill(options: { targetDir?: string } = {}): InstallAgentSkillResult {
+  return installAgentSkill(options.targetDir ?? DEFAULT_CLAUDE_SKILL_DIR);
+}
+
+function installAgentSkill(target: string): InstallAgentSkillResult {
+  const targetDir = resolve(target);
   const skillFile = join(targetDir, "SKILL.md");
   const source = bundledSkillPath();
   const content = readFileSync(source, "utf8");
@@ -25,12 +36,27 @@ export function ensureCodexSkill(options: {
   targetDir?: string;
   log?: (line: string) => void;
 } = {}): InstallCodexSkillResult | undefined {
+  return ensureAgentSkill("codex", installCodexSkill, options);
+}
+
+export function ensureClaudeSkill(options: {
+  targetDir?: string;
+  log?: (line: string) => void;
+} = {}): InstallAgentSkillResult | undefined {
+  return ensureAgentSkill("claude", installClaudeSkill, options);
+}
+
+function ensureAgentSkill(
+  runtime: "codex" | "claude",
+  install: (options: { targetDir?: string }) => InstallAgentSkillResult,
+  options: { targetDir?: string; log?: (line: string) => void },
+): InstallAgentSkillResult | undefined {
   try {
-    const result = installCodexSkill({ targetDir: options.targetDir });
-    options.log?.(`[codex-skill] ${result.overwritten ? "updated" : "installed"} ${result.skillFile}`);
+    const result = install({ targetDir: options.targetDir });
+    options.log?.(`[${runtime}-skill] ${result.overwritten ? "updated" : "installed"} ${result.skillFile}`);
     return result;
   } catch (error) {
-    options.log?.(`[codex-skill] not installed: ${error instanceof Error ? error.message : String(error)}`);
+    options.log?.(`[${runtime}-skill] not installed: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
   }
 }

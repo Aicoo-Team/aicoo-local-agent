@@ -2,7 +2,12 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ensureCodexSkill, installCodexSkill } from "../../src/cli/skill-install.js";
+import {
+  ensureClaudeSkill,
+  ensureCodexSkill,
+  installClaudeSkill,
+  installCodexSkill,
+} from "../../src/cli/skill-install.js";
 
 describe("Codex skill installer", () => {
   it("installs the bundled local-to-local delegation skill", () => {
@@ -19,6 +24,12 @@ describe("Codex skill installer", () => {
     expect(installed).toContain("Use `--no-wait` only when the user explicitly wants asynchronous dispatch");
     expect(installed).toContain("--context-file");
     expect(installed).toContain("Never attach raw memory");
+    expect(installed).toContain("ccd agents --json");
+    expect(installed).toContain("Who knows what? Who can do what?");
+    expect(installed).toContain("If the directory is empty");
+    expect(installed).toContain("transcript of agent conversations");
+    expect(installed).toContain("Local first result:");
+    expect(installed).toContain("goal:enterprise-proposal:engineering");
   });
 
   it("can be safely ensured during bridge start", () => {
@@ -32,5 +43,16 @@ describe("Codex skill installer", () => {
     expect(second?.overwritten).toBe(true);
     expect(logs[0]).toContain("installed");
     expect(logs[1]).toContain("updated");
+  });
+
+  it("installs the same orchestration skill for Claude Code", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-skill-"));
+    const targetDir = join(directory, "aicoo-c2c");
+
+    const installed = installClaudeSkill({ targetDir });
+    const ensured = ensureClaudeSkill({ targetDir });
+
+    expect(readFileSync(installed.skillFile, "utf8")).toContain("ccd agents --json");
+    expect(ensured?.overwritten).toBe(true);
   });
 });

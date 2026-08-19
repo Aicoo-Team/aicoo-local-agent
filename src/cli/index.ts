@@ -28,7 +28,12 @@ import {
 } from "../security/relationship-access.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
-import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
+import {
+  ensureClaudeSkill,
+  ensureCodexSkill,
+  installClaudeSkill,
+  installCodexSkill,
+} from "./skill-install.js";
 import { selectLocalSessionForPeer } from "./active-session.js";
 import {
   COLLABORATION_CONTEXT_MAX_BYTES,
@@ -230,6 +235,20 @@ program.command("onboard")
       console.log("Bridge connected. Give me a task, or tell me whose agent you want to connect with.");
       console.log(`Team-agent directory is temporarily unavailable: ${errorMessage(error)}`);
     }
+  });
+
+program.command("agents")
+  .description("list the agents in your Aicoo Team and their published capabilities")
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .option("--json", "print the machine-readable private Agent Card directory", false)
+  .action(async (options) => {
+    const directory = await makeHostedClient(options.server, options.spool).listTeamAgents();
+    if (options.json) {
+      print(directory);
+      return;
+    }
+    for (const line of formatTeamAgentWelcome(directory)) console.log(line);
   });
 
 program.command("serve")
@@ -882,6 +901,15 @@ program.command("install-codex-skill")
     console.log("Restart Codex so it can load the new skill.");
   });
 
+program.command("install-claude-skill")
+  .description("install the Aicoo local-to-local delegation skill for Claude Code")
+  .option("--target-dir <dir>", "Claude Code skill directory to write")
+  .action((options) => {
+    const result = installClaudeSkill({ targetDir: options.targetDir });
+    console.log(`${result.overwritten ? "Updated" : "Installed"} Aicoo C2C Claude skill.`);
+    console.log(`skillFile: ${result.skillFile}`);
+  });
+
 program.showHelpAfterError();
 program.parseAsync().catch((error: unknown) => {
   if (error instanceof ApiError) {
@@ -953,6 +981,8 @@ async function startBridge(options: {
   });
   if (selected.runtime === "codex") {
     ensureCodexSkill({ log: options.json ? undefined : console.log });
+  } else if (selected.runtime === "claude-code") {
+    ensureClaudeSkill({ log: options.json ? undefined : console.log });
   }
   const spool = new BridgeSpool(options.spool);
   spool.setIdentity("relationshipPolicyFile", relationshipPolicyFile);

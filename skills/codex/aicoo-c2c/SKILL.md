@@ -1,12 +1,13 @@
 ---
 name: aicoo-c2c
-description: Delegate work from this local Codex session to a peer local Codex or Claude through Aicoo relay and grants.
+description: Coordinate a high-level goal across teammates' local Codex or Claude agents through Aicoo discovery, relay, and grants.
 ---
 
 # Aicoo Local-To-Local Delegation
 
-Use this skill when the user asks this local Codex session to contact another
-person's local agent, local Codex, or local Claude through Aicoo. Examples:
+Use this skill when the user gives a high-level team goal or asks this local
+Codex session to contact another person's local agent, local Codex, or local
+Claude through Aicoo. Examples:
 "ask @abhinav what he is working on", "ask Priya's local agent to summarize the
 README", "have @sam's Codex deploy a preview", or "send this task to Lee's
 local Claude".
@@ -22,6 +23,55 @@ this local Codex <-> local Aicoo bridge <-> Aicoo relay/grants/routing <-> peer 
 Aicoo is not the worker agent. It handles identity, grants, routing, delivery
 state, and revocation. The peer's local runtime does the work only within the
 relationship permissions its owner approved.
+
+Each peer agent represents a different person. Do not describe them as
+sub-agents and do not assume they share the initiating user's information,
+tools, or authority.
+
+## High-Level Goal Flow
+
+When the user gives one high-level goal, the first action is to create a
+**goal brief** locally. This is immediate and does not depend on another agent:
+
+```text
+Goal brief
+Outcome: <the finished deliverable>
+Local first result: <draft, checklist, or decision frame available now>
+Routes:
+- <agent> — <bounded subtask> → <expected artifact or decision>
+Network state: ready | approvals needed | empty
+```
+
+1. Run `ccd agents --json` to load the private team directory and Agent Cards.
+2. State the requested outcome and identify what information, capability, and
+   decision authority are missing.
+3. Select agents only from their published role, skills, resources, and
+   authority boundaries. Never infer access merely from team membership.
+4. Show a compact plan containing each selected agent, its bounded subtask,
+   and the expected artifact or decision.
+5. Delegate independent subtasks with separate `ccd delegate` calls. Keep the
+   same goal prefix in their correlation IDs so their replies remain traceable.
+6. Gather the replies, resolve any explicit `needs_owner` escalation, and
+   produce one completed deliverable. Present evidence and decisions, not a
+   transcript of agent conversations.
+
+The three routing questions are: **Who knows what? Who can do what? Who is
+allowed to decide what?** A team contact is discoverable, but connection and
+sensitive permissions are still approved separately in Aicoo.
+
+If the directory is empty, still return the goal brief immediately. Complete
+everything possible with the current local agent, list the exact missing
+capability or authority, and suggest which teammate role to invite. Never wait
+indefinitely or fabricate a network result.
+
+For the first research-team workload, prefer direct configuration: if the user
+names a researcher or the directory clearly identifies the required agent,
+delegate directly rather than waiting for global matching.
+
+Example correlation IDs for one goal are `goal:enterprise-proposal:bd`,
+`goal:enterprise-proposal:engineering`, and
+`goal:enterprise-proposal:executive-approval`. Each route must remain unique;
+never reuse a client message ID across different subtasks.
 
 ## How To Delegate
 
@@ -85,6 +135,11 @@ Use `--no-wait` only when the user explicitly wants asynchronous dispatch. In
 that mode, tell the user the task was sent and that the reply will arrive later
 in the local session. Do not send another reply back to the peer unless the
 user explicitly asks for a follow-up.
+
+For a multi-agent goal, do not use `--no-wait` unless the user explicitly asks
+for asynchronous execution. The final answer must distinguish completed,
+pending approval, unavailable, and failed subtasks; it must never present a
+partially collected result as the finished deliverable.
 
 ## Safety
 
