@@ -124,12 +124,21 @@ Run the commands on the same machine where Claude Code or Codex can access the
 workspace you want to use. The app is the human collaboration surface; this
 package is the local bridge that keeps your coding agent reachable from Aicoo.
 
+Install the persistent CLI once so `ccd` remains available to the background
+service and supporting commands:
+
 ```bash
-npx -y @aicoo/local-agent@latest onboard --runtime claude-code
+npm i -g @aicoo/local-agent@latest
+```
+
+Then run the single onboarding command for the local runtime:
+
+```bash
+ccd onboard --runtime claude-code
 ```
 
 ```bash
-npx -y @aicoo/local-agent@latest onboard --runtime codex
+ccd onboard --runtime codex
 ```
 
 `onboard` checks Node.js and the selected runtime, opens Aicoo for one device approval, saves the
