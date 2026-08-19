@@ -7,6 +7,7 @@ import {
   type StartDeviceCodeInput,
   type StartDeviceCodeResponse,
 } from "../shared/http-client.js";
+import type { TeamAgentDirectory } from "../shared/contracts.js";
 
 const MINIMUM_NODE_VERSION = [22, 5, 0] as const;
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
@@ -22,6 +23,36 @@ export interface DeviceAuthorizationClient {
 export interface BridgeReadinessClient {
   getDefaultRoute(): Promise<{ endpointId: string }>;
   heartbeatEndpoint(endpointId: string): Promise<void>;
+}
+
+export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] {
+  const heading = directory.team
+    ? `Bridge connected. Here are the agents in ${directory.team.name} and what they can help with:`
+    : "Bridge connected. You are not in an Aicoo Team yet.";
+  if (directory.agents.length === 0) {
+    return [
+      heading,
+      directory.team
+        ? "No other team agents are available yet. The first task plan will still be created locally."
+        : "Join a team to discover teammate agents automatically.",
+      "Give me a task, or tell me whose agent you want to connect with.",
+    ];
+  }
+
+  const agents = directory.agents.map((agent) => {
+    const status = agent.connectionState === "connected"
+      ? agent.availability === "available" ? "connected, available" : "connected, away"
+      : agent.connectionState === "connection_pending" ? "connection pending" : "contact";
+    const skills = agent.agentCard.skills.map((skill) => skill.name).join(", ")
+      || agent.agentCard.description;
+    return `- ${agent.agentCard.name} (${agent.role}; ${status}) — ${skills}`;
+  });
+
+  return [
+    heading,
+    ...agents,
+    "Give me a task, or tell me whose agent you want to connect with.",
+  ];
 }
 
 export interface SavedDeviceCredentials {

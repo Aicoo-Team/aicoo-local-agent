@@ -38,6 +38,7 @@ import {
 import {
   assertRuntimeAvailable,
   authorizeDevice,
+  formatTeamAgentWelcome,
   launchDetachedBridge,
   nodeMeetsMinimumVersion,
   readRunningProcessId,
@@ -221,7 +222,14 @@ program.command("onboard")
     console.log(`Runtime: ${options.runtime}`);
     console.log(`Endpoint: ${ready.endpointId}`);
     console.log(`Logs: ${logFile}`);
-    console.log("Next: open an Aicoo conversation and click Collaborate.");
+    try {
+      const directory = await makeHostedClient(server, options.spool).listTeamAgents();
+      console.log("");
+      for (const line of formatTeamAgentWelcome(directory)) console.log(line);
+    } catch (error) {
+      console.log("Bridge connected. Give me a task, or tell me whose agent you want to connect with.");
+      console.log(`Team-agent directory is temporarily unavailable: ${errorMessage(error)}`);
+    }
   });
 
 program.command("serve")

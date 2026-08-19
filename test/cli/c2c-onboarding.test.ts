@@ -3,6 +3,33 @@ import { HttpMessageTransport } from "../../src/shared/http-client.js";
 import { AicooTransport } from "../../src/shared/aicoo-transport.js";
 
 describe("C2C Onboarding Client Integration", () => {
+  it("fetches the private team-agent directory", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        team: { id: "team-1", name: "Research" },
+        agents: [{ principalId: "peer-1", connectionState: "contact" }],
+      }),
+    });
+    const client = new AicooTransport({
+      baseUrl: "https://www.aicoo.io",
+      token: "test-token",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    await expect(client.listTeamAgents()).resolves.toMatchObject({
+      team: { id: "team-1" },
+      agents: [{ principalId: "peer-1", connectionState: "contact" }],
+    });
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://www.aicoo.io/api/v1/local-agent/team-agents",
+      expect.objectContaining({
+        headers: expect.objectContaining({ authorization: "Bearer test-token" }),
+      }),
+    );
+  });
+
   it("fetches pair status via AicooTransport", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
