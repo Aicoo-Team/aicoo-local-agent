@@ -23,6 +23,34 @@ function envelope(overrides: Partial<MessageEnvelope> = {}): MessageEnvelope {
 }
 
 describe("delegation reply completion", () => {
+  it("accepts a peer completion proposal as the delegated result", () => {
+    expect(isFinalDelegationReplyEnvelope(envelope({
+      collaborationTurn: {
+        turnId: "turn-2",
+        clientTurnId: "peer-2",
+        parentTurnId: "turn-1",
+        sequence: 2,
+        type: "question",
+        expectsReply: true,
+        outcome: "propose_complete",
+      },
+    }))).toBe(true);
+  });
+
+  it("keeps waiting when the peer asks a non-terminal follow-up question", () => {
+    expect(isFinalDelegationReplyEnvelope(envelope({
+      collaborationTurn: {
+        turnId: "turn-2",
+        clientTurnId: "peer-2",
+        parentTurnId: "turn-1",
+        sequence: 2,
+        type: "question",
+        expectsReply: true,
+        outcome: "respond",
+      },
+    }))).toBe(false);
+  });
+
   it("keeps waiting when the peer agent reaches a human authority boundary", () => {
     expect(isFinalDelegationReplyEnvelope(envelope({
       collaborationTurn: {

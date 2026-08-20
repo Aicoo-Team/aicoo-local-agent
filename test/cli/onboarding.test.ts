@@ -171,7 +171,7 @@ describe("local-agent onboarding", () => {
       ],
     })).toEqual([
       "Bridge connected. Here are the agents in Research and what they can help with:",
-      "- Alex Engineering Agent (Engineering; contact) — Technical feasibility",
+      "- Alex Engineering Agent — Alex Chen's agent (Engineering; contact) — Technical feasibility",
       "Give me a task, or tell me whose agent you want to connect with.",
     ]);
   });

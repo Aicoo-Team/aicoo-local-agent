@@ -1455,8 +1455,8 @@ async function waitForDelegationReply(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const reply = spool.findReplyByCorrelation(correlationId);
-    // A bounded collaboration can exchange follow-up turns. Do not surface a completion
-    // proposal or question as the final subtask artifact while another reply is expected.
+    // A bounded collaboration can exchange follow-up turns. Keep waiting for questions and
+    // owner decisions, but return a peer's completion proposal as the delegated artifact.
     if (isFinalDelegationReply(reply)) return reply;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
