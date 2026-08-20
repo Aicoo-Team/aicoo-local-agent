@@ -124,18 +124,33 @@ Run the commands on the same machine where Claude Code or Codex can access the
 workspace you want to use. The app is the human collaboration surface; this
 package is the local bridge that keeps your coding agent reachable from Aicoo.
 
+Install the persistent CLI once so `ccd` remains available to the background
+service and supporting commands:
+
 ```bash
-npx -y @aicoo/local-agent@latest onboard --runtime claude-code
+npm i -g @aicoo/local-agent@latest
+```
+
+Then run the single onboarding command for the local runtime:
+
+```bash
+ccd onboard --runtime claude-code
 ```
 
 ```bash
-npx -y @aicoo/local-agent@latest onboard --runtime codex
+ccd onboard --runtime codex
 ```
 
 `onboard` checks Node.js and the selected runtime, opens Aicoo for one device approval, saves the
 device credential locally, starts the bridge in the background, and verifies both the incoming
 route and an outgoing control-plane write. If the browser cannot be opened, the same approval URL
 is printed in the terminal. A returning device with a valid credential skips browser approval.
+After the Bridge is ready, onboarding lists the agents in the user's Aicoo Team and their published
+capabilities. The machine-readable form is available at any time:
+
+```bash
+ccd agents --json
+```
 
 The bridge registers your local runtime as reachable. Onboarding itself grants no teammate access
 to files or tools; project access still requires a separate relationship preset and folder.
@@ -148,13 +163,16 @@ picker routing is a separate feature.
 Use `claude-code` when Claude Code is the local runtime you want to expose, or
 `codex` when Codex should answer.
 
-When started with the Codex adapter, the bridge automatically installs or
-updates the Aicoo delegation skill so your local Codex knows when to hand a
-task to a peer local runtime.
+When started with the Codex or Claude Code adapter, the bridge automatically
+installs or updates the Aicoo delegation skill in that runtime's personal skill
+directory. This lets the initiating agent discover team Agent Cards, plan a
+high-level goal, and hand bounded subtasks to peer local runtimes.
 
 ### Collaborate with teammates
 
-Open a DM with any teammate in Aicoo and click **Collaborate** to pair your agents.
+Joining an Aicoo Team makes its members' agents discoverable as private contacts. Discovery does
+not grant task, file, tool, or decision authority. The first delegated task creates a connection
+request in Aicoo with **Deny**, **Allow once**, and **Always allow** choices.
 
 Aicoo relays between both local runtimes:
 
@@ -174,6 +192,19 @@ working on" map to:
 ```bash
 ccd delegate @teammate "Summarize the README in the shared repo"
 ```
+
+For one high-level goal, the installed Codex skill first reads `ccd agents
+--json`, creates an immediate goal brief, splits missing information,
+capability, and authority into bounded subtasks, and delegates each one to the
+appropriate person's agent. It then returns one synthesized deliverable rather
+than a transcript of agent conversations. If the team directory is empty, it
+still produces the goal brief and identifies the exact missing role instead of
+waiting on the network.
+
+The agent executes its validated plan with `ccd goal --plan-file <path>`. The
+runner dispatches independent subtasks with stable goal correlation IDs, waits
+for their approvals and replies concurrently, and returns structured completed,
+needs-owner, pending, or failed states for final synthesis.
 
 When the teammate has shared more than one project with the same local-agent
 device, select the exact project grant ID provided by the access flow, or its

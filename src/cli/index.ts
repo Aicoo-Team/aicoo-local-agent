@@ -28,16 +28,28 @@ import {
 } from "../security/relationship-access.js";
 import { startServer } from "../control-plane/server.js";
 import { formatDelivery } from "./format.js";
-import { ensureCodexSkill, installCodexSkill } from "./skill-install.js";
+import {
+  ensureClaudeSkill,
+  ensureCodexSkill,
+  installClaudeSkill,
+  installCodexSkill,
+} from "./skill-install.js";
 import { selectLocalSessionForPeer } from "./active-session.js";
 import {
   COLLABORATION_CONTEXT_MAX_BYTES,
   parseCollaborationContext,
   type CollaborationContext,
 } from "../shared/collaboration-context.js";
+import { parseGoalPlan } from "../shared/goal-plan.js";
+import { runGoalPlan } from "./goal-runner.js";
+import {
+  authorityDecisionFromEnvelope,
+  isFinalDelegationReplyEnvelope,
+} from "./delegation-replies.js";
 import {
   assertRuntimeAvailable,
   authorizeDevice,
+  formatTeamAgentWelcome,
   launchDetachedBridge,
   nodeMeetsMinimumVersion,
   readRunningProcessId,
@@ -221,7 +233,120 @@ program.command("onboard")
     console.log(`Runtime: ${options.runtime}`);
     console.log(`Endpoint: ${ready.endpointId}`);
     console.log(`Logs: ${logFile}`);
-    console.log("Next: open an Aicoo conversation and click Collaborate.");
+    try {
+      const directory = await makeHostedClient(server, options.spool).listTeamAgents();
+      console.log("");
+      for (const line of formatTeamAgentWelcome(directory)) console.log(line);
+    } catch (error) {
+      console.log("Bridge connected. Give me a task, or tell me whose agent you want to connect with.");
+      console.log(`Team-agent directory is temporarily unavailable: ${errorMessage(error)}`);
+    }
+  });
+
+program.command("agents")
+  .description("list the agents in your Aicoo Team and their published capabilities")
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .option("--json", "print the machine-readable private Agent Card directory", false)
+  .action(async (options) => {
+    const directory = await makeHostedClient(options.server, options.spool).listTeamAgents();
+    if (options.json) {
+      print(directory);
+      return;
+    }
+    for (const line of formatTeamAgentWelcome(directory)) console.log(line);
+  });
+
+program.command("goal")
+  .description("execute a validated multi-agent goal plan and collect correlated results")
+  .requiredOption("--plan-file <path>", "JSON goal plan prepared by the initiating agent")
+  .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
+  .option("--ttl <minutes>", "per-subtask grant TTL", "30")
+  .option("--timeout <seconds>", "per-subtask approval and execution timeout", "1800")
+  .option("--request-timeout <seconds>", "delegation HTTP submission timeout", "30")
+  .option("--server <url>", "control-plane URL")
+  .action(async (options) => {
+    if (statSync(options.planFile).size > 256 * 1024) throw new Error("goal plan is too large");
+    const plan = parseGoalPlan(JSON.parse(readFileSync(options.planFile, "utf8")) as unknown);
+    const client = makeHostedClient(options.server, options.spool);
+    const route = await resolveRoute({ spool: options.spool });
+    const spool = new BridgeSpool(options.spool);
+    const timeoutMs = Number.parseInt(options.timeout, 10) * 1_000;
+    const requestedTtlMinutes = Number.parseInt(options.ttl, 10);
+    const requestTimeoutMs = Number.parseInt(options.requestTimeout, 10) * 1_000;
+
+    try {
+      const result = await runGoalPlan(plan, {
+        runSubtask: async (subtask, identifiers) => {
+          const resolved = await resolvePerson(client, subtask.target, options.spool);
+          const task = subtask.project
+            ? { text: subtask.task, projectAccessId: subtask.project }
+            : subtask.task;
+          let context: CollaborationContext | undefined;
+          if (subtask.contextFile) {
+            if (statSync(subtask.contextFile).size > COLLABORATION_CONTEXT_MAX_BYTES) {
+              throw new Error(`context_too_large: ${subtask.id}`);
+            }
+            context = parseCollaborationContext(
+              JSON.parse(readFileSync(subtask.contextFile, "utf8")) as unknown,
+              subtask.task,
+            );
+          }
+          const delegation = await requestRuntimeDelegation({
+            transport: client,
+            spool,
+            target: { kind: "person_default_runtime", principalId: resolved.principalId },
+            task,
+            ...(context ? { context } : {}),
+            sessionHandle: route.sessionHandle,
+            clientMessageId: identifiers.clientMessageId,
+            correlationId: identifiers.correlationId,
+            requestedTtlMinutes,
+            timeoutMs,
+            requestTimeoutMs,
+          });
+          const reply = await waitForDelegationReplyOrUndefined(
+            spool,
+            identifiers.correlationId,
+            timeoutMs,
+          );
+          if (!reply) {
+            return {
+              status: delegation.status === "collaboration_requested"
+                ? "awaiting_approval" as const
+                : "timed_out" as const,
+              error: delegation.status === "collaboration_requested"
+                ? "The teammate has not approved this collaboration yet."
+                : "The delegated agent did not reply before the timeout.",
+            };
+          }
+          const outcome = reply.envelope.collaborationTurn?.outcome;
+          const authorityDecision = authorityDecisionFromEnvelope(reply.envelope);
+          const text = reply.envelope.payload.text;
+          const resultText = typeof text === "string" ? text : JSON.stringify(reply.envelope.payload);
+          if (authorityDecision === "deny") {
+            return { status: "failed" as const, outcome: "failed" as const, result: resultText };
+          }
+          if (authorityDecision === "allow") {
+            return { status: "completed" as const, outcome: "respond" as const, result: resultText };
+          }
+          if (outcome === "needs_owner") {
+            return { status: "needs_owner" as const, outcome, result: resultText };
+          }
+          if (outcome === "failed") {
+            return { status: "failed" as const, outcome, result: resultText };
+          }
+          return {
+            status: "completed" as const,
+            ...(outcome ? { outcome } : {}),
+            result: resultText,
+          };
+        },
+      });
+      print(result);
+    } finally {
+      spool.close();
+    }
   });
 
 program.command("serve")
@@ -521,8 +646,10 @@ connect.command("accept")
   )
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--server <url>", "control-plane URL")
-  .action(async (sessionId, options) => {
-    const grant = await makeHostedClient(options.server, options.spool).acceptCommunicationSession(sessionId);
+  .action(async (sessionId, options, command) => {
+    const server = commandLineOption(command, "server", options.server);
+    const spoolFile = required(commandLineOption(command, "spool", options.spool), "--spool");
+    const grant = await makeCollaborationClient(server, spoolFile).acceptCommunicationSession(sessionId);
     if (!options.access) {
       print(grant);
       return;
@@ -538,7 +665,7 @@ connect.command("accept")
       });
       return;
     }
-    const policyFile = resolveRunningRelationshipPolicy(options.policy, options.spool);
+    const policyFile = resolveRunningRelationshipPolicy(options.policy, spoolFile);
     upsertRelationshipPreset({
       file: policyFile,
       principalId: grant.requester.principalId,
@@ -874,6 +1001,15 @@ program.command("install-codex-skill")
     console.log("Restart Codex so it can load the new skill.");
   });
 
+program.command("install-claude-skill")
+  .description("install the Aicoo local-to-local delegation skill for Claude Code")
+  .option("--target-dir <dir>", "Claude Code skill directory to write")
+  .action((options) => {
+    const result = installClaudeSkill({ targetDir: options.targetDir });
+    console.log(`${result.overwritten ? "Updated" : "Installed"} Aicoo C2C Claude skill.`);
+    console.log(`skillFile: ${result.skillFile}`);
+  });
+
 program.showHelpAfterError();
 program.parseAsync().catch((error: unknown) => {
   if (error instanceof ApiError) {
@@ -945,6 +1081,8 @@ async function startBridge(options: {
   });
   if (selected.runtime === "codex") {
     ensureCodexSkill({ log: options.json ? undefined : console.log });
+  } else if (selected.runtime === "claude-code") {
+    ensureClaudeSkill({ log: options.json ? undefined : console.log });
   }
   const spool = new BridgeSpool(options.spool);
   spool.setIdentity("relationshipPolicyFile", relationshipPolicyFile);
@@ -1168,6 +1306,31 @@ function makeHostedClient(server?: string, spool?: string): HttpMessageTransport
   return makeClient({ hosted: true, server: hostedServerUrl(server), spool });
 }
 
+function commandLineOption(command: Command, name: string, fallback?: string): string | undefined {
+  let current: Command | null = command;
+  while (current) {
+    if (current.getOptionValueSource(name) === "cli") {
+      const value = current.opts<Record<string, unknown>>()[name];
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    current = current.parent;
+  }
+  return fallback;
+}
+
+function makeCollaborationClient(server?: string, spool?: string): HttpMessageTransport {
+  const rootServer = program.opts<{ server?: string }>().server;
+  const rootServerSource = program.getOptionValueSource("server");
+  const environmentServer = process.env.CCD_SERVER_URL?.trim() || undefined;
+  const selectedServer = server
+    ?? (rootServerSource === "cli" ? rootServer : undefined)
+    ?? environmentServer;
+  if (selectedServer) {
+    return makeClient({ server: normalizeHostedServerUrl(selectedServer), spool });
+  }
+  return makeHostedClient(undefined, spool);
+}
+
 function hostedServerUrl(explicitServer?: string): string {
   const serverCandidate = explicitServer ?? process.env.CCD_SERVER_URL ?? program.opts<{ server?: string }>().server;
   if (!serverCandidate || serverCandidate === LOCAL_SERVER_URL) return PRODUCT_AICOO_SERVER_URL;
@@ -1230,7 +1393,7 @@ async function requestConnection(
 }
 
 async function latestPendingSessionId(server?: string, spool?: string): Promise<string> {
-  const client = makeHostedClient(server, spool);
+  const client = makeCollaborationClient(server, spool);
   const me = await client.whoami();
   const pending = (await client.listCommunicationSessions())
     .filter((session) => session.status === "pending" && session.recipient.principalId === me.principalId)
@@ -1251,7 +1414,7 @@ async function acceptConnection(
   grant: CommunicationGrant;
   accessPolicy: { status: "saved"; preset: RelationshipAccessPreset; policyFile: string; folder?: string } | { status: "not_applied"; reason: string };
 }> {
-  const grant = await makeHostedClient(server, spool).acceptCommunicationSession(sessionId);
+  const grant = await makeCollaborationClient(server, spool).acceptCommunicationSession(sessionId);
   const deviceId = grant.requester.deviceId;
   if (!deviceId) {
     return {
@@ -1292,10 +1455,32 @@ async function waitForDelegationReply(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const reply = spool.findReplyByCorrelation(correlationId);
-    if (reply) return reply;
+    // A bounded collaboration can exchange follow-up turns. Do not surface a completion
+    // proposal or question as the final subtask artifact while another reply is expected.
+    if (isFinalDelegationReply(reply)) return reply;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Timed out waiting for the peer reply (${correlationId})`);
+}
+
+async function waitForDelegationReplyOrUndefined(
+  spool: BridgeSpool,
+  correlationId: string,
+  timeoutMs: number,
+): Promise<ReturnType<BridgeSpool["findReplyByCorrelation"]>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const reply = spool.findReplyByCorrelation(correlationId);
+    if (isFinalDelegationReply(reply)) return reply;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return undefined;
+}
+
+function isFinalDelegationReply(
+  reply: ReturnType<BridgeSpool["findReplyByCorrelation"]>,
+): reply is NonNullable<ReturnType<BridgeSpool["findReplyByCorrelation"]>> {
+  return Boolean(reply && isFinalDelegationReplyEnvelope(reply.envelope));
 }
 
 function resolveDeviceId(explicit: string | undefined, spoolFile: string): string {

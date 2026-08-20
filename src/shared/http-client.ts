@@ -17,6 +17,7 @@ import type {
   TrustedToolPolicyUsageInput,
   RuntimeSessionBinding,
   SendMessageInput,
+  TeamAgentDirectory,
 } from "./contracts.js";
 import type { DelegationRequestOptions, MessageTransport } from "./transport.js";
 
@@ -301,6 +302,10 @@ export class HttpMessageTransport implements MessageTransport {
 
   async whoami(): Promise<{ principalId: string; deviceId: string }> {
     return this.requestJson("/api/v1/whoami");
+  }
+
+  async listTeamAgents(): Promise<TeamAgentDirectory> {
+    return this.requestJson("/api/v1/local-agent/team-agents");
   }
 
   async getDefaultRoute(): Promise<{ endpointId: string; sessionHandle: string; updatedAt: string }> {

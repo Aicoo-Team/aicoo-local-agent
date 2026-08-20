@@ -1,0 +1,24 @@
+{
+  "goalId": "acme-enterprise-proposal",
+  "objective": "Prepare an approved proposal for Acme covering SSO, private deployment, and a pilot next month",
+  "subtasks": [
+    {
+      "id": "customer-context",
+      "target": "@bd",
+      "task": "Provide Acme's budget, urgency, stakeholders, deal history, and pilot success criteria",
+      "expectedOutput": "Customer context and commercial constraints"
+    },
+    {
+      "id": "technical-feasibility",
+      "target": "@engineering",
+      "task": "Assess SSO, private deployment, pilot scope, implementation effort, risks, and earliest credible delivery date",
+      "expectedOutput": "Technical solution and delivery estimate"
+    },
+    {
+      "id": "commercial-approval",
+      "target": "@ceo",
+      "task": "Review and approve the commercial and delivery commitments for the Acme proposal",
+      "expectedOutput": "Approved pricing and commitment boundaries"
+    }
+  ]
+}

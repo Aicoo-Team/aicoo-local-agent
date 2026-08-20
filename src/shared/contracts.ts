@@ -5,6 +5,7 @@ export type RuntimeKind = "claude-code" | "codex";
 export type TargetKind = "human_inbox" | "person_default_runtime" | "runtime_session";
 export type MessageKind = "text" | "task_invite" | "resource_request" | "control";
 export type CommunicationStatus = "pending" | "active" | "declined" | "revoked" | "expired";
+export type TeamAgentConnectionState = "contact" | "connection_pending" | "connected";
 export type DeliveryStatus =
   | "queued"
   | "dispatched"
@@ -29,6 +30,54 @@ export interface RuntimeEndpoint {
   capabilities: string[];
   presence: "online" | "draining" | "offline";
   lastSeenAt: string;
+}
+
+export interface TeamAgentSkill {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  examples?: string[];
+  inputModes?: string[];
+  outputModes?: string[];
+}
+
+export interface TeamAgentCard {
+  name: string;
+  description: string;
+  supportedInterfaces: Array<{
+    url: string;
+    protocolBinding: string;
+    protocolVersion: string;
+  }>;
+  provider: { organization: string; url: string };
+  version: string;
+  capabilities: {
+    streaming?: boolean;
+    pushNotifications?: boolean;
+    extendedAgentCard?: boolean;
+  };
+  defaultInputModes: string[];
+  defaultOutputModes: string[];
+  skills: TeamAgentSkill[];
+}
+
+export interface TeamAgentContact {
+  principalId: string;
+  handle: string | null;
+  displayName: string;
+  teamRole: string;
+  role: string;
+  connectionState: TeamAgentConnectionState;
+  availability: "available" | "away" | "unknown";
+  agentCard: TeamAgentCard;
+  accessibleResources: Array<{ id: string; description: string }>;
+  authorityBoundaries: Array<{ id: string; description: string }>;
+}
+
+export interface TeamAgentDirectory {
+  team: { id: string; name: string } | null;
+  agents: TeamAgentContact[];
 }
 
 export type Endpoint = RuntimeEndpoint;

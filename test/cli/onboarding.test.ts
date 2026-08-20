@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   authorizeDevice,
+  formatTeamAgentWelcome,
   nodeMeetsMinimumVersion,
   readRunningProcessId,
   waitForBridgeReady,
@@ -134,5 +135,51 @@ describe("local-agent onboarding", () => {
     writeFileSync(pidFile, "4321\n");
     expect(readRunningProcessId(pidFile, (pid) => pid === 4321)).toBe(4321);
     expect(readRunningProcessId(pidFile, () => false)).toBeUndefined();
+  });
+
+  it("introduces team agents after the bridge connects", () => {
+    expect(formatTeamAgentWelcome({
+      team: { id: "team-1", name: "Research" },
+      agents: [
+        {
+          principalId: "peer-1",
+          handle: "alex",
+          displayName: "Alex Chen",
+          teamRole: "member",
+          role: "Engineering",
+          connectionState: "contact",
+          availability: "unknown",
+          agentCard: {
+            name: "Alex Engineering Agent",
+            description: "Checks technical feasibility.",
+            supportedInterfaces: [],
+            provider: { organization: "Aicoo", url: "https://www.aicoo.io" },
+            version: "1.0.0",
+            capabilities: {},
+            defaultInputModes: ["text/plain"],
+            defaultOutputModes: ["text/plain"],
+            skills: [{
+              id: "feasibility",
+              name: "Technical feasibility",
+              description: "Checks technical feasibility.",
+              tags: ["engineering"],
+            }],
+          },
+          accessibleResources: [],
+          authorityBoundaries: [],
+        },
+      ],
+    })).toEqual([
+      "Bridge connected. Here are the agents in Research and what they can help with:",
+      "- Alex Engineering Agent (Engineering; contact) — Technical feasibility",
+      "Give me a task, or tell me whose agent you want to connect with.",
+    ]);
+  });
+
+  it("avoids a cold-start dead end when no teammate agent exists yet", () => {
+    expect(formatTeamAgentWelcome({
+      team: { id: "team-1", name: "Research" },
+      agents: [],
+    })).toContain("No other team agents are available yet. The first task plan will still be created locally.");
   });
 });

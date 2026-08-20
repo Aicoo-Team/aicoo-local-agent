@@ -9,6 +9,7 @@
     "bin",
     "dist",
     "skills",
+    "examples",
     "README.md",
     "LICENSE",
     "package.json"
