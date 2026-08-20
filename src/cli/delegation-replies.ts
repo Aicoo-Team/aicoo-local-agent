@@ -1,11 +1,12 @@
 import type { MessageEnvelope } from "../shared/contracts.js";
 
 export function isFinalDelegationReplyEnvelope(envelope: MessageEnvelope | undefined): boolean {
+  const turn = envelope?.collaborationTurn;
   return Boolean(
     envelope
     && envelope.replyTo
-    && envelope.collaborationTurn?.expectsReply !== true
-    && envelope.collaborationTurn?.outcome !== "needs_owner",
+    && turn?.outcome !== "needs_owner"
+    && (turn?.expectsReply !== true || turn.outcome === "propose_complete"),
   );
 }
 

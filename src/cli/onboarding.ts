@@ -45,7 +45,7 @@ export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] 
       : agent.connectionState === "connection_pending" ? "connection pending" : "contact";
     const skills = agent.agentCard.skills.map((skill) => skill.name).join(", ")
       || agent.agentCard.description;
-    return `- ${agent.agentCard.name} (${agent.role}; ${status}) — ${skills}`;
+    return `- ${agent.agentCard.name} — ${agent.displayName}'s agent (${agent.role}; ${status}) — ${skills}`;
   });
 
   return [
