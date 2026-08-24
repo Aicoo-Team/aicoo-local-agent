@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
@@ -55,12 +55,12 @@ import {
   readRunningProcessId,
   waitForBridgeReady,
 } from "./onboarding.js";
+import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
 const PREVIEW_AICOO_SERVER_URL = "https://www.yourcoo.ai";
 const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
-const DEFAULT_CREDENTIALS_FILE = join(homedir(), ".aicoo", "credentials.json");
 
 const program = new Command()
   .name("ccd")
@@ -82,8 +82,8 @@ program.command("login")
     const start = await unauthClient.startDeviceCode({
       deviceId,
       runtime: options.runtime,
-      bridgeVersion: "0.1.0",
-      adapterVersion: "0.1.0",
+      bridgeVersion: "0.4.5",
+      adapterVersion: "0.4.5",
       capabilities: ["comm:c2c", "runtime:adapter"],
       label: `${hostname()} (${options.runtime})`,
     });
@@ -1163,34 +1163,6 @@ function resolveRunningRelationshipPolicy(explicitPolicy: string | undefined, sp
   } finally {
     spool.close();
   }
-}
-
-function getCredentialsFile(spoolFile?: string): string {
-  if (!spoolFile || spoolFile === DEFAULT_SPOOL) return DEFAULT_CREDENTIALS_FILE;
-  return `${spoolFile}.credentials.json`;
-}
-
-function loadSavedToken(spoolFile?: string): string | undefined {
-  const file = getCredentialsFile(spoolFile);
-  try {
-    if (existsSync(file)) {
-      const parsed = JSON.parse(readFileSync(file, "utf8"));
-      return (parsed.token ?? parsed.deviceToken) as string | undefined;
-    }
-  } catch {
-    /* unreadable credentials file */
-  }
-  return undefined;
-}
-
-function saveSavedCredentials(credentials: { token: string; userId?: string; deviceId?: string }, spoolFile?: string): void {
-  const file = getCredentialsFile(spoolFile);
-  ensureParentDirectory(file);
-  const temporaryFile = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temporaryFile, JSON.stringify({ ...credentials, updatedAt: new Date().toISOString() }, null, 2), {
-    mode: 0o600,
-  });
-  renameSync(temporaryFile, file);
 }
 
 function isHostedUrl(serverUrl: string): boolean {
