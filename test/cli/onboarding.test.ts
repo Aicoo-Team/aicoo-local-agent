@@ -42,6 +42,10 @@ describe("local-agent onboarding", () => {
     expect(openUrl).toHaveBeenCalledWith(
       "https://www.aicoo.io/local-agent/device-code?code=ABCD-1234",
     );
+    expect(client.startDeviceCode).toHaveBeenCalledWith(expect.objectContaining({
+      bridgeVersion: "0.4.5",
+      adapterVersion: "0.4.5",
+    }));
     expect(result).toEqual({ token: "device-token", userId: "user-1", deviceId: "device-1" });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Waiting for approval"));
   });

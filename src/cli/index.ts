@@ -82,8 +82,8 @@ program.command("login")
     const start = await unauthClient.startDeviceCode({
       deviceId,
       runtime: options.runtime,
-      bridgeVersion: "0.1.0",
-      adapterVersion: "0.1.0",
+      bridgeVersion: "0.4.5",
+      adapterVersion: "0.4.5",
       capabilities: ["comm:c2c", "runtime:adapter"],
       label: `${hostname()} (${options.runtime})`,
     });
