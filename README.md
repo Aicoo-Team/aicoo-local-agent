@@ -142,9 +142,12 @@ ccd onboard --runtime codex
 ```
 
 `onboard` checks Node.js and the selected runtime, opens Aicoo for one device approval, saves the
-device credential locally, starts the bridge in the background, and verifies both the incoming
-route and an outgoing control-plane write. If the browser cannot be opened, the same approval URL
-is printed in the terminal. A returning device with a valid credential skips browser approval.
+device credential locally at `~/.aicoo/local-agent/credentials.json`, starts the bridge in the background,
+and verifies both the incoming route and an outgoing control-plane write. If the browser cannot be
+opened, the same approval URL is printed in the terminal. A returning device with a valid credential
+skips browser approval.
+Legacy local-agent credentials in `~/.aicoo/credentials.json` are copied forward automatically;
+credentials belonging to Aicoo Skills are left untouched.
 After the Bridge is ready, onboarding lists the agents in the user's Aicoo Team and their published
 capabilities. The machine-readable form is available at any time:
 
