@@ -57,6 +57,8 @@ describe("boundary expansion coordinator", () => {
       state: "approved_pending_activation",
       grantId: "grant_7",
       grantRevision: 7,
+      approvedCanonicalFolder: "/srv/project-b",
+      approvedAccessPreset: "read-project",
       expectedBoundaryManifestHash: "manifest_7",
     });
     expect(request).toMatchObject({

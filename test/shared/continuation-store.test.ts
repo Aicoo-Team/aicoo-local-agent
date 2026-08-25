@@ -21,6 +21,39 @@ const checkpoint = {
 };
 
 describe("durable C2C continuation store", () => {
+  it("upgrades checkpoints created before approved boundary scope was persisted", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE c2c_continuations (
+        continuation_id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        communication_session_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        session_handle TEXT NOT NULL,
+        runtime_turn_id TEXT NOT NULL,
+        original_message_json TEXT NOT NULL,
+        requested_capability_json TEXT NOT NULL,
+        state TEXT NOT NULL,
+        grant_id TEXT,
+        grant_revision INTEGER,
+        expected_boundary_manifest_hash TEXT,
+        boundary_manifest_hash TEXT,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+
+    new ContinuationStore(db);
+    const columns = db.prepare("PRAGMA table_info(c2c_continuations)").all() as unknown as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
+      "approved_canonical_folder",
+      "approved_access_preset",
+    ]));
+  });
+
   it("deduplicates the same paused tool attempt and rejects conflicting reuse", () => {
     const db = new DatabaseSync(":memory:");
     const store = new ContinuationStore(db);
@@ -43,6 +76,8 @@ describe("durable C2C continuation store", () => {
     store.markApproved(pending.continuationId, {
       grantId: "grant_1",
       grantRevision: 3,
+      approvedCanonicalFolder: "/srv/project-b",
+      approvedAccessPreset: "read-project",
       expectedBoundaryManifestHash: "manifest_1",
     });
     store.markRebuilding(pending.continuationId);
@@ -54,6 +89,8 @@ describe("durable C2C continuation store", () => {
       state: "completed",
       grantId: "grant_1",
       grantRevision: 3,
+      approvedCanonicalFolder: "/srv/project-b",
+      approvedAccessPreset: "read-project",
       boundaryManifestHash: "manifest_1",
     });
   });
@@ -65,6 +102,8 @@ describe("durable C2C continuation store", () => {
     store.markApproved(pending.continuationId, {
       grantId: "grant_1",
       grantRevision: 3,
+      approvedCanonicalFolder: "/srv/project-b",
+      approvedAccessPreset: "read-project",
       expectedBoundaryManifestHash: "expected",
     });
     store.markRebuilding(pending.continuationId);
@@ -86,6 +125,8 @@ describe("durable C2C continuation store", () => {
     expect(() => store.markApproved(pending.continuationId, {
       grantId: "late",
       grantRevision: 4,
+      approvedCanonicalFolder: "/srv/project-b",
+      approvedAccessPreset: "read-project",
       expectedBoundaryManifestHash: "late",
     })).toThrow("invalid continuation transition");
   });
@@ -99,6 +140,8 @@ describe("durable C2C continuation store", () => {
     firstStore.markApproved(pending.continuationId, {
       grantId: "grant_1",
       grantRevision: 3,
+      approvedCanonicalFolder: "/srv/project-b",
+      approvedAccessPreset: "read-project",
       expectedBoundaryManifestHash: "manifest_1",
     });
     firstDb.close();

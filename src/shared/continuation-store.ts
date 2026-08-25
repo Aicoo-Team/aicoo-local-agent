@@ -31,6 +31,8 @@ export interface ContinuationCheckpoint {
   state: ContinuationState;
   grantId?: string;
   grantRevision?: number;
+  approvedCanonicalFolder?: string;
+  approvedAccessPreset?: "read-project" | "edit-project";
   expectedBoundaryManifestHash?: string;
   boundaryManifestHash?: string;
   errorCode?: string;
@@ -38,7 +40,8 @@ export interface ContinuationCheckpoint {
 
 export type CreateContinuationInput = Omit<
   ContinuationCheckpoint,
-  "continuationId" | "state" | "grantId" | "grantRevision" | "expectedBoundaryManifestHash"
+  "continuationId" | "state" | "grantId" | "grantRevision" | "approvedCanonicalFolder"
+  | "approvedAccessPreset" | "expectedBoundaryManifestHash"
   | "boundaryManifestHash" | "errorCode"
 >;
 
@@ -60,6 +63,8 @@ export class ContinuationStore {
         state TEXT NOT NULL,
         grant_id TEXT,
         grant_revision INTEGER,
+        approved_canonical_folder TEXT,
+        approved_access_preset TEXT,
         expected_boundary_manifest_hash TEXT,
         boundary_manifest_hash TEXT,
         error_code TEXT,
@@ -69,6 +74,8 @@ export class ContinuationStore {
       CREATE INDEX IF NOT EXISTS idx_c2c_continuations_state
         ON c2c_continuations(state, updated_at);
     `);
+    addColumn(db, "approved_canonical_folder", "TEXT");
+    addColumn(db, "approved_access_preset", "TEXT");
   }
 
   create(input: CreateContinuationInput): ContinuationCheckpoint {
@@ -130,13 +137,21 @@ export class ContinuationStore {
 
   markApproved(
     continuationId: string,
-    approval: { grantId: string; grantRevision: number; expectedBoundaryManifestHash: string },
+    approval: {
+      grantId: string;
+      grantRevision: number;
+      approvedCanonicalFolder: string;
+      approvedAccessPreset: "read-project" | "edit-project";
+      expectedBoundaryManifestHash: string;
+    },
   ): ContinuationCheckpoint {
     const current = this.require(continuationId);
     if (current.state === "approved_pending_activation") {
       if (
         current.grantId === approval.grantId
         && current.grantRevision === approval.grantRevision
+        && current.approvedCanonicalFolder === approval.approvedCanonicalFolder
+        && current.approvedAccessPreset === approval.approvedAccessPreset
         && current.expectedBoundaryManifestHash === approval.expectedBoundaryManifestHash
       ) return current;
       throw new Error("continuation approval conflict");
@@ -145,11 +160,14 @@ export class ContinuationStore {
     this.db.prepare(
       `UPDATE c2c_continuations
        SET state = 'approved_pending_activation', grant_id = ?, grant_revision = ?,
+           approved_canonical_folder = ?, approved_access_preset = ?,
            expected_boundary_manifest_hash = ?, updated_at = ?
        WHERE continuation_id = ?`,
     ).run(
       approval.grantId,
       approval.grantRevision,
+      approval.approvedCanonicalFolder,
+      approval.approvedAccessPreset,
       approval.expectedBoundaryManifestHash,
       new Date().toISOString(),
       continuationId,
@@ -284,6 +302,8 @@ interface ContinuationRow {
   state: ContinuationState;
   grant_id: string | null;
   grant_revision: number | null;
+  approved_canonical_folder: string | null;
+  approved_access_preset: "read-project" | "edit-project" | null;
   expected_boundary_manifest_hash: string | null;
   boundary_manifest_hash: string | null;
   error_code: string | null;
@@ -303,6 +323,8 @@ function fromRow(row: ContinuationRow): ContinuationCheckpoint {
     state: row.state,
     ...(row.grant_id ? { grantId: row.grant_id } : {}),
     ...(row.grant_revision !== null ? { grantRevision: row.grant_revision } : {}),
+    ...(row.approved_canonical_folder ? { approvedCanonicalFolder: row.approved_canonical_folder } : {}),
+    ...(row.approved_access_preset ? { approvedAccessPreset: row.approved_access_preset } : {}),
     ...(row.expected_boundary_manifest_hash
       ? { expectedBoundaryManifestHash: row.expected_boundary_manifest_hash }
       : {}),
@@ -332,4 +354,12 @@ function validateInput(input: CreateContinuationInput): void {
 
 function invalidTransition(from: ContinuationState, to: ContinuationState): Error {
   return new Error(`invalid continuation transition: ${from} -> ${to}`);
+}
+
+function addColumn(db: DatabaseSync, name: string, type: "TEXT"): void {
+  try {
+    db.exec(`ALTER TABLE c2c_continuations ADD COLUMN ${name} ${type};`);
+  } catch (error) {
+    if (!/duplicate column/i.test(String(error))) throw error;
+  }
 }

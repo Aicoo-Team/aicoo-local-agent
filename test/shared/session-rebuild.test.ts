@@ -21,6 +21,8 @@ function approved(store: ContinuationStore) {
   return store.markApproved(checkpoint.continuationId, {
     grantId: "grant_7",
     grantRevision: 7,
+    approvedCanonicalFolder: "/srv/project-b",
+    approvedAccessPreset: "read-project",
     expectedBoundaryManifestHash: "manifest_7",
   });
 }

@@ -58,6 +58,8 @@ export class BoundaryExpansionCoordinator {
     const approved = this.store.markApproved(checkpoint.continuationId, {
       grantId: activation.grantId,
       grantRevision: activation.grantRevision,
+      approvedCanonicalFolder: activation.canonicalFolder,
+      approvedAccessPreset: activation.accessPreset,
       expectedBoundaryManifestHash: activation.expectedBoundaryManifestHash,
     });
     if (
