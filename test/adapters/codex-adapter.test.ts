@@ -199,7 +199,7 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[0]?.prompt).not.toContain(`- ${realpathSync.native(first)}`);
   });
 
-  it("places several explicitly selected projects in one Codex boundary", async () => {
+  it("preflights several objective-named projects into one Codex boundary", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-multi-project-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const first = join(directory, "first-project");
@@ -232,7 +232,7 @@ describe("CodexAdapter managed sessions", () => {
     expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_multi", {
       kind: "task_invite",
       payload: {
-        task: { text: "Compare both", projectAccessIds: [first, second] },
+        task: { text: "Compare first-project with second-project" },
       },
     }), "queue")).toMatchObject({ status: "runtime_acked" });
 

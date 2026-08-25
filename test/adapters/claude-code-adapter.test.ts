@@ -316,7 +316,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(options.additionalDirectories).toEqual([realpathSync.native(second)]);
   });
 
-  it("reuses one Claude boundary for the same explicitly selected project set", async () => {
+  it("reuses one Claude boundary for the same objective-preflight project set", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-multi-project-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const first = join(directory, "first-project");
@@ -349,7 +349,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     const multiProject = (id: string) => inbound(id, {
       kind: "task_invite",
       payload: {
-        task: { text: "Compare both", projectAccessIds: [first, second] },
+        task: { text: "Compare first-project with second-project" },
       },
     });
     expect(await adapter.deliverToSession("claude-managed-1", multiProject("msg_multi_1"), "queue"))

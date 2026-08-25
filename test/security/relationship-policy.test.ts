@@ -252,6 +252,77 @@ describe("RelationshipPolicy", () => {
     }
   });
 
+  it("preflights unambiguous project names from the objective using active grants only", () => {
+    const directory = makeDirectory();
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const unrelated = join(directory, "unrelated-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(unrelated);
+    mkdirSync(config);
+    const file = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second, unrelated],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: "Compare first-project with second-project" } },
+    }))).toMatchObject({
+      status: "selected",
+      selectionSource: "objective_preflight",
+      folders: [realpathSync.native(first), realpathSync.native(second)].sort(),
+    });
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: "Compare both projects" } },
+    }))).toMatchObject({
+      status: "selection_required",
+      folders: [],
+    });
+  });
+
+  it("does not guess between duplicate project names during objective preflight", () => {
+    const directory = makeDirectory();
+    const first = join(directory, "first", "project");
+    const second = join(directory, "second", "project");
+    const config = join(directory, "config");
+    mkdirSync(first, { recursive: true });
+    mkdirSync(second, { recursive: true });
+    mkdirSync(config);
+    const file = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: "Inspect project" } },
+    }))).toMatchObject({ status: "selection_required", folders: [] });
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: `Inspect ${realpathSync.native(second)}` } },
+    }))).toMatchObject({
+      status: "selected",
+      selectionSource: "objective_preflight",
+      folders: [realpathSync.native(second)],
+    });
+  });
+
   it("forgets generated peer permissions when a bridge run resets its policy", () => {
     const directory = makeDirectory();
     const project = join(directory, "project");

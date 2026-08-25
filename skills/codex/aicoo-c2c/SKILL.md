@@ -124,8 +124,11 @@ ccd delegate @username "compare both projects" \
   --project ttp_first_project --project ttp_second_project
 ```
 
-The receiver deliberately returns `project_selection_required` when multiple
-projects are available and no project was selected.
+When no selector is supplied, the receiver may preflight exact paths or unique
+project names stated in the objective against already-active grants. This does
+not create or widen a grant. It deliberately returns
+`project_selection_required` when the objective is ambiguous; retry with the
+exact `--project` value instead of guessing.
 
 Use the exact peer handle/name the user gave when possible. Keep the task text
 faithful to the user's request. If the request names files or folders, include

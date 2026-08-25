@@ -53,6 +53,7 @@ export interface ProjectAccess {
   preset: RelationshipAccessPreset;
   folders: string[];
   writableFolders: string[];
+  selectionSource?: "single_active_grant" | "explicit" | "objective_preflight";
   requestedProject?: string;
   requestedProjects?: string[];
   selectedPolicyIds?: string[];
@@ -231,11 +232,20 @@ export class RelationshipPolicy {
     }
     const relationships = this.relationshipsFor(message);
     const trustedPolicies = this.trustedPoliciesFor(message);
-    const requestedProjects = projectAccessSelectors(message);
     const availableFolders = [...new Set([
       ...relationships.flatMap((relationship) => relationship.folders),
       ...trustedPolicies.map((policy) => policy.canonicalFolder),
     ])].sort();
+    const explicitProjects = projectAccessSelectors(message);
+    const preflightProjects = explicitProjects.length === 0
+      ? objectivePreflightProjects(message, availableFolders)
+      : [];
+    const requestedProjects = explicitProjects.length > 0 ? explicitProjects : preflightProjects;
+    const selectionSource = explicitProjects.length > 0
+      ? "explicit" as const
+      : preflightProjects.length > 0
+        ? "objective_preflight" as const
+        : "single_active_grant" as const;
 
     let selectedFolders: string[];
     const selectedPolicyIds = new Set<string>();
@@ -339,6 +349,7 @@ export class RelationshipPolicy {
           .filter((policy) => policy.accessPreset === "edit-project")
           .map((policy) => policy.canonicalFolder),
       ])].filter((folder) => selectedFolders.includes(folder)).sort(),
+      selectionSource,
       ...(requestedProjects.length > 0 ? { requestedProjects } : {}),
       ...(requestedProjects.length === 1 ? { requestedProject: requestedProjects[0] } : {}),
       ...(selectedPolicyIds.size > 0 ? { selectedPolicyIds: [...selectedPolicyIds].sort() } : {}),
@@ -503,6 +514,44 @@ export function projectAccessSelectors(message: InboundMessage | undefined): str
   return typeof selector === "string" && selector.trim() && selector.length <= 1_024
     ? [selector.trim()]
     : ["\u0000invalid-project-selection"];
+}
+
+/**
+ * Select already-active project grants named by a task objective before the runtime starts.
+ * A basename is accepted only when it identifies exactly one available folder; otherwise the
+ * caller receives selection_required and must provide an exact grant ID or absolute folder.
+ */
+function objectivePreflightProjects(
+  message: InboundMessage | undefined,
+  availableFolders: readonly string[],
+): string[] {
+  if (message?.kind !== "task_invite" || availableFolders.length < 2) return [];
+  const task = message.payload.task;
+  if (!task || typeof task !== "object" || Array.isArray(task)) return [];
+  const text = (task as Record<string, unknown>).text;
+  if (typeof text !== "string" || !text.trim()) return [];
+
+  const normalizedObjective = text.toLowerCase();
+  const foldersByName = new Map<string, string[]>();
+  for (const folder of availableFolders) {
+    const name = basename(folder).toLowerCase();
+    foldersByName.set(name, [...(foldersByName.get(name) ?? []), folder]);
+  }
+
+  const selected = new Set<string>();
+  for (const folder of availableFolders) {
+    if (objectiveNamesProject(normalizedObjective, folder.toLowerCase())) selected.add(folder);
+  }
+  for (const [name, folders] of foldersByName) {
+    if (name.length < 3 || folders.length !== 1 || !objectiveNamesProject(normalizedObjective, name)) continue;
+    selected.add(folders[0]!);
+  }
+  return [...selected].sort();
+}
+
+function objectiveNamesProject(objective: string, projectName: string): boolean {
+  const escaped = projectName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`(^|[^a-z0-9_])${escaped}($|[^a-z0-9_])`, "u").test(objective);
 }
 
 /** Check a canonicalized tool action against the immutable access snapshot used to launch a session. */

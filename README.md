@@ -214,7 +214,10 @@ device, select the exact project grant ID provided by the access flow, or its
 approved absolute folder. The owner can inspect local grants with `ccd
 trusted-access list`. Repeat `--project` when one task needs several already
 granted projects; the receiver builds one initial multi-directory boundary
-instead of restarting once per project. It fails closed instead of guessing:
+instead of restarting once per project. If no selector is supplied, objective
+preflight may select only already-active grants whose exact path or unique
+project name appears in the task. Ambiguous names still fail closed and require
+`--project`:
 
 ```bash
 ccd delegate @teammate "Summarize the README" --project ttp_project_grant_id
