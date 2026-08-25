@@ -95,7 +95,7 @@ describe("selectRuntimeAdapter relationship policy handling", () => {
     })).rejects.toThrow("requires an owner approval gateway");
   });
 
-  it("fails closed instead of pretending Codex has the full capability surface", async () => {
+  it("requires Codex app-server before enabling the full capability surface", async () => {
     const directory = makeDirectory();
 
     await expect(selectRuntimeAdapter({
@@ -104,7 +104,7 @@ describe("selectRuntimeAdapter relationship policy handling", () => {
       spoolFile: join(directory, "bridge.spool"),
       workspace: directory,
       capabilitySurface: "full-agent",
-    })).rejects.toThrow("only for the Claude Code runtime");
+    })).rejects.toThrow("requires --codex-app-server");
   });
 
   function makeDirectory(): string {

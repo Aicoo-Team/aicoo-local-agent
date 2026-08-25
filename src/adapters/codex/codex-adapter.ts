@@ -20,6 +20,8 @@ import { createBoundaryManifest } from "../../shared/boundary-manifest.js";
 import type { ContinuationCheckpoint, ContinuationStore } from "../../shared/continuation-store.js";
 import { continuationInboundMessage } from "../../shared/continuation-message.js";
 import { requestBoundaryExpansionForTool } from "../../shared/boundary-expansion-request.js";
+import type { CapabilitySurface } from "../../shared/capability-rollout.js";
+import { hardenBashInput, redactToolOutput } from "../../security/full-capability-security.js";
 
 export interface CodexAdapterConfig {
   stateFile: string;
@@ -34,6 +36,7 @@ export interface CodexAdapterConfig {
   permissionProfileRoot?: string;
   model?: string;
   turnAckTimeoutMs?: number;
+  capabilitySurface?: CapabilitySurface;
   driver?: CodexDriver;
   /**
    * When set, app-server approvals and brokered exec file operations are routed to the owner.
@@ -113,6 +116,7 @@ export class CodexAdapter implements RuntimeAdapter {
     if (!gateway || !communicationSessionId) return {};
     return {
       onApproval: async (request) => {
+        const fullCapability = this.#config.capabilitySurface === "full-agent";
         if (request.kind === "permissions") {
           this.#config.log?.("codex permission widening denied: the active kernel profile is immutable");
           return "decline";
@@ -120,9 +124,17 @@ export class CodexAdapter implements RuntimeAdapter {
         const gitOperation = request.kind === "commandExecution"
           ? parseSafeGitCommand(request.command ?? request.summary.replace(/^Run:\s*/u, ""), this.#config.cwd)
           : undefined;
-        if (request.kind === "commandExecution" && !gitOperation) {
+        if (request.kind === "commandExecution" && !gitOperation && !fullCapability) {
           this.#config.log?.("codex command denied: raw shell and unsupported Git commands are disabled");
           return "decline";
+        }
+        const rawShell = request.kind === "commandExecution" && !gitOperation;
+        if (rawShell) {
+          const hardened = hardenBashInput({ command: request.command ?? request.summary.replace(/^Run:\s*/u, "") });
+          if (hardened.behavior === "deny") {
+            this.#config.log?.(`codex command denied: ${hardened.message}`);
+            return "decline";
+          }
         }
         let boundaryAllowed = false;
         let outsideAction: { toolName: string; input: Record<string, unknown> } | undefined;
@@ -130,6 +142,8 @@ export class CodexAdapter implements RuntimeAdapter {
           const policy = this.relationshipPolicy();
           const actions = gitOperation
             ? [{ toolName: gitOperation.toolName, input: { repository: gitOperation.repository } }]
+            : rawShell
+              ? [{ toolName: "Edit", input: { file_path: request.cwd ?? turnCwd } }]
             : request.kind === "fileChange" && request.paths?.length
               ? request.paths.map((path) => ({ toolName: "Edit", input: { file_path: path } }))
               : [];
@@ -138,7 +152,7 @@ export class CodexAdapter implements RuntimeAdapter {
             const boundary = policy.authorizeBoundary(action, message);
             if (boundary.behavior !== "allow") {
               boundaryAllowed = false;
-              outsideAction = action;
+              if (!rawShell) outsideAction = action;
               break;
             }
             const boundaryInput = boundary.updatedInput ?? action.input;
@@ -147,7 +161,7 @@ export class CodexAdapter implements RuntimeAdapter {
               input: boundaryInput,
             })) {
               boundaryAllowed = false;
-              outsideAction = { toolName: action.toolName, input: boundaryInput };
+              if (!rawShell) outsideAction = { toolName: action.toolName, input: boundaryInput };
               break;
             }
             const canonicalRepository = "repository" in boundaryInput
@@ -189,12 +203,14 @@ export class CodexAdapter implements RuntimeAdapter {
             sessionHandle,
             ...(message.id ? { messageId: message.id } : {}),
             // The owner reads one line, so it names the command, not the mechanism.
-            toolName: gitOperation?.toolName ?? (request.kind === "fileChange" ? "Edit" : "Permissions"),
+            toolName: gitOperation?.toolName ?? (rawShell ? "Bash" : request.kind === "fileChange" ? "Edit" : "Permissions"),
             toolInputSummary: gitOperation?.summary ?? request.summary,
           },
           { log: this.#config.log },
         );
-        return outcome.behavior === "allow" ? "accept" : "decline";
+        return outcome.behavior === "allow"
+          ? outcome.scope === "session" ? "acceptForSession" : "accept"
+          : "decline";
       },
     };
   }
@@ -410,6 +426,10 @@ export class CodexAdapter implements RuntimeAdapter {
         : formatInbound(message, contextOnly),
       cwd: turnCwd,
       ...(hasProjectAccess ? { permissionProfile } : {}),
+      ...(hasProjectAccess && this.#config.capabilitySurface === "full-agent"
+        ? { writableRoots: writableFolders }
+        : {}),
+      ...(this.#config.capabilitySurface === "full-agent" ? { turnTimeoutMs: 7 * 60_000 } : {}),
       ...(session.providerThreadId ? { resumeThreadId: session.providerThreadId } : {}),
       ...(this.#config.codexPath ? { codexPath: this.#config.codexPath } : {}),
       ...(this.#config.model ? { model: this.#config.model } : {}),
@@ -519,6 +539,10 @@ export class CodexAdapter implements RuntimeAdapter {
       folders: access.folders,
       writableFolders: access.writableFolders,
     })) throw new Error("approved boundary could not produce a Codex permission profile");
+    session.providerThreadId = undefined;
+    this.#db.prepare(
+      "UPDATE managed_sessions SET provider_thread_id = NULL, last_active_at = ? WHERE local_handle = ?",
+    ).run(nowIso(), session.localHandle);
     const { hash } = createBoundaryManifest({
       runtime: "codex",
       adapterVersion: CodexAdapter.adapterVersion,
@@ -619,7 +643,10 @@ export class CodexAdapter implements RuntimeAdapter {
       return;
     }
     if (event.type === "item.completed" && event.item.type === "agent_message" && typeof event.item.text === "string") {
-      sink.onReplyText(event.item.text);
+      const reply = this.#config.capabilitySurface === "full-agent"
+        ? redactToolOutput(event.item.text)
+        : event.item.text;
+      sink.onReplyText(typeof reply === "string" ? reply : "[REDACTED]");
       return;
     }
     if (event.type === "turn.completed") {

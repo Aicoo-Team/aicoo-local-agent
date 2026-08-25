@@ -66,6 +66,10 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   return [
     `default_permissions = ${tomlString(name)}`,
     "",
+    "[shell_environment_policy]",
+    'inherit = "core"',
+    'exclude = ["*TOKEN*", "*SECRET*", "*PASSWORD*", "*PASSWD*", "*API_KEY*", "*PRIVATE_KEY*", "DATABASE_URL"]',
+    "",
     `[permissions.${name}]`,
     `description = "Aicoo c2c relationship (${input.preset})"`,
     `extends = "${base}"`,
@@ -95,6 +99,7 @@ export interface PreparedCodexProfile {
   /** Value for the CODEX_HOME environment variable of the spawned process. */
   codexHome: string;
   profileName: string;
+  workspaceRoots?: string[];
 }
 
 /**
@@ -120,7 +125,11 @@ export function writeCodexPermissionProfile(
     copyFileSync(authFile, join(directory, "auth.json"));
     chmodSync(join(directory, "auth.json"), 0o600);
   }
-  return { codexHome: directory, profileName: input.profileName ?? CODEX_PROFILE_NAME };
+  return {
+    codexHome: directory,
+    profileName: input.profileName ?? CODEX_PROFILE_NAME,
+    workspaceRoots: [...new Set(input.folders)],
+  };
 }
 
 function tomlString(value: string): string {

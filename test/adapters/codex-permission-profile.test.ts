@@ -68,6 +68,14 @@ describe("codex permission profile", () => {
     }
   });
 
+  it("keeps credentials out of the command environment", () => {
+    const profile = renderCodexPermissionProfile({ preset: "edit-project", folders: ["/srv/p"] })!;
+    expect(profile).toContain("[shell_environment_policy]");
+    expect(profile).toContain('inherit = "core"');
+    expect(profile).toContain('"*TOKEN*"');
+    expect(profile).toContain('"*SECRET*"');
+  });
+
   it("writes a private CODEX_HOME so the owner's own config cannot leak in", () => {
     const dir = tempDir("codex-profile-");
     const authFile = join(dir, "source-auth.json");

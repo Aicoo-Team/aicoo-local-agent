@@ -68,7 +68,7 @@ describe("CodexAdapter managed sessions", () => {
       }],
     }));
     const driver = new FakeCodexDriver("done");
-    driver.resultDelayMs = 5_000;
+    driver.resultDelayMs = 100;
     const asked: string[] = [];
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
@@ -104,6 +104,77 @@ describe("CodexAdapter managed sessions", () => {
       paths: ["/srv/outside.ts"],
     })).resolves.toBe("decline");
     expect(asked).toEqual(["GitStatus"]);
+  });
+
+  it("allows owner-approved raw shell only in gated full-agent mode", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-full-capability-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "edit-project",
+      folder: project,
+    });
+    const driver = new FakeCodexDriver("token ghp_abcdefghijklmnopqrstuvwxyz123456");
+    driver.resultDelayMs = 100;
+    const asked: string[] = [];
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input.toolName);
+          return { approvalId: "appr-shell", status: "allow", decision: "allow", scope: "session" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow", scope: "session" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_full_shell"), "new_turn");
+
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "commandExecution",
+      command: "npm test",
+      cwd: project,
+      summary: "Run: npm test",
+    })).resolves.toBe("acceptForSession");
+    expect(driver.turns[0]?.writableRoots).toEqual([realpathSync.native(project)]);
+    expect(asked).toEqual(["Bash"]);
+
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "commandExecution",
+      command: "npm test",
+      cwd: directory,
+      summary: "Run outside the granted project",
+    })).resolves.toBe("decline");
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "commandExecution",
+      command: "bad\0command",
+      cwd: project,
+      summary: "Run invalid command",
+    })).resolves.toBe("decline");
+    expect(asked).toEqual(["Bash"]);
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started" }),
+      expect.objectContaining({
+        type: "reply",
+        payload: expect.objectContaining({ text: "token [REDACTED]" }),
+      }),
+    ]);
   });
 
   it("creates a durable rebuild continuation for an out-of-boundary file change", async () => {
@@ -407,6 +478,7 @@ describe("CodexAdapter managed sessions", () => {
       boundaryManifestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     await expect(adapter.resumeContinuation(checkpoint)).resolves.toMatchObject({ status: "runtime_acked" });
+    expect(driver.turns.at(-1)?.resumeThreadId).toBeUndefined();
     const profile = readFileSync(join(driver.turns.at(-1)!.permissionProfile!.codexHome, "config.toml"), "utf8");
     expect(profile).toContain(JSON.stringify(realpathSync.native(first)));
     expect(profile).toContain(JSON.stringify(realpathSync.native(second)));

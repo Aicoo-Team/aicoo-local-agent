@@ -54,8 +54,8 @@ export async function selectRuntimeAdapter(
   if (!Number.isInteger(options.sessions) || options.sessions < 1) {
     throw new Error("--sessions must be a positive integer");
   }
-  if (options.capabilitySurface === "full-agent" && options.kind !== "claude-code") {
-    throw new Error("full-agent capability is currently available only for the Claude Code runtime");
+  if (options.capabilitySurface === "full-agent" && options.kind === "fake") {
+    throw new Error("full-agent capability is unavailable for the fake runtime");
   }
   if (options.kind === "fake") {
     const adapter = new FakeRuntimeAdapter(options.sessions);
@@ -69,6 +69,12 @@ export async function selectRuntimeAdapter(
   }
 
   if (options.kind === "codex") {
+    if (options.capabilitySurface === "full-agent" && !options.codexAppServer) {
+      throw new Error("Codex full-agent capability requires --codex-app-server");
+    }
+    if (options.capabilitySurface === "full-agent" && !options.approvalGateway) {
+      throw new Error("Codex full-agent capability requires an owner approval gateway");
+    }
     const explicitPath = options.codexPath ? resolve(options.codexPath) : undefined;
     if (explicitPath && !(await isExecutable(explicitPath))) {
       throw new Error(`codex executable is not executable: ${explicitPath}`);
@@ -105,6 +111,7 @@ export async function selectRuntimeAdapter(
       ...(relationshipPolicyFile ? { relationshipPolicyFile } : {}),
       ...trustedPolicyOptions(options),
       ...(options.model ? { model: options.model } : {}),
+      capabilitySurface: options.capabilitySurface ?? "restricted",
       log: options.log,
     });
     return {

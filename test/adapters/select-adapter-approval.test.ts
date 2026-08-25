@@ -56,4 +56,37 @@ describe("selectRuntimeAdapter Codex approvals", () => {
     expect(capturedConfigs[0]?.approvalGateway).toBe(approvalGateway);
     expect(capturedConfigs[0]?.driver).toBeUndefined();
   });
+
+  it("wires gated full-agent Codex through app-server and owner approvals", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-select-full-codex-"));
+    directories.push(directory);
+    const codexPath = join(directory, "codex");
+    writeFileSync(codexPath, "#!/bin/sh\n");
+    chmodSync(codexPath, 0o700);
+    const approvalGateway: ToolApprovalGateway = {
+      async requestToolApproval() {
+        return { approvalId: "approval-full", status: "allow", decision: "allow" };
+      },
+      async getToolApproval() {
+        return { status: "allow", decision: "allow" };
+      },
+    };
+
+    await selectRuntimeAdapter({
+      kind: "codex",
+      sessions: 1,
+      spoolFile: join(directory, "bridge.spool"),
+      workspace: directory,
+      codexPath,
+      approvalGateway,
+      codexAppServer: true,
+      capabilitySurface: "full-agent",
+    });
+
+    expect(capturedConfigs[0]).toMatchObject({
+      approvalGateway,
+      capabilitySurface: "full-agent",
+      driver: expect.any(Object),
+    });
+  });
 });

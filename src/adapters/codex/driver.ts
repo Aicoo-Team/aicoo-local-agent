@@ -47,6 +47,8 @@ export interface CodexTurnStartInput {
    * Only the app-server driver can honour this; `codex exec` has no way to be interrupted.
    */
   onApproval?: (request: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
+  /** Hard wall-clock limit for one app-server turn, including tool execution. */
+  turnTimeoutMs?: number;
   log?: (line: string) => void;
 }
 
