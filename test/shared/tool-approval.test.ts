@@ -130,6 +130,45 @@ describe("just-in-time tool approval", () => {
       scope: "session",
     });
   });
+
+  it("binds a boundary expansion decision to its durable continuation and attested grant", async () => {
+    const activation = {
+      grantId: "grant_7",
+      grantRevision: 7,
+      canonicalFolder: "/srv/project-b",
+      accessPreset: "read-project" as const,
+      expectedBoundaryManifestHash: "manifest_7",
+    };
+    const request = {
+      ...REQUEST,
+      boundaryExpansion: {
+        continuationId: "cont_1",
+        attemptId: "tool_attempt_1",
+        resourceKind: "filesystem" as const,
+        canonicalResource: "/srv/project-b/README.md",
+        requestedAccessPreset: "read-project" as const,
+        currentBoundaryManifestHash: "manifest_6",
+        requiresSessionRebuild: true as const,
+      },
+    };
+    let received: unknown;
+    const g: ToolApprovalGateway = {
+      async requestToolApproval(input) {
+        received = input;
+        return { approvalId: "appr_7", status: "pending", decision: null };
+      },
+      async getToolApproval() {
+        return { status: "allow", decision: "allow", activation };
+      },
+    };
+
+    await expect(awaitToolApproval(g, request, fakeClock())).resolves.toEqual({
+      behavior: "allow",
+      scope: "once",
+      activation,
+    });
+    expect(received).toEqual(request);
+  });
 });
 
 describe("approval prompt text", () => {

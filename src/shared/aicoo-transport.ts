@@ -784,4 +784,23 @@ export interface ToolApprovalRequest {
   messageId?: string;
   toolName: string;
   toolInputSummary: string;
+  boundaryExpansion?: BoundaryExpansionRequest;
+}
+
+export interface BoundaryExpansionRequest {
+  continuationId: string;
+  attemptId: string;
+  resourceKind: "filesystem";
+  canonicalResource: string;
+  requestedAccessPreset: "read-project" | "edit-project";
+  currentBoundaryManifestHash?: string;
+  requiresSessionRebuild: true;
+}
+
+export interface BoundaryActivation {
+  grantId: string;
+  grantRevision: number;
+  canonicalFolder: string;
+  accessPreset: "read-project" | "edit-project";
+  expectedBoundaryManifestHash: string;
 }

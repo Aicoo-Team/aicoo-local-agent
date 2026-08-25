@@ -1,4 +1,7 @@
-import type { ToolApprovalRequest } from "./aicoo-transport.js";
+import type {
+  BoundaryActivation,
+  ToolApprovalRequest,
+} from "./aicoo-transport.js";
 
 /**
  * Just-in-time tool approval.
@@ -30,10 +33,11 @@ export interface ToolApprovalState {
   status: string;
   decision: "allow" | "deny" | null;
   scope?: ToolApprovalScope | null;
+  activation?: BoundaryActivation | null;
 }
 
 export type ToolApprovalOutcome =
-  | { behavior: "allow"; scope: ToolApprovalScope }
+  | { behavior: "allow"; scope: ToolApprovalScope; activation?: BoundaryActivation }
   | { behavior: "deny"; message: string };
 
 export interface AwaitToolApprovalOptions {
@@ -75,7 +79,14 @@ export async function awaitToolApproval(
     return denied(`could not ask ${input.toolName} approval: ${String(error)}`, options.log);
   }
 
-  const initial = decide(requested.status, requested.decision, requested.scope);
+  const requiresActivation = input.boundaryExpansion?.requiresSessionRebuild === true;
+  const initial = decide(
+    requested.status,
+    requested.decision,
+    requested.scope,
+    requested.activation,
+    requiresActivation,
+  );
   if (initial) {
     options.log?.(
       initial.behavior === "allow"
@@ -98,7 +109,13 @@ export async function awaitToolApproval(
       options.log?.(`tool approval poll failed, still waiting: ${String(error)}`);
       continue;
     }
-    const resolved = decide(current.status, current.decision, current.scope);
+    const resolved = decide(
+      current.status,
+      current.decision,
+      current.scope,
+      current.activation,
+      requiresActivation,
+    );
     if (resolved) {
       options.log?.(`tool approval ${resolved.behavior} for ${input.toolName} (${current.status})`);
       return resolved;
@@ -113,14 +130,49 @@ function decide(
   status: string,
   decision: string | null,
   scope: ToolApprovalScope | null | undefined = "once",
+  activation: BoundaryActivation | null | undefined = undefined,
+  requiresActivation = false,
 ): ToolApprovalOutcome | undefined {
-  if (decision === "allow") return { behavior: "allow", scope: scope === "session" ? "session" : "once" };
+  if (decision === "allow") return allowed(scope, activation, requiresActivation);
   if (decision === "deny") return { behavior: "deny", message: "the owner declined this tool call" };
   // No decision yet. `pending` is the normal case; anything else terminal (expired, revoked) is a
   // deny — an approval that ended without an allow was never granted.
   if (status === "pending") return undefined;
-  if (status === "auto_allow") return { behavior: "allow", scope: scope === "session" ? "session" : "once" };
+  if (status === "auto_allow") return allowed(scope, activation, requiresActivation);
   return { behavior: "deny", message: `approval ended as ${status}` };
+}
+
+function allowed(
+  scope: ToolApprovalScope | null | undefined,
+  activation: BoundaryActivation | null | undefined,
+  requiresActivation: boolean,
+): ToolApprovalOutcome {
+  const verifiedActivation = validActivation(activation) ? activation : undefined;
+  if (requiresActivation && !verifiedActivation) {
+    return {
+      behavior: "deny",
+      message: "Aicoo: approval did not include an activatable kernel boundary",
+    };
+  }
+  return {
+    behavior: "allow",
+    scope: scope === "session" ? "session" : "once",
+    ...(verifiedActivation ? { activation: verifiedActivation } : {}),
+  };
+}
+
+function validActivation(value: BoundaryActivation | null | undefined): value is BoundaryActivation {
+  return Boolean(
+    value
+    && typeof value.grantId === "string" && value.grantId.trim() && value.grantId.length <= 512
+    && Number.isSafeInteger(value.grantRevision) && value.grantRevision >= 0
+    && typeof value.canonicalFolder === "string" && value.canonicalFolder.trim()
+    && value.canonicalFolder.length <= 4_096
+    && (value.accessPreset === "read-project" || value.accessPreset === "edit-project")
+    && typeof value.expectedBoundaryManifestHash === "string"
+    && value.expectedBoundaryManifestHash.trim()
+    && value.expectedBoundaryManifestHash.length <= 512,
+  );
 }
 
 function denied(reason: string, log?: (line: string) => void): ToolApprovalOutcome {
