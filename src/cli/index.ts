@@ -57,7 +57,12 @@ import {
   waitForBridgeReady,
 } from "./onboarding.js";
 import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
-import { evaluateCapabilityRollout } from "../shared/capability-rollout.js";
+import {
+  evaluateCapabilityRollout,
+  resolveCapabilitySurface,
+  type CapabilitySurfaceActivation,
+  type CapabilitySurface,
+} from "../shared/capability-rollout.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
@@ -382,6 +387,9 @@ program.command("bridge")
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
   .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
+  .addOption(new Option("--capability-surface <surface>", "peer agent capability surface")
+    .choices(["restricted", "full-agent"])
+    .default("restricted"))
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
   .option("--no-local-helper", "disable the localhost folder/file picker helper")
@@ -403,6 +411,9 @@ program.command("start")
   .option("--workspace <dir>", "managed-session workspace", process.cwd())
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
   .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
+  .addOption(new Option("--capability-surface <surface>", "peer agent capability surface")
+    .choices(["restricted", "full-agent"])
+    .default("restricted"))
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
@@ -1066,6 +1077,7 @@ async function startBridge(options: {
   codexState?: string;
   codexPath?: string;
   codexAppServer?: boolean;
+  capabilitySurface?: CapabilitySurface;
   localHelper?: boolean;
   localHelperPort?: string;
   localHelperHost?: string;
@@ -1076,6 +1088,16 @@ async function startBridge(options: {
   json?: boolean;
 }): Promise<void> {
   ensureParentDirectory(options.spool);
+  const readinessSpool = new BridgeSpool(options.spool);
+  let capabilityActivation: CapabilitySurfaceActivation;
+  try {
+    capabilityActivation = resolveCapabilitySurface(
+      options.capabilitySurface ?? "restricted",
+      new BoundaryTelemetry(readinessSpool.db).snapshot(),
+    );
+  } finally {
+    readinessSpool.close();
+  }
   const bridgeInstanceId = randomUUID();
   const relationshipPolicyFile = options.relationshipPolicy ?? `${resolve(options.spool)}.relationships.json`;
   const trustedToolPolicyFile = `${resolve(options.spool)}.trusted-tools.json`;
@@ -1106,6 +1128,7 @@ async function startBridge(options: {
     ownerPrincipalId: ownerIdentity.principalId,
     ownerDeviceId: ownerIdentity.deviceId,
     bridgeInstanceId,
+    capabilitySurface: capabilityActivation.active,
     ...(approvalGateway ? { approvalGateway } : {}),
     // Opt-in: drives Codex through app-server so the owner can be asked mid-turn.
     ...(options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1" ? { codexAppServer: true } : {}),
@@ -1158,7 +1181,8 @@ async function startBridge(options: {
   if (options.json) {
     console.log(JSON.stringify({
       status: "ready",
-      mode: "text-only",
+      mode: capabilityActivation.active === "restricted" ? "text-only" : "full-agent",
+      capabilitySurface: capabilityActivation.active,
       adapter: selected.label,
       ...started,
     }, null, 2));
@@ -1167,6 +1191,7 @@ async function startBridge(options: {
     console.log("  Aicoo Local Agent Bridge is running!");
     console.log(`     Adapter:  ${selected.label}`);
     console.log(`     Device:   ${deviceId}`);
+    console.log(`     Surface:  ${capabilityActivation.active}`);
     console.log("     Status:   Ready for C2C collaboration");
     console.log("========================================================\n");
     console.log("Listening for incoming C2C session tasks... (Press Ctrl+C to stop)");

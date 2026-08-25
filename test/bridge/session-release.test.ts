@@ -371,7 +371,7 @@ describe("RuntimeBridge communication session release", () => {
       relationships: [{
         principalId: "prn_a",
         deviceId: "device-a1",
-        tools: ["GitDiff", "GitLog", "GitStatus", "Read"],
+        tools: ["GitDiff", "GitLog", "GitStatus", "Glob", "Grep", "Read"],
         folders: [realpathSync.native(folder)],
       }],
     });

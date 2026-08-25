@@ -27,6 +27,14 @@ export interface CapabilityRolloutDecision {
   metrics: BoundaryMetricsSnapshot;
 }
 
+export type CapabilitySurface = "restricted" | "full-agent";
+
+export interface CapabilitySurfaceActivation {
+  requested: CapabilitySurface;
+  active: CapabilitySurface;
+  rollout: CapabilityRolloutDecision;
+}
+
 /** Fail-closed evidence gate for enabling the wider C2C capability surface. */
 export function evaluateCapabilityRollout(
   metrics: BoundaryMetricsSnapshot,
@@ -43,4 +51,16 @@ export function evaluateCapabilityRollout(
     && metrics.rebuildLatencyP95Ms > thresholds.maximumRebuildP95Ms
   ) reasons.push("rebuild_latency_too_high");
   return { eligible: reasons.length === 0, reasons, thresholds, metrics };
+}
+
+/** An explicit owner request cannot bypass unhealthy or insufficient local evidence. */
+export function resolveCapabilitySurface(
+  requested: CapabilitySurface,
+  metrics: BoundaryMetricsSnapshot,
+): CapabilitySurfaceActivation {
+  const rollout = evaluateCapabilityRollout(metrics);
+  if (requested === "full-agent" && !rollout.eligible) {
+    throw new Error(`full-agent capability is not ready: ${rollout.reasons.join(", ")}`);
+  }
+  return { requested, active: requested, rollout };
 }

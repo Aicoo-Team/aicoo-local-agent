@@ -73,15 +73,18 @@ interface RelationshipPolicyOptions extends Partial<TrustedToolPolicyIdentity> {
 
 const PATH_INPUTS = {
   Read: ["file_path"],
+  Glob: ["path"],
+  Grep: ["path"],
   Write: ["file_path"],
   Edit: ["file_path"],
+  NotebookEdit: ["notebook_path"],
   GitStatus: ["repository"],
   GitDiff: ["repository"],
   GitLog: ["repository"],
   GitAdd: ["repository"],
   GitCommit: ["repository"],
 } as const;
-const WRITE_TOOLS = new Set(["Write", "Edit", "GitAdd", "GitCommit"]);
+const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "GitAdd", "GitCommit"]);
 
 const POLICY_SUPPORTED_TOOLS = Object.keys(PATH_INPUTS).sort();
 const POLICY_SUPPORTED_TOOL_SET = new Set<string>(POLICY_SUPPORTED_TOOLS);
@@ -429,6 +432,10 @@ export class RelationshipPolicy {
     const allowedFolders = [...new Set([...relationshipFolders, ...trustedFolders])];
     if (allowedFolders.length === 0) return deny(`Tool ${action.toolName} requires an allowed folder`);
 
+    if (searchPatternEscapesBoundary(action.toolName, action.input)) {
+      return deny("Search patterns cannot traverse outside the selected project boundary");
+    }
+
     const paths = pathKeys.flatMap((key) => {
       const value = action.input[key];
       return typeof value === "string" && value.trim() ? [{ key, value }] : [];
@@ -477,6 +484,21 @@ export class RelationshipPolicy {
       policy.requesterPrincipalId === message.senderPrincipalId
       && policy.requesterDeviceId === message.senderDeviceId);
   }
+}
+
+function searchPatternEscapesBoundary(toolName: string, input: Record<string, unknown>): boolean {
+  const values = toolName === "Glob"
+    ? [input.pattern]
+    : toolName === "Grep"
+      ? [input.glob]
+      : [];
+  return values.some((value) => {
+    if (typeof value !== "string") return false;
+    const portable = value.replaceAll("\\", "/");
+    return portable.startsWith("/")
+      || /^[a-z]:\//iu.test(portable)
+      || portable.split("/").includes("..");
+  });
 }
 
 /**
@@ -770,7 +792,8 @@ function dangerousPathDecision(toolName: string, candidate: string): string | un
   if (CREDENTIAL_FILE_NAMES.has(fileName) || fileName.startsWith(".env.")) {
     return "Credential files cannot be accessed by a remote relationship";
   }
-  if ((toolName === "Write" || toolName === "Edit") && isExecutionOnNextUsePath(normalized)) {
+  if ((toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit")
+    && isExecutionOnNextUsePath(normalized)) {
     return "Execution-on-next-use files cannot be modified by a remote relationship";
   }
   return undefined;

@@ -9,6 +9,7 @@ import { CodexAppServerDriver } from "./codex/app-server-driver.js";
 import { FakeRuntimeAdapter } from "./fake/fake-adapter.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
 import { RelationshipPolicy } from "../security/relationship-policy.js";
+import type { CapabilitySurface } from "../shared/capability-rollout.js";
 
 export type RuntimeAdapterKind = "fake" | "claude-code" | "codex";
 
@@ -28,6 +29,7 @@ export interface RuntimeAdapterSelectionOptions {
   ownerDeviceId?: string;
   bridgeInstanceId?: string;
   model?: string;
+  capabilitySurface?: CapabilitySurface;
   /** Lets an un-preauthorized tool be put to the owner instead of refused, on either runtime. */
   approvalGateway?: ToolApprovalGateway;
   /**
@@ -51,6 +53,9 @@ export async function selectRuntimeAdapter(
 ): Promise<RuntimeAdapterSelection> {
   if (!Number.isInteger(options.sessions) || options.sessions < 1) {
     throw new Error("--sessions must be a positive integer");
+  }
+  if (options.capabilitySurface === "full-agent" && options.kind !== "claude-code") {
+    throw new Error("full-agent capability is currently available only for the Claude Code runtime");
   }
   if (options.kind === "fake") {
     const adapter = new FakeRuntimeAdapter(options.sessions);
@@ -115,6 +120,9 @@ export async function selectRuntimeAdapter(
     throw new Error(`Claude Code executable is not executable: ${explicitPath}`);
   }
   const configuredPath = explicitPath ?? await findExecutableOnPath("claude");
+  if (options.capabilitySurface === "full-agent" && !options.approvalGateway) {
+    throw new Error("full-agent capability requires an owner approval gateway");
+  }
   const relationshipPolicyFile = options.relationshipPolicyFile
     ? resolve(options.relationshipPolicyFile)
     : undefined;
@@ -141,6 +149,7 @@ export async function selectRuntimeAdapter(
     ...trustedPolicyOptions(options),
     ...(options.approvalGateway ? { approvalGateway: options.approvalGateway } : {}),
     ...(options.model ? { model: options.model } : {}),
+    capabilitySurface: options.capabilitySurface ?? "restricted",
     log: options.log,
   });
   return {

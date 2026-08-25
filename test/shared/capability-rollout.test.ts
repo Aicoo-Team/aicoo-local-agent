@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { BoundaryMetricsSnapshot } from "../../src/adapters/boundary-telemetry.js";
-import { evaluateCapabilityRollout } from "../../src/shared/capability-rollout.js";
+import {
+  evaluateCapabilityRollout,
+  resolveCapabilitySurface,
+} from "../../src/shared/capability-rollout.js";
 
 function metrics(overrides: Partial<BoundaryMetricsSnapshot> = {}): BoundaryMetricsSnapshot {
   return {
@@ -45,5 +48,20 @@ describe("full capability rollout gate", () => {
       eligible: false,
       reasons: ["rebuild_rate_too_high", "rebuild_failure_rate_too_high", "rebuild_latency_too_high"],
     });
+  });
+
+  it("requires explicit owner activation as well as healthy evidence", () => {
+    expect(resolveCapabilitySurface("restricted", metrics())).toEqual({
+      requested: "restricted",
+      active: "restricted",
+      rollout: expect.objectContaining({ eligible: true }),
+    });
+    expect(resolveCapabilitySurface("full-agent", metrics())).toEqual({
+      requested: "full-agent",
+      active: "full-agent",
+      rollout: expect.objectContaining({ eligible: true }),
+    });
+    expect(() => resolveCapabilitySurface("full-agent", metrics({ eligibleTasks: 3 })))
+      .toThrow(/insufficient_sample/u);
   });
 });

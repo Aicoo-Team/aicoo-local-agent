@@ -787,6 +787,22 @@ describe("CodeAdapter just-in-time tool approval", () => {
     return policyFile;
   }
 
+  function editPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-edit-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read", "Write", "Edit"],
+        folders: [process.cwd()],
+      }],
+    }));
+    return policyFile;
+  }
+
   function folderBoundaryPolicyFile(): string {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-folder-boundary-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -807,6 +823,7 @@ describe("CodeAdapter just-in-time tool approval", () => {
     approvalGateway?: ReturnType<typeof gateway>,
     policyFile?: string,
     collaborationId?: string,
+    capabilitySurface: "restricted" | "full-agent" = "restricted",
   ) {
     const driver = new FakeClaudeAgentDriver();
     // canUseTool fires mid-turn; hold the turn open so the active message (and its
@@ -818,6 +835,7 @@ describe("CodeAdapter just-in-time tool approval", () => {
       relationshipPolicyFile: policyFile ?? chatOnlyPolicyFile(),
       driver,
       turnAckTimeoutMs: 500,
+      capabilitySurface,
       ...(approvalGateway ? { approvalGateway } : {}),
     });
     cleanups.push(() => adapter.close());
@@ -897,6 +915,81 @@ describe("CodeAdapter just-in-time tool approval", () => {
     expect(await options.canUseTool?.("Bash", { command: "git reset --hard" }, permissionContext()))
       .toMatchObject({ behavior: "deny", interrupt: false });
     expect(g.asked).toHaveLength(1);
+  });
+
+  it("exposes the full tool surface only in full-agent mode and governs raw shell", async () => {
+    const g = gateway("allow");
+    const options = await startedAdapter(g, editPolicyFile(), "collab-full", "full-agent");
+
+    expect(options.tools).toEqual(expect.arrayContaining([
+      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill",
+    ]));
+    expect(options.disallowedTools).toEqual([]);
+    expect(options.settingSources).toEqual(["user", "project", "local"]);
+    expect(options.mcpServers).toBeUndefined();
+    expect(options.strictMcpConfig).toBe(false);
+    expect(options.managedSettings).toMatchObject({
+      sandbox: {
+        enabled: true,
+        failIfUnavailable: true,
+        allowUnsandboxedCommands: false,
+        network: { allowedDomains: [], allowManagedDomainsOnly: true },
+        filesystem: {
+          allowRead: [realpathSync.native(process.cwd())],
+          allowManagedReadPathsOnly: true,
+        },
+      },
+    });
+
+    expect(await options.canUseTool?.("Bash", {
+      command: "npm test",
+      timeout: 900_000,
+      dangerouslyDisableSandbox: true,
+    }, permissionContext())).toMatchObject({
+      behavior: "allow",
+      updatedInput: {
+        command: "npm test",
+        timeout: 120_000,
+        dangerouslyDisableSandbox: false,
+      },
+    });
+    expect(g.asked).toEqual([
+      expect.objectContaining({ toolName: "Bash", toolInputSummary: "Bash npm test" }),
+    ]);
+
+    const preToolUseHook = options.hooks?.PreToolUse?.[0]?.hooks?.[0];
+    expect(await preToolUseHook?.({
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "npm test", dangerouslyDisableSandbox: true },
+      tool_use_id: "full-bash-hook",
+      session_id: "s",
+      transcript_path: "",
+      cwd: options.cwd ?? "",
+      permission_mode: "default",
+    } as never, "full-bash-hook", { signal: new AbortController().signal })).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "allow",
+        updatedInput: { dangerouslyDisableSandbox: false, timeout: 120_000 },
+      },
+    });
+
+    const postToolUseHook = options.hooks?.PostToolUse?.[0]?.hooks?.[0];
+    expect(await postToolUseHook?.({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      tool_response: { output: "leaked ghp_abcdefghijklmnopqrstuvwxyz123456" },
+      tool_use_id: "full-bash-hook",
+      session_id: "s",
+      transcript_path: "",
+      cwd: options.cwd ?? "",
+      permission_mode: "default",
+    } as never, "full-bash-hook", { signal: new AbortController().signal })).toMatchObject({
+      hookSpecificOutput: {
+        updatedToolOutput: { output: "leaked [REDACTED]" },
+      },
+    });
   });
 
   it("does not offer approval when no active boundary can honor the path", async () => {

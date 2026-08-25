@@ -533,11 +533,19 @@ describe("RelationshipPolicy", () => {
     expect(permissions.authorize(
       { toolName: "Glob", input: { pattern: "../../../**/*.env" } },
       inbound(),
-    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("Unsupported") });
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("traverse") });
     expect(permissions.authorize(
       { toolName: "Grep", input: { pattern: "AWS_SECRET", glob: "../../**/*" } },
       inbound(),
-    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("Unsupported") });
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("traverse") });
+    expect(permissions.authorize(
+      { toolName: "Glob", input: { pattern: "src/**/*.ts", path: project } },
+      inbound(),
+    )).toMatchObject({ behavior: "allow", updatedInput: { path: realpathSync.native(project) } });
+    expect(permissions.authorize(
+      { toolName: "Grep", input: { pattern: "TODO", glob: "**/*.ts", path: project } },
+      inbound(),
+    )).toMatchObject({ behavior: "allow", updatedInput: { path: realpathSync.native(project) } });
     expect(permissions.authorize(
       { toolName: "MultiEdit", input: { file_path: join(project, "a.ts") } },
       inbound(),
