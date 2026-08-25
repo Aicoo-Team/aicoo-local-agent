@@ -70,4 +70,20 @@ describe("multi-agent goal runner", () => {
       }),
     ).toThrow("duplicate subtask id: review");
   });
+
+  it("preserves several explicit projects for initial boundary planning", () => {
+    const parsed = parseGoalPlan({
+      goalId: "compare-projects",
+      objective: "Compare two approved projects",
+      subtasks: [{
+        id: "compare",
+        target: "@engineering",
+        task: "Compare both implementations",
+        expectedOutput: "Comparison",
+        projects: ["ttp_first", "ttp_second"],
+      }],
+    });
+
+    expect(parsed.subtasks[0]?.projects).toEqual(["ttp_first", "ttp_second"]);
+  });
 });

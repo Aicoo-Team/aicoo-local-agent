@@ -10,7 +10,11 @@ import type {
   SDKUserMessage,
   SyncHookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
-import { RelationshipPolicy } from "../../security/relationship-policy.js";
+import {
+  projectAccessAllowsAction,
+  RelationshipPolicy,
+  type ProjectAccess,
+} from "../../security/relationship-policy.js";
 import { parseSafeGitCommand, safeGitShellInput } from "../../security/safe-git.js";
 import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
@@ -22,6 +26,7 @@ import {
   type ClaudeDriverQuery,
 } from "./driver.js";
 import { AsyncMessageQueue } from "./message-queue.js";
+import { BoundaryTelemetry, type BoundaryMetricsSnapshot } from "../boundary-telemetry.js";
 
 export interface ClaudeCodeAdapterConfig {
   stateFile: string;
@@ -68,7 +73,8 @@ interface ManagedSession {
   boundCommunicationSessionId?: string;
   sandboxPrincipalId?: string;
   sandboxDeviceId?: string;
-  sandboxProjectFolder?: string;
+  sandboxBoundaryKey?: string;
+  sandboxAccess?: ProjectAccess;
   acceptedTurns: AcceptedTurn[];
   pendingAcks: Map<string, PendingAck>;
 }
@@ -107,6 +113,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   readonly #sessions = new Map<string, ManagedSession>();
   readonly #events = new EventEmitter();
   readonly #config: ClaudeCodeAdapterConfig;
+  readonly #boundaryTelemetry: BoundaryTelemetry;
   #initialized = false;
   #closing = false;
   #closed = false;
@@ -143,6 +150,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         PRIMARY KEY(local_handle, seq)
       );
     `);
+    this.#boundaryTelemetry = new BoundaryTelemetry(this.#db);
     try {
       this.#db.exec("ALTER TABLE managed_sessions ADD COLUMN bound_comm_session_id TEXT;");
     } catch (error) {
@@ -201,6 +209,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       state: session.state,
       allowInbound: session.state !== "closed",
     }));
+  }
+
+  boundaryMetrics(): BoundaryMetricsSnapshot {
+    return this.#boundaryTelemetry.snapshot();
   }
 
   async *subscribeSessionEvents(sessionHandle: string, cursor = "0"): AsyncIterable<AdapterEvent> {
@@ -266,15 +278,52 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       this.#config.log?.("claude project access denied: the requested project grant was not found");
       return { status: "project_access_not_found" } as const;
     }
-    const selectedProjectFolder = projectAccess?.folders[0];
+    const selectedBoundaryKey = sandboxBoundaryKey(projectAccess);
+    if (message.kind === "task_invite" && projectAccess?.status === "selected") {
+      this.#boundaryTelemetry.recordEligibleTask({
+        messageId: message.id,
+        localHandle: session.localHandle,
+        correlationId: message.correlationId ?? message.id,
+      });
+    }
     if (
       session.sandboxPrincipalId !== message.senderPrincipalId
       || session.sandboxDeviceId !== message.senderDeviceId
-      || session.sandboxProjectFolder !== selectedProjectFolder
+      || session.sandboxBoundaryKey !== selectedBoundaryKey
     ) {
+      const previousBoundaryKey = session.sandboxBoundaryKey;
+      const transitionKind = previousBoundaryKey === undefined ? "initial" : "post_start_rebuild";
+      const cause = previousBoundaryKey === undefined
+        ? "initial"
+        : session.sandboxPrincipalId !== message.senderPrincipalId
+          ? "sender_change"
+          : session.sandboxDeviceId !== message.senderDeviceId
+            ? "device_change"
+            : "boundary_change";
+      const startedAt = Date.now();
       try {
         await this.relaunchForSender(session, message);
+        if (projectAccess?.status === "selected" && selectedBoundaryKey) {
+          this.#boundaryTelemetry.recordTransition({
+            messageId: message.id,
+            kind: transitionKind,
+            cause,
+            boundaryKey: selectedBoundaryKey,
+            success: true,
+            latencyMs: Date.now() - startedAt,
+          });
+        }
       } catch (error) {
+        if (projectAccess?.status === "selected" && selectedBoundaryKey) {
+          this.#boundaryTelemetry.recordTransition({
+            messageId: message.id,
+            kind: transitionKind,
+            cause,
+            boundaryKey: selectedBoundaryKey,
+            success: false,
+            latencyMs: Date.now() - startedAt,
+          });
+        }
         this.#config.log?.(`Claude sender-scoped sandbox failed to start: ${String(error)}`);
         return { status: "runtime_unavailable" } as const;
       }
@@ -451,7 +500,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     session.boundCommunicationSessionId = undefined;
     session.sandboxPrincipalId = undefined;
     session.sandboxDeviceId = undefined;
-    session.sandboxProjectFolder = undefined;
+    session.sandboxBoundaryKey = undefined;
+    session.sandboxAccess = undefined;
     session.state = "idle";
     this.#db.prepare(
       `UPDATE managed_sessions
@@ -475,9 +525,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     session.providerSessionId = randomUUID();
     session.initialized = false;
     session.state = "idle";
-    session.sandboxPrincipalId = message.senderPrincipalId;
-    session.sandboxDeviceId = message.senderDeviceId;
-    session.sandboxProjectFolder = this.relationshipPolicy()?.accessFor(message).folders[0];
+    const nextSandboxAccess = this.relationshipPolicy()?.accessFor(message);
     this.#db.prepare(
       `UPDATE managed_sessions
        SET provider_session_id = ?, initialized = 0, state = 'idle', last_active_at = ?
@@ -485,6 +533,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     ).run(session.providerSessionId, nowIso(), session.localHandle);
     try {
       await this.launchSession(session, message);
+      session.sandboxPrincipalId = message.senderPrincipalId;
+      session.sandboxDeviceId = message.senderDeviceId;
+      session.sandboxBoundaryKey = sandboxBoundaryKey(nextSandboxAccess);
+      session.sandboxAccess = nextSandboxAccess;
     } finally {
       session.resetting = false;
     }
@@ -534,6 +586,22 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           { toolName: effectiveToolName, input: effectiveInput },
           activeMessage,
         );
+        if (boundary.behavior !== "allow") {
+          return {
+            behavior: "deny",
+            message: "This request is outside the active session boundary. Select or grant the folder before starting the task.",
+          };
+        }
+        const boundaryInput = boundary.updatedInput ?? effectiveInput;
+        if (!projectAccessAllowsAction(session.sandboxAccess, {
+          toolName: effectiveToolName,
+          input: boundaryInput,
+        })) {
+          return {
+            behavior: "deny",
+            message: "This request is outside the active session boundary. Select or grant the folder before starting the task.",
+          };
+        }
         if (gitOperation) {
           const canonicalRepository = boundary.updatedInput?.repository;
           if (typeof canonicalRepository === "string") gitOperation.repository = canonicalRepository;
@@ -837,6 +905,15 @@ function collaborationResponseProtocol(message: MessageEnvelope): string[] {
 function normalizeCursor(value: string): number {
   const cursor = Number.parseInt(value, 10);
   return Number.isFinite(cursor) && cursor >= 0 ? cursor : 0;
+}
+
+function sandboxBoundaryKey(access: ProjectAccess | undefined): string | undefined {
+  if (!access || access.status !== "selected") return undefined;
+  return JSON.stringify({
+    preset: access.preset,
+    folders: [...access.folders].sort(),
+    writableFolders: [...access.writableFolders].sort(),
+  });
 }
 
 /**

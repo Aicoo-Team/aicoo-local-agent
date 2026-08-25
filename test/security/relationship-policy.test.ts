@@ -212,6 +212,46 @@ describe("RelationshipPolicy", () => {
     )).toMatchObject({ behavior: "deny", message: expect.stringContaining("outside") });
   });
 
+  it("selects several explicitly granted projects for one initial boundary", () => {
+    const directory = makeDirectory();
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const file = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+    const selected = inbound({
+      payload: {
+        task: {
+          text: "Compare both projects",
+          projectAccessIds: [first, second],
+        },
+      },
+    });
+
+    expect(permissions.accessFor(selected)).toMatchObject({
+      status: "selected",
+      preset: "read-project",
+      folders: [realpathSync.native(first), realpathSync.native(second)].sort(),
+    });
+    for (const project of [first, second]) {
+      expect(permissions.authorize(
+        { toolName: "Read", input: { file_path: join(project, "README.md") } },
+        selected,
+      )).toMatchObject({ behavior: "allow" });
+    }
+  });
+
   it("forgets generated peer permissions when a bridge run resets its policy", () => {
     const directory = makeDirectory();
     const project = join(directory, "project");

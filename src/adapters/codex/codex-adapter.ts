@@ -3,7 +3,11 @@ import { chmodSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
-import { RelationshipPolicy } from "../../security/relationship-policy.js";
+import {
+  projectAccessAllowsAction,
+  RelationshipPolicy,
+  type ProjectAccess,
+} from "../../security/relationship-policy.js";
 import { parseSafeGitCommand } from "../../security/safe-git.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
@@ -90,17 +94,56 @@ export class CodexAdapter implements RuntimeAdapter {
    * Returns nothing when there is no gateway or no live session to attribute the answer to; the
    * driver then refuses on its own, which is the pre-existing behaviour rather than a new bypass.
    */
-  #approvalRoute(message: InboundMessage, sessionHandle: string): { onApproval?: CodexTurnStartInput["onApproval"] } {
+  #approvalRoute(
+    message: InboundMessage,
+    sessionHandle: string,
+    sessionAccess: ProjectAccess | undefined,
+  ): { onApproval?: CodexTurnStartInput["onApproval"] } {
     const gateway = this.#config.approvalGateway;
     const communicationSessionId = message.communicationSessionId;
     if (!gateway || !communicationSessionId) return {};
     return {
       onApproval: async (request) => {
+        if (request.kind === "permissions") {
+          this.#config.log?.("codex permission widening denied: the active kernel profile is immutable");
+          return "decline";
+        }
         const gitOperation = request.kind === "commandExecution"
-          ? parseSafeGitCommand(request.summary.replace(/^Run:\s*/u, ""), this.#config.cwd)
+          ? parseSafeGitCommand(request.command ?? request.summary.replace(/^Run:\s*/u, ""), this.#config.cwd)
           : undefined;
         if (request.kind === "commandExecution" && !gitOperation) {
           this.#config.log?.("codex command denied: raw shell and unsupported Git commands are disabled");
+          return "decline";
+        }
+        let boundaryAllowed = false;
+        try {
+          const policy = this.relationshipPolicy();
+          const actions = gitOperation
+            ? [{ toolName: gitOperation.toolName, input: { repository: gitOperation.repository } }]
+            : request.kind === "fileChange" && request.paths?.length
+              ? request.paths.map((path) => ({ toolName: "Edit", input: { file_path: path } }))
+              : [];
+          boundaryAllowed = actions.length > 0 && actions.every((action) => {
+            const boundary = policy.authorizeBoundary(action, message);
+            if (boundary.behavior !== "allow") return false;
+            const boundaryInput = boundary.updatedInput ?? action.input;
+            if (!projectAccessAllowsAction(sessionAccess, {
+              toolName: action.toolName,
+              input: boundaryInput,
+            })) return false;
+            const canonicalRepository = "repository" in boundaryInput
+              ? boundaryInput.repository
+              : undefined;
+            if (gitOperation && typeof canonicalRepository === "string") {
+              gitOperation.repository = canonicalRepository;
+            }
+            return true;
+          });
+        } catch {
+          boundaryAllowed = false;
+        }
+        if (!boundaryAllowed) {
+          this.#config.log?.("codex approval denied: request is outside the active session boundary");
           return "decline";
         }
         const outcome = await awaitToolApproval(
@@ -312,7 +355,12 @@ export class CodexAdapter implements RuntimeAdapter {
       ...(session.providerThreadId ? { resumeThreadId: session.providerThreadId } : {}),
       ...(this.#config.codexPath ? { codexPath: this.#config.codexPath } : {}),
       ...(this.#config.model ? { model: this.#config.model } : {}),
-      ...this.#approvalRoute(message, session.localHandle),
+      ...this.#approvalRoute(message, session.localHandle, hasProjectAccess ? {
+        status: "selected",
+        preset: projectAccessPreset!,
+        folders: grantedFolders,
+        writableFolders,
+      } : undefined),
       log: this.#config.log,
     });
     const active: ActiveTurn = { message, runtimeTurnId, contextOnly, turn, done: Promise.resolve() };

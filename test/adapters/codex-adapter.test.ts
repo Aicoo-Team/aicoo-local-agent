@@ -51,12 +51,27 @@ describe("CodexAdapter managed sessions", () => {
   });
 
   it("maps app-server Git approvals to dedicated tools and refuses raw shell", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-app-approval-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    mkdirSync(project);
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["GitStatus"],
+        folders: [project],
+      }],
+    }));
     const driver = new FakeCodexDriver("done");
     driver.resultDelayMs = 5_000;
     const asked: string[] = [];
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
-      cwd: process.cwd(),
+      cwd: project,
+      relationshipPolicyFile: policyFile,
       driver,
       turnAckTimeoutMs: 500,
       approvalGateway: {
@@ -79,6 +94,13 @@ describe("CodexAdapter managed sessions", () => {
       .resolves.toBe("accept");
     await expect(approve!({ kind: "commandExecution", summary: "Run: git reset --hard" }))
       .resolves.toBe("decline");
+    await expect(approve!({ kind: "permissions", summary: "Widen this session's sandbox permissions" }))
+      .resolves.toBe("decline");
+    await expect(approve!({
+      kind: "fileChange",
+      summary: "Modify: /srv/outside.ts",
+      paths: ["/srv/outside.ts"],
+    })).resolves.toBe("decline");
     expect(asked).toEqual(["GitStatus"]);
   });
 
@@ -175,6 +197,50 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[0]?.cwd).toBe(realpathSync.native(second));
     expect(driver.turns[0]?.prompt).toContain(realpathSync.native(second));
     expect(driver.turns[0]?.prompt).not.toContain(`- ${realpathSync.native(first)}`);
+  });
+
+  it("places several explicitly selected projects in one Codex boundary", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-multi-project-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeCodexDriver("Both projects inspected.");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_multi", {
+      kind: "task_invite",
+      payload: {
+        task: { text: "Compare both", projectAccessIds: [first, second] },
+      },
+    }), "queue")).toMatchObject({ status: "runtime_acked" });
+
+    const profile = readFileSync(join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"), "utf8");
+    expect(profile).toContain(`${JSON.stringify(realpathSync.native(first))} = true`);
+    expect(profile).toContain(`${JSON.stringify(realpathSync.native(second))} = true`);
+    expect(driver.turns[0]?.prompt).toContain(`- ${realpathSync.native(first)}`);
+    expect(driver.turns[0]?.prompt).toContain(`- ${realpathSync.native(second)}`);
   });
 
   it("uses the kernel profile without a second local approval layer", async () => {

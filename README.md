@@ -212,10 +212,14 @@ needs-owner, pending, or failed states for final synthesis.
 When the teammate has shared more than one project with the same local-agent
 device, select the exact project grant ID provided by the access flow, or its
 approved absolute folder. The owner can inspect local grants with `ccd
-trusted-access list`. The receiver fails closed instead of guessing:
+trusted-access list`. Repeat `--project` when one task needs several already
+granted projects; the receiver builds one initial multi-directory boundary
+instead of restarting once per project. It fails closed instead of guessing:
 
 ```bash
 ccd delegate @teammate "Summarize the README" --project ttp_project_grant_id
+ccd delegate @teammate "Compare both projects" \
+  --project ttp_first_project --project ttp_second_project
 ```
 
 Successful handle resolutions are cached per bridge spool. If the hosted

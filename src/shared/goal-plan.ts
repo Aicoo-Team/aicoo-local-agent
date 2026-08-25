@@ -4,6 +4,7 @@ export interface GoalSubtaskPlan {
   task: string;
   expectedOutput: string;
   project?: string;
+  projects?: string[];
   contextFile?: string;
 }
 
@@ -41,6 +42,10 @@ export function parseGoalPlan(value: unknown): GoalPlan {
     if (ids.has(id)) throw new Error(`duplicate subtask id: ${id}`);
     ids.add(id);
     const project = optionalString(subtask.project, `subtasks[${index}].project`, 1_024);
+    const projects = optionalStringArray(subtask.projects, `subtasks[${index}].projects`, 16, 1_024);
+    if (project && projects) {
+      throw new Error(`subtasks[${index}] cannot contain both project and projects`);
+    }
     const contextFile = optionalString(
       subtask.contextFile,
       `subtasks[${index}].contextFile`,
@@ -56,6 +61,7 @@ export function parseGoalPlan(value: unknown): GoalPlan {
         1_000,
       ),
       ...(project ? { project } : {}),
+      ...(projects ? { projects } : {}),
       ...(contextFile ? { contextFile } : {}),
     };
   });
@@ -75,4 +81,18 @@ function requiredString(value: unknown, field: string, maxLength: number): strin
 function optionalString(value: unknown, field: string, maxLength: number): string | undefined {
   if (value === undefined) return undefined;
   return requiredString(value, field, maxLength);
+}
+
+function optionalStringArray(
+  value: unknown,
+  field: string,
+  maxItems: number,
+  maxItemLength: number,
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxItems) {
+    throw new Error(`${field} must contain between 1 and ${maxItems} items`);
+  }
+  return [...new Set(value.map((item, index) =>
+    requiredString(item, `${field}[${index}]`, maxItemLength)))];
 }

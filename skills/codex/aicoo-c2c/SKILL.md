@@ -94,8 +94,9 @@ The goal-plan JSON shape is:
 }
 ```
 
-Use lowercase stable IDs. Include `project` only when an exact approved project
-grant is known. Include `contextFile` only for a bounded context capsule that
+Use lowercase stable IDs. Include `project` only when one exact approved project
+grant is known, or `projects` when the subtask needs several exact approved
+projects in one initial boundary. Include `contextFile` only for a bounded context capsule that
 passes the same secret and size checks as direct delegation.
 
 ## How To Delegate
@@ -112,6 +113,15 @@ project grant ID (preferred) or approved absolute folder. Never guess a folder:
 
 ```bash
 ccd delegate @username "summarize the project" --project ttp_project_grant_id
+```
+
+When one objective genuinely needs several already-approved projects, repeat
+the option so the recipient can construct one multi-directory boundary before
+execution:
+
+```bash
+ccd delegate @username "compare both projects" \
+  --project ttp_first_project --project ttp_second_project
 ```
 
 The receiver deliberately returns `project_selection_required` when multiple

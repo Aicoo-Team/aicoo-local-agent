@@ -203,13 +203,13 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       behavior: "allow",
       updatedInput: { file_path: join(realpathSync.native(directory), "project", "README.md") },
     });
-    // Pulse approves the operation; the sender-scoped SDK sandbox is the filesystem boundary
-    // and refuses the outside path when Claude actually attempts it.
+    // Do not ask the owner to approve a path or write level that this immutable session boundary
+    // cannot honor. The request must be reissued with the wider boundary selected up front.
     expect(await options.canUseTool?.("Read", { file_path: join(directory, "outside.txt") }, {
       signal: new AbortController().signal,
       toolUseID: "outside-read",
       requestId: "permission-request",
-    })).toMatchObject({ behavior: "allow" });
+    })).toMatchObject({ behavior: "deny" });
     expect(await options.canUseTool?.("Edit", { file_path: join(project, "README.md") }, {
       signal: new AbortController().signal,
       toolUseID: "edit-tool-call",
@@ -220,7 +220,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       toolUseID: "bash-tool-call",
       requestId: "permission-request",
     })).toMatchObject({ behavior: "deny" });
-    expect(asked).toEqual(["Read", "Read", "Edit"]);
+    expect(asked).toEqual(["Read", "Edit"]);
   });
 
   it("injects a remote reply as context-only and does not create an automatic reply loop", async () => {
@@ -314,6 +314,74 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     const options = driver.starts.at(-1)!.options;
     expect(options.cwd).toBe(realpathSync.native(second));
     expect(options.additionalDirectories).toEqual([realpathSync.native(second)]);
+  });
+
+  it("reuses one Claude boundary for the same explicitly selected project set", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-multi-project-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeClaudeAgentDriver("Both projects inspected.");
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const multiProject = (id: string) => inbound(id, {
+      kind: "task_invite",
+      payload: {
+        task: { text: "Compare both", projectAccessIds: [first, second] },
+      },
+    });
+    expect(await adapter.deliverToSession("claude-managed-1", multiProject("msg_multi_1"), "queue"))
+      .toMatchObject({ status: "runtime_acked" });
+    const startsAfterFirstTurn = driver.starts.length;
+    expect(driver.starts.at(-1)!.options.additionalDirectories).toEqual(
+      [realpathSync.native(first), realpathSync.native(second)].sort(),
+    );
+
+    expect(await adapter.deliverToSession("claude-managed-1", multiProject("msg_multi_2"), "queue"))
+      .toMatchObject({ status: "runtime_acked" });
+    expect(driver.starts).toHaveLength(startsAfterFirstTurn);
+    expect(adapter.boundaryMetrics()).toMatchObject({
+      eligibleTasks: 2,
+      initialBoundaryBuilds: 1,
+      postStartRebuildTasks: 0,
+      totalPostStartRebuilds: 0,
+    });
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_multi_3", {
+      kind: "task_invite",
+      payload: {
+        task: { text: "Inspect only the first", projectAccessId: first },
+      },
+    }), "queue")).toMatchObject({ status: "runtime_acked" });
+    expect(adapter.boundaryMetrics()).toMatchObject({
+      eligibleTasks: 3,
+      initialBoundaryBuilds: 1,
+      postStartRebuildTasks: 1,
+      totalPostStartRebuilds: 1,
+      failedBoundaryBuilds: 0,
+    });
   });
 
   it("binds a managed Claude conversation to one communication session", async () => {
@@ -537,6 +605,22 @@ describe("CodeAdapter just-in-time tool approval", () => {
     return policyFile;
   }
 
+  function folderBoundaryPolicyFile(): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-folder-boundary-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: [],
+        folders: [process.cwd()],
+      }],
+    }));
+    return policyFile;
+  }
+
   async function startedAdapter(
     approvalGateway?: ReturnType<typeof gateway>,
     policyFile?: string,
@@ -573,20 +657,20 @@ describe("CodeAdapter just-in-time tool approval", () => {
 
   it("asks the owner when policy does not cover the call, and allows on approval", async () => {
     const g = gateway("allow");
-    const options = await startedAdapter(g);
+    const options = await startedAdapter(g, folderBoundaryPolicyFile());
 
-    expect(await options.canUseTool?.("Read", { file_path: "/srv/secret.ts" }, permissionContext()))
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
       .toMatchObject({ behavior: "allow" });
     // The owner sees one line, so it has to name the file — "Read" alone is not decidable.
     expect(g.asked).toHaveLength(1);
-    expect(g.asked[0]!.toolInputSummary).toBe("Read /srv/secret.ts");
+    expect(g.asked[0]!.toolInputSummary).toBe("Read README.md");
     expect(g.asked[0]!.communicationSessionId).toBe("comm_1");
   });
 
   it("denies when the owner declines", async () => {
     const g = gateway("deny");
-    const options = await startedAdapter(g);
-    expect(await options.canUseTool?.("Read", { file_path: "/srv/secret.ts" }, permissionContext()))
+    const options = await startedAdapter(g, folderBoundaryPolicyFile());
+    expect(await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext()))
       .toMatchObject({ behavior: "deny", interrupt: false });
     // Must be a deny the owner chose, not the old deny-before-asking path.
     expect(g.asked).toHaveLength(1);
@@ -594,15 +678,15 @@ describe("CodeAdapter just-in-time tool approval", () => {
 
   it("does not widen Allow once into a local turn-wide permission", async () => {
     const g = gateway("allow");
-    const options = await startedAdapter(g);
+    const options = await startedAdapter(g, folderBoundaryPolicyFile());
 
-    await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
-    await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext());
+    await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext());
+    await options.canUseTool?.("Read", { file_path: "README.md" }, permissionContext());
     expect(g.asked).toHaveLength(2);
 
     // Pulse decides whether either request can auto-resolve from a collaboration-scoped
     // allowance. The bridge must not silently broaden a one-time decision by itself.
-    await options.canUseTool?.("Read", { file_path: "/srv/b.ts" }, permissionContext());
+    await options.canUseTool?.("Read", { file_path: "package.json" }, permissionContext());
     expect(g.asked).toHaveLength(3);
   });
 
@@ -633,16 +717,50 @@ describe("CodeAdapter just-in-time tool approval", () => {
     expect(g.asked).toHaveLength(1);
   });
 
-  it("asks the owner even before any policy file exists", async () => {
-    // The state every new install is in. If a missing file threw instead of yielding an empty
-    // policy, the catch below would deny before reaching the gateway and nobody would ever be
-    // asked — the feature would be dead for exactly the users who need it most.
+  it("does not offer approval when no active boundary can honor the path", async () => {
+    // Regression: an owner approval cannot widen an already-running kernel sandbox. Prompting
+    // here would record an allow that the runtime must still refuse.
     const g = gateway("allow");
     const options = await startedAdapter(g, missingPolicyFile());
 
     expect(await options.canUseTool?.("Read", { file_path: "/srv/a.ts" }, permissionContext()))
-      .toMatchObject({ behavior: "allow" });
-    expect(g.asked).toHaveLength(1);
+      .toMatchObject({
+        behavior: "deny",
+        message: expect.stringContaining("outside the active session boundary"),
+      });
+    expect(g.asked).toHaveLength(0);
+  });
+
+  it("does not treat a policy update as an in-place kernel boundary widening", async () => {
+    // Regression: the relationship file can change while Claude is running, but its kernel
+    // additionalDirectories cannot. Approval must not claim that the old session can use it.
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-fixed-boundary-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first");
+    const second = join(directory, "second");
+    mkdirSync(first);
+    mkdirSync(second);
+    const policyFile = join(directory, "relationships.json");
+    const relationship = (folders: string[]) => ({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: [],
+        folders,
+      }],
+    });
+    writeFileSync(policyFile, JSON.stringify(relationship([first])));
+    const g = gateway("allow");
+    const options = await startedAdapter(g, policyFile);
+
+    writeFileSync(policyFile, JSON.stringify(relationship([first, second])));
+    expect(await options.canUseTool?.("Read", { file_path: join(second, "README.md") }, permissionContext()))
+      .toMatchObject({
+        behavior: "deny",
+        message: expect.stringContaining("outside the active session boundary"),
+      });
+    expect(g.asked).toHaveLength(0);
   });
 
   it("denies without asking when the policy file is present but corrupt", async () => {

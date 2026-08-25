@@ -68,6 +68,10 @@ const program = new Command()
   .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? LOCAL_SERVER_URL)
   .option("--token <token>", "device bearer token", process.env.CCD_TOKEN);
 
+function collectOption(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
 program.command("login")
   .description("log in this machine via Aicoo device-code pairing flow")
   .addOption(new Option("--runtime <adapter>", "runtime adapter").choices(["claude-code", "codex"]).default("codex"))
@@ -279,9 +283,11 @@ program.command("goal")
       const result = await runGoalPlan(plan, {
         runSubtask: async (subtask, identifiers) => {
           const resolved = await resolvePerson(client, subtask.target, options.spool);
-          const task = subtask.project
-            ? { text: subtask.task, projectAccessId: subtask.project }
-            : subtask.task;
+          const task = subtask.projects
+            ? { text: subtask.task, projectAccessIds: subtask.projects }
+            : subtask.project
+              ? { text: subtask.task, projectAccessId: subtask.project }
+              : subtask.task;
           let context: CollaborationContext | undefined;
           if (subtask.contextFile) {
             if (statSync(subtask.contextFile).size > COLLABORATION_CONTEXT_MAX_BYTES) {
@@ -773,7 +779,12 @@ program.command("delegate")
   .option("--timeout <seconds>", "local pending-delegation timeout", "1800")
   .option("--request-timeout <seconds>", "delegation HTTP submission timeout", "30")
   .option("--context-file <path>", "bounded JSON context capsule prepared by your local agent")
-  .option("--project <id-or-folder>", "exact shared-project grant ID or approved absolute folder")
+  .option(
+    "--project <id-or-folder>",
+    "exact shared-project grant ID or approved absolute folder (repeat for one multi-project boundary)",
+    collectOption,
+    [],
+  )
   .option("--no-wait", "return after dispatch instead of waiting for the peer reply")
   .option("--server <url>", "control-plane URL")
   .action(async (person, taskParts, options) => {
@@ -792,9 +803,14 @@ program.command("delegate")
 
     const route = await resolveRoute({ spool: options.spool });
     const taskText = taskParts.join(" ");
-    const task = options.project
-      ? { text: taskText, projectAccessId: String(options.project).trim() }
-      : taskText;
+    const projects = Array.isArray(options.project)
+      ? [...new Set(options.project.map((project: unknown) => String(project).trim()).filter(Boolean))]
+      : [];
+    const task = projects.length > 1
+      ? { text: taskText, projectAccessIds: projects }
+      : projects.length === 1
+        ? { text: taskText, projectAccessId: projects[0] }
+        : taskText;
     let context: CollaborationContext | undefined;
     if (options.contextFile) {
       try {
@@ -803,7 +819,7 @@ program.command("delegate")
         }
         context = parseCollaborationContext(
           JSON.parse(readFileSync(options.contextFile, "utf8")) as unknown,
-          task,
+          taskText,
         );
       } catch (error) {
         console.error(`Could not load context capsule: ${errorMessage(error)}`);
