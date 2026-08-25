@@ -1089,14 +1089,15 @@ async function startBridge(options: {
 }): Promise<void> {
   ensureParentDirectory(options.spool);
   const readinessSpool = new BridgeSpool(options.spool);
-  let capabilityActivation: CapabilitySurfaceActivation;
+  let boundaryMetrics: ReturnType<BoundaryTelemetry["snapshot"]>;
   try {
-    capabilityActivation = resolveCapabilitySurface(
-      options.capabilitySurface ?? "restricted",
-      new BoundaryTelemetry(readinessSpool.db).snapshot(),
-    );
+    boundaryMetrics = new BoundaryTelemetry(readinessSpool.db).snapshot();
   } finally {
     readinessSpool.close();
+  }
+  const rebuildReadiness = evaluateCapabilityRollout(boundaryMetrics);
+  if (options.capabilitySurface === "full-agent" && !rebuildReadiness.eligible) {
+    throw new Error(`full-agent capability is not ready: ${rebuildReadiness.reasons.join(", ")}`);
   }
   const bridgeInstanceId = randomUUID();
   const relationshipPolicyFile = options.relationshipPolicy ?? `${resolve(options.spool)}.relationships.json`;
@@ -1113,6 +1114,16 @@ async function startBridge(options: {
   const approvalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
     ? (transport as unknown as ToolApprovalGateway)
     : undefined;
+  const codexAppServer = options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1";
+  const capabilityActivation: CapabilitySurfaceActivation = resolveCapabilitySurface(
+    options.capabilitySurface ?? "restricted",
+    boundaryMetrics,
+    {
+      runtime: options.adapter,
+      ownerApprovalGateway: Boolean(approvalGateway),
+      ...(options.adapter === "codex" ? { codexAppServer } : {}),
+    },
+  );
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
     sessions: Number.parseInt(options.sessions, 10),
@@ -1131,7 +1142,7 @@ async function startBridge(options: {
     capabilitySurface: capabilityActivation.active,
     ...(approvalGateway ? { approvalGateway } : {}),
     // Opt-in: drives Codex through app-server so the owner can be asked mid-turn.
-    ...(options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1" ? { codexAppServer: true } : {}),
+    ...(codexAppServer ? { codexAppServer: true } : {}),
     model: options.model,
     log: console.log,
   });
@@ -1183,6 +1194,10 @@ async function startBridge(options: {
       status: "ready",
       mode: capabilityActivation.active === "restricted" ? "text-only" : "full-agent",
       capabilitySurface: capabilityActivation.active,
+      capabilityGate: {
+        rollout: capabilityActivation.rollout,
+        security: capabilityActivation.security,
+      },
       adapter: selected.label,
       ...started,
     }, null, 2));
@@ -1192,6 +1207,9 @@ async function startBridge(options: {
     console.log(`     Adapter:  ${selected.label}`);
     console.log(`     Device:   ${deviceId}`);
     console.log(`     Surface:  ${capabilityActivation.active}`);
+    if (capabilityActivation.active === "full-agent") {
+      console.log("     Gate:     sandbox + approval + timeout + credential/output controls");
+    }
     console.log("     Status:   Ready for C2C collaboration");
     console.log("========================================================\n");
     console.log("Listening for incoming C2C session tasks... (Press Ctrl+C to stop)");

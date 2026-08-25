@@ -249,9 +249,16 @@ reference server you can self-host**.
 
 Receivers are chat-only by default. The owner can approve a verified peer device
 for `chat-only`, `read-project`, or `edit-project` access. Claude Code enforces
-allowed file operations per tool call; Codex uses the local bridge broker for
-allowed `Read`, `Write`, and `Edit` operations. Shell, network, browser, Git,
-package-manager, MCP, and delegated tools remain unsupported.
+allowed file operations per tool call; Codex launches a kernel-scoped permission
+profile for the selected project folders.
+
+`--capability-surface full-agent` is an explicit, evidence-gated mode. It stays
+closed until local rebuild metrics are healthy and the selected runtime has a
+kernel boundary, a live owner-approval route, and an interruptible approval path.
+In that mode, arbitrary shell is available only inside the active project boundary
+and only after owner approval. Claude can expose its wider managed tool/MCP surface
+through the same gate. Codex owner MCP/plugin configuration remains isolated until
+it can be copied as an explicit per-integration grant instead of as ambient trust.
 See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
 
 ## Develop

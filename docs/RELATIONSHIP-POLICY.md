@@ -114,8 +114,8 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 ## Enforcement
 
 - Both `principalId` and `deviceId` must match exactly.
-- Unknown, MCP, shell, delegation, web, Glob, and Grep tools deny by default.
-- The path gate recognizes only `Read`, `Write`, and `Edit`.
+- Restricted mode denies unknown, MCP, shell, delegation, and web tools by default.
+- The path gate recognizes file, search, notebook, and constrained Git operations.
 - Literal paths are resolved through the filesystem before containment checks;
   the canonical authorized path is also the path passed forward for execution.
 - A policy inside a granted folder is rejected, and the policy itself cannot be
@@ -125,11 +125,15 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 - Each Claude conversation and Codex thread binds to one communication session,
   rejects messages from a different relationship, and is released when that
   communication session is revoked or expired.
-- Claude Code exposes only `Read`, `Write`, and `Edit` and denies every call
-  that the relationship policy does not explicitly allow.
-- Codex exposes no direct relationship-policy tools; the bridge broker executes
-  only policy-authorized `Read`, `Write`, and `Edit` requests. Shell, network,
-  MCP, browser, Git, and package-manager actions remain unsupported.
+- In restricted mode, both runtimes expose only the narrow project capability
+  surface and constrained Git operations allowed by the active relationship.
+- Full-agent mode is explicit and stays closed until rebuild-health evidence,
+  kernel scoping, owner approval, and an interruptible runtime path are present.
+- Full-agent shell commands are size/timeout bounded, credential-filtered,
+  sandboxed to the selected folders, and owner-approved. Direct runtime network
+  access remains denied.
+- Claude's wider tool and MCP surface uses the same owner gate. Codex keeps the
+  owner's MCP/plugin configuration isolated pending explicit per-integration grants.
 
 The hosted control plane must include `senderDeviceId` in dispatch envelopes,
 and `requesterDeviceId` in grant responses, both derived from authenticated

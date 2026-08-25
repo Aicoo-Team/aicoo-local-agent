@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BoundaryMetricsSnapshot } from "../../src/adapters/boundary-telemetry.js";
 import {
+  evaluateCapabilitySecurity,
   evaluateCapabilityRollout,
   resolveCapabilitySurface,
 } from "../../src/shared/capability-rollout.js";
@@ -51,17 +52,73 @@ describe("full capability rollout gate", () => {
   });
 
   it("requires explicit owner activation as well as healthy evidence", () => {
-    expect(resolveCapabilitySurface("restricted", metrics())).toEqual({
+    const security = {
+      runtime: "codex" as const,
+      ownerApprovalGateway: true,
+      codexAppServer: true,
+    };
+    expect(resolveCapabilitySurface("restricted", metrics(), security)).toEqual({
       requested: "restricted",
       active: "restricted",
       rollout: expect.objectContaining({ eligible: true }),
+      security: expect.objectContaining({ eligible: true }),
     });
-    expect(resolveCapabilitySurface("full-agent", metrics())).toEqual({
+    expect(resolveCapabilitySurface("full-agent", metrics(), security)).toEqual({
       requested: "full-agent",
       active: "full-agent",
       rollout: expect.objectContaining({ eligible: true }),
+      security: expect.objectContaining({ eligible: true }),
     });
-    expect(() => resolveCapabilitySurface("full-agent", metrics({ eligibleTasks: 3 })))
+    expect(() => resolveCapabilitySurface("full-agent", metrics({ eligibleTasks: 3 }), security))
       .toThrow(/insufficient_sample/u);
+  });
+
+  it("keeps the full surface closed until the runtime has an enforceable approval gate", () => {
+    expect(evaluateCapabilitySecurity({
+      runtime: "codex",
+      ownerApprovalGateway: false,
+      codexAppServer: false,
+    })).toMatchObject({
+      eligible: false,
+      reasons: ["owner_approval_unavailable", "interactive_approval_unavailable"],
+    });
+    expect(evaluateCapabilitySecurity({
+      runtime: "fake",
+      ownerApprovalGateway: true,
+      codexAppServer: true,
+    })).toMatchObject({
+      eligible: false,
+      reasons: [
+        "kernel_boundary_unavailable",
+        "command_hardening_unavailable",
+        "execution_timeout_unavailable",
+        "credential_isolation_unavailable",
+        "output_redaction_unavailable",
+      ],
+    });
+    expect(evaluateCapabilitySecurity({
+      runtime: "claude-code",
+      ownerApprovalGateway: true,
+    })).toMatchObject({
+      eligible: true,
+      reasons: [],
+      controls: {
+        kernelBoundary: true,
+        ownerApproval: true,
+        interactiveApproval: true,
+        commandHardening: true,
+        executionTimeout: true,
+        credentialIsolation: true,
+        outputRedaction: true,
+      },
+    });
+  });
+
+  it("reports security blockers separately from rebuild-health blockers", () => {
+    expect(() => resolveCapabilitySurface("full-agent", metrics(), {
+      runtime: "codex",
+      ownerApprovalGateway: true,
+      codexAppServer: false,
+    })).toThrow(/interactive_approval_unavailable/u);
   });
 });

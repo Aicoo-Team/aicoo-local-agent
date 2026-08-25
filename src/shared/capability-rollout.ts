@@ -29,10 +29,40 @@ export interface CapabilityRolloutDecision {
 
 export type CapabilitySurface = "restricted" | "full-agent";
 
+export type CapabilitySecurityBlocker =
+  | "kernel_boundary_unavailable"
+  | "owner_approval_unavailable"
+  | "interactive_approval_unavailable"
+  | "command_hardening_unavailable"
+  | "execution_timeout_unavailable"
+  | "credential_isolation_unavailable"
+  | "output_redaction_unavailable";
+
+export interface CapabilitySecurityContext {
+  runtime: "fake" | "claude-code" | "codex";
+  ownerApprovalGateway: boolean;
+  codexAppServer?: boolean;
+}
+
+export interface CapabilitySecurityDecision {
+  eligible: boolean;
+  reasons: CapabilitySecurityBlocker[];
+  controls: {
+    kernelBoundary: boolean;
+    ownerApproval: boolean;
+    interactiveApproval: boolean;
+    commandHardening: boolean;
+    executionTimeout: boolean;
+    credentialIsolation: boolean;
+    outputRedaction: boolean;
+  };
+}
+
 export interface CapabilitySurfaceActivation {
   requested: CapabilitySurface;
   active: CapabilitySurface;
   rollout: CapabilityRolloutDecision;
+  security: CapabilitySecurityDecision;
 }
 
 /** Fail-closed evidence gate for enabling the wider C2C capability surface. */
@@ -53,14 +83,42 @@ export function evaluateCapabilityRollout(
   return { eligible: reasons.length === 0, reasons, thresholds, metrics };
 }
 
+/** Runtime checks that must be true before the wider surface is even constructed. */
+export function evaluateCapabilitySecurity(
+  context: CapabilitySecurityContext,
+): CapabilitySecurityDecision {
+  const controls = {
+    kernelBoundary: context.runtime !== "fake",
+    ownerApproval: context.ownerApprovalGateway,
+    interactiveApproval: context.runtime !== "codex" || context.codexAppServer === true,
+    commandHardening: context.runtime !== "fake",
+    executionTimeout: context.runtime !== "fake",
+    credentialIsolation: context.runtime !== "fake",
+    outputRedaction: context.runtime !== "fake",
+  };
+  const reasons: CapabilitySecurityBlocker[] = [];
+  if (!controls.kernelBoundary) reasons.push("kernel_boundary_unavailable");
+  if (!controls.ownerApproval) reasons.push("owner_approval_unavailable");
+  if (!controls.interactiveApproval) reasons.push("interactive_approval_unavailable");
+  if (!controls.commandHardening) reasons.push("command_hardening_unavailable");
+  if (!controls.executionTimeout) reasons.push("execution_timeout_unavailable");
+  if (!controls.credentialIsolation) reasons.push("credential_isolation_unavailable");
+  if (!controls.outputRedaction) reasons.push("output_redaction_unavailable");
+  return { eligible: reasons.length === 0, reasons, controls };
+}
+
 /** An explicit owner request cannot bypass unhealthy or insufficient local evidence. */
 export function resolveCapabilitySurface(
   requested: CapabilitySurface,
   metrics: BoundaryMetricsSnapshot,
+  securityContext: CapabilitySecurityContext,
 ): CapabilitySurfaceActivation {
   const rollout = evaluateCapabilityRollout(metrics);
-  if (requested === "full-agent" && !rollout.eligible) {
-    throw new Error(`full-agent capability is not ready: ${rollout.reasons.join(", ")}`);
+  const security = evaluateCapabilitySecurity(securityContext);
+  if (requested === "full-agent" && (!rollout.eligible || !security.eligible)) {
+    throw new Error(
+      `full-agent capability is not ready: ${[...rollout.reasons, ...security.reasons].join(", ")}`,
+    );
   }
-  return { requested, active: requested, rollout };
+  return { requested, active: requested, rollout, security };
 }
