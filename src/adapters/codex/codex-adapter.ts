@@ -11,13 +11,15 @@ import {
 import { parseSafeGitCommand } from "../../security/safe-git.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
+import { stableHash } from "../../shared/ids.js";
 import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from "../runtime-adapter.js";
 import { CodexExecDriver, type CodexDriver, type CodexThreadEvent, type CodexTurn, type CodexTurnStartInput } from "./driver.js";
 import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 import { writeCodexPermissionProfile } from "./permission-profile.js";
 import { createBoundaryManifest } from "../../shared/boundary-manifest.js";
-import type { ContinuationCheckpoint } from "../../shared/continuation-store.js";
+import type { ContinuationCheckpoint, ContinuationStore } from "../../shared/continuation-store.js";
 import { continuationInboundMessage } from "../../shared/continuation-message.js";
+import { requestBoundaryExpansionForTool } from "../../shared/boundary-expansion-request.js";
 
 export interface CodexAdapterConfig {
   stateFile: string;
@@ -88,6 +90,7 @@ export class CodexAdapter implements RuntimeAdapter {
   readonly #sessions = new Map<string, ManagedSession>();
   readonly #events = new EventEmitter();
   readonly #config: CodexAdapterConfig;
+  #continuationStore?: ContinuationStore;
   #closing = false;
   #closed = false;
 
@@ -101,6 +104,8 @@ export class CodexAdapter implements RuntimeAdapter {
   #approvalRoute(
     message: InboundMessage,
     sessionHandle: string,
+    runtimeTurnId: string,
+    turnCwd: string,
     sessionAccess: ProjectAccess | undefined,
   ): { onApproval?: CodexTurnStartInput["onApproval"] } {
     const gateway = this.#config.approvalGateway;
@@ -120,6 +125,7 @@ export class CodexAdapter implements RuntimeAdapter {
           return "decline";
         }
         let boundaryAllowed = false;
+        let outsideAction: { toolName: string; input: Record<string, unknown> } | undefined;
         try {
           const policy = this.relationshipPolicy();
           const actions = gitOperation
@@ -127,26 +133,52 @@ export class CodexAdapter implements RuntimeAdapter {
             : request.kind === "fileChange" && request.paths?.length
               ? request.paths.map((path) => ({ toolName: "Edit", input: { file_path: path } }))
               : [];
-          boundaryAllowed = actions.length > 0 && actions.every((action) => {
+          boundaryAllowed = actions.length > 0;
+          for (const action of actions) {
             const boundary = policy.authorizeBoundary(action, message);
-            if (boundary.behavior !== "allow") return false;
+            if (boundary.behavior !== "allow") {
+              boundaryAllowed = false;
+              outsideAction = action;
+              break;
+            }
             const boundaryInput = boundary.updatedInput ?? action.input;
             if (!projectAccessAllowsAction(sessionAccess, {
               toolName: action.toolName,
               input: boundaryInput,
-            })) return false;
+            })) {
+              boundaryAllowed = false;
+              outsideAction = { toolName: action.toolName, input: boundaryInput };
+              break;
+            }
             const canonicalRepository = "repository" in boundaryInput
               ? boundaryInput.repository
               : undefined;
             if (gitOperation && typeof canonicalRepository === "string") {
               gitOperation.repository = canonicalRepository;
             }
-            return true;
-          });
+          }
         } catch {
           boundaryAllowed = false;
         }
         if (!boundaryAllowed) {
+          if (outsideAction && this.#continuationStore) {
+            const expansion = await requestBoundaryExpansionForTool({
+              store: this.#continuationStore,
+              gateway,
+              message,
+              sessionHandle,
+              runtimeTurnId,
+              attemptId: stableHash({ runtimeTurnId, request }),
+              toolName: outsideAction.toolName,
+              toolInput: outsideAction.input,
+              cwd: turnCwd,
+              summary: gitOperation?.summary ?? request.summary,
+              log: this.#config.log,
+            });
+            if (expansion?.state === "approved_pending_activation") {
+              this.#config.log?.("codex boundary expansion approved; rebuilding before task continuation");
+            }
+          }
           this.#config.log?.("codex approval denied: request is outside the active session boundary");
           return "decline";
         }
@@ -205,6 +237,27 @@ export class CodexAdapter implements RuntimeAdapter {
     }
     this.loadOrCreateSessions(config.sessionCount ?? 1);
     this.#events.setMaxListeners(100);
+  }
+
+  configureContinuationStore(store: ContinuationStore): void {
+    this.#continuationStore = store;
+  }
+
+  async canActivateContinuation(checkpoint: ContinuationCheckpoint): Promise<boolean> {
+    try {
+      this.continuationSession(checkpoint);
+      const message = continuationInboundMessage(checkpoint);
+      const access = this.relationshipPolicy().accessFor(message);
+      return Boolean(
+        access.status === "selected"
+        && checkpoint.approvedCanonicalFolder
+        && access.folders.includes(checkpoint.approvedCanonicalFolder)
+        && checkpoint.grantId
+        && access.selectedPolicyIds?.includes(checkpoint.grantId),
+      );
+    } catch {
+      return false;
+    }
   }
 
   async initialize(): Promise<void> {
@@ -350,16 +403,17 @@ export class CodexAdapter implements RuntimeAdapter {
     const runtimeTurnId = randomUUID();
     const projectAccessPreset = accessPreset === "chat-only" ? undefined : accessPreset;
     const hasProjectAccess = Boolean(permissionProfile && projectAccessPreset) && !contextOnly;
+    const turnCwd = hasProjectAccess ? grantedFolders[0]! : this.#config.cwd;
     const turn = this.#driver.startTurn({
       prompt: hasProjectAccess
         ? formatSandboxedRequest(message, projectAccessPreset!, grantedFolders)
         : formatInbound(message, contextOnly),
-      cwd: hasProjectAccess ? grantedFolders[0]! : this.#config.cwd,
+      cwd: turnCwd,
       ...(hasProjectAccess ? { permissionProfile } : {}),
       ...(session.providerThreadId ? { resumeThreadId: session.providerThreadId } : {}),
       ...(this.#config.codexPath ? { codexPath: this.#config.codexPath } : {}),
       ...(this.#config.model ? { model: this.#config.model } : {}),
-      ...this.#approvalRoute(message, session.localHandle, hasProjectAccess ? {
+      ...this.#approvalRoute(message, session.localHandle, runtimeTurnId, turnCwd, hasProjectAccess ? {
         status: "selected",
         preset: projectAccessPreset!,
         folders: grantedFolders,
@@ -452,6 +506,7 @@ export class CodexAdapter implements RuntimeAdapter {
       || !checkpoint.approvedCanonicalFolder
       || !access.folders.includes(checkpoint.approvedCanonicalFolder)
       || !checkpoint.grantId
+      || !access.selectedPolicyIds?.includes(checkpoint.grantId)
       || checkpoint.grantRevision === undefined
       || !checkpoint.approvedAccessPreset
       || !this.#config.bridgeInstanceId

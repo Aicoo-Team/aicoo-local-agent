@@ -18,6 +18,7 @@ export function continuationInboundMessage(checkpoint: ContinuationCheckpoint): 
   }
   const approvedFolder = checkpoint.approvedCanonicalFolder;
   if (!approvedFolder) throw new Error("continuation has no approved folder");
+  if (!checkpoint.grantId) throw new Error("continuation has no approved grant");
   const selectors = projectAccessSelectors(original as InboundMessage);
   const originalTask = original.payload.task;
   const taskRecord = originalTask && typeof originalTask === "object" && !Array.isArray(originalTask)
@@ -34,7 +35,7 @@ export function continuationInboundMessage(checkpoint: ContinuationCheckpoint): 
       ...original.payload,
       task: {
         ...taskRecord,
-        projectAccessIds: [...new Set([...selectors, approvedFolder])].sort(),
+        projectAccessIds: [...new Set([...selectors, checkpoint.grantId, approvedFolder])].sort(),
         continuation: {
           continuationId: checkpoint.continuationId,
           grantId: checkpoint.grantId,

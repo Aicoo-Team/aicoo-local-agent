@@ -33,6 +33,10 @@ export class ContinuationRecovery {
       }
       this.#inFlight.add(checkpoint.continuationId);
       try {
+        if (
+          this.adapter.canActivateContinuation
+          && !(await this.adapter.canActivateContinuation(checkpoint))
+        ) return;
         const result = await this.#coordinator.execute(checkpoint.continuationId, {
           quiesce: (current) => quiesceContinuation.call(this.adapter, current),
           rebuildAndAttest: async (current) => {

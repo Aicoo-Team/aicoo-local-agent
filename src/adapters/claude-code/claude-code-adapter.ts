@@ -20,8 +20,9 @@ import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-a
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
 import { createBoundaryManifest } from "../../shared/boundary-manifest.js";
-import type { ContinuationCheckpoint } from "../../shared/continuation-store.js";
+import type { ContinuationCheckpoint, ContinuationStore } from "../../shared/continuation-store.js";
 import { continuationInboundMessage } from "../../shared/continuation-message.js";
+import { requestBoundaryExpansionForTool } from "../../shared/boundary-expansion-request.js";
 import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from "../runtime-adapter.js";
 import {
   OfficialClaudeAgentDriver,
@@ -117,6 +118,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   readonly #events = new EventEmitter();
   readonly #config: ClaudeCodeAdapterConfig;
   readonly #boundaryTelemetry: BoundaryTelemetry;
+  #continuationStore?: ContinuationStore;
   #initialized = false;
   #closing = false;
   #closed = false;
@@ -171,6 +173,27 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       if (session.state !== "closed") await this.startSession(session);
     }
     this.#initialized = true;
+  }
+
+  configureContinuationStore(store: ContinuationStore): void {
+    this.#continuationStore = store;
+  }
+
+  async canActivateContinuation(checkpoint: ContinuationCheckpoint): Promise<boolean> {
+    try {
+      this.continuationSession(checkpoint);
+      const message = continuationInboundMessage(checkpoint);
+      const access = this.relationshipPolicy()?.accessFor(message);
+      return Boolean(
+        access?.status === "selected"
+        && checkpoint.approvedCanonicalFolder
+        && access.folders.includes(checkpoint.approvedCanonicalFolder)
+        && checkpoint.grantId
+        && access.selectedPolicyIds?.includes(checkpoint.grantId),
+      );
+    } catch {
+      return false;
+    }
   }
 
   async close(): Promise<void> {
@@ -450,6 +473,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       || !checkpoint.approvedCanonicalFolder
       || !access.folders.includes(checkpoint.approvedCanonicalFolder)
       || !checkpoint.grantId
+      || !access.selectedPolicyIds?.includes(checkpoint.grantId)
       || checkpoint.grantRevision === undefined
       || !checkpoint.approvedAccessPreset
       || !this.#config.bridgeInstanceId
@@ -652,6 +676,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const resolveToolDecision = async (
       toolName: string,
       input: Record<string, unknown>,
+      attemptId: string,
     ): Promise<{ behavior: "allow" | "deny"; message?: string; updatedInput?: Record<string, unknown> }> => {
       const activeMessage = session.acceptedTurns[0]?.message;
       if (!this.#config.relationshipPolicyFile) {
@@ -680,9 +705,27 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           activeMessage,
         );
         if (boundary.behavior !== "allow") {
+          const activeTurn = session.acceptedTurns[0];
+          const expansion = activeMessage && activeTurn && this.#continuationStore && this.#config.approvalGateway
+            ? await requestBoundaryExpansionForTool({
+                store: this.#continuationStore,
+                gateway: this.#config.approvalGateway,
+                message: activeMessage,
+                sessionHandle: session.localHandle,
+                runtimeTurnId: activeTurn.runtimeTurnId,
+                attemptId,
+                toolName: effectiveToolName,
+                toolInput: effectiveInput,
+                cwd: additionalDirectories[0] ?? this.#config.cwd,
+                summary: gitOperation?.summary ?? summarizeToolInput(toolName, input),
+                log: this.#config.log,
+              })
+            : undefined;
           return {
             behavior: "deny",
-            message: "This request is outside the active session boundary. Select or grant the folder before starting the task.",
+            message: expansion?.state === "approved_pending_activation"
+              ? "The folder was approved. Aicoo is rebuilding the session and will resume the task."
+              : "This request is outside the active session boundary. Select or grant the folder before starting the task.",
           };
         }
         const boundaryInput = boundary.updatedInput ?? effectiveInput;
@@ -690,9 +733,27 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           toolName: effectiveToolName,
           input: boundaryInput,
         })) {
+          const activeTurn = session.acceptedTurns[0];
+          const expansion = activeMessage && activeTurn && this.#continuationStore && this.#config.approvalGateway
+            ? await requestBoundaryExpansionForTool({
+                store: this.#continuationStore,
+                gateway: this.#config.approvalGateway,
+                message: activeMessage,
+                sessionHandle: session.localHandle,
+                runtimeTurnId: activeTurn.runtimeTurnId,
+                attemptId,
+                toolName: effectiveToolName,
+                toolInput: boundaryInput,
+                cwd: additionalDirectories[0] ?? this.#config.cwd,
+                summary: gitOperation?.summary ?? summarizeToolInput(toolName, input),
+                log: this.#config.log,
+              })
+            : undefined;
           return {
             behavior: "deny",
-            message: "This request is outside the active session boundary. Select or grant the folder before starting the task.",
+            message: expansion?.state === "approved_pending_activation"
+              ? "The folder was approved. Aicoo is rebuilding the session and will resume the task."
+              : "This request is outside the active session boundary. Select or grant the folder before starting the task.",
           };
         }
         if (gitOperation) {
@@ -789,6 +850,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
             const decision = await resolveToolDecision(
               preToolUse.tool_name,
               (preToolUse.tool_input ?? {}) as Record<string, unknown>,
+              preToolUse.tool_use_id,
             );
             return {
               continue: true,
@@ -803,8 +865,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           }],
         }],
       },
-      canUseTool: async (toolName, input) => {
-        const decision = await resolveToolDecision(toolName, input);
+      canUseTool: async (toolName, input, context) => {
+        const decision = await resolveToolDecision(toolName, input, context.toolUseID);
         return decision.behavior === "allow"
           ? { behavior: "allow" as const, ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}) }
           : {

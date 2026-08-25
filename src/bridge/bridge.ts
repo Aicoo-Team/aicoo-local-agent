@@ -70,8 +70,10 @@ export class RuntimeBridge {
 
   constructor(private readonly options: BridgeOptions) {
     this.#bridgeInstanceId = options.bridgeInstanceId ?? id("bridge");
+    const continuationStore = new ContinuationStore(options.spool.db);
+    options.adapter.configureContinuationStore?.(continuationStore);
     this.#continuationRecovery = new ContinuationRecovery(
-      new ContinuationStore(options.spool.db),
+      continuationStore,
       options.adapter,
       options.log,
     );
@@ -182,6 +184,7 @@ export class RuntimeBridge {
       this.runPendingDelegations(),
       this.runOutboundReplies(),
       this.runTrustedToolUsageReports(),
+      this.runContinuationRecovery(),
       ...this.options.spool.listSessionMappings().map(({ nativeHandle, serverHandle }) =>
         this.runAdapterEvents(nativeHandle, serverHandle)),
     ];
@@ -289,6 +292,17 @@ export class RuntimeBridge {
     while (!this.#controller.signal.aborted) {
       await this.flushTrustedToolUsageReports();
       await delay(1_000, this.#controller.signal);
+    }
+  }
+
+  private async runContinuationRecovery(): Promise<void> {
+    while (!this.#controller.signal.aborted) {
+      try {
+        await this.#continuationRecovery.recover();
+      } catch (error) {
+        this.options.log?.(`[bridge] continuation recovery deferred: ${String(error)}`);
+      }
+      await delay(250, this.#controller.signal);
     }
   }
 

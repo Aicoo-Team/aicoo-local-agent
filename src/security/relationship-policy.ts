@@ -571,6 +571,25 @@ export function projectAccessAllowsAction(
   return paths.every((candidate) => allowedFolders.some((folder) => isWithin(folder, candidate)));
 }
 
+/** Resolve one safe filesystem target for an owner-facing boundary expansion request. */
+export function canonicalToolResourceForApproval(
+  action: { toolName: string; input: Record<string, unknown> },
+  cwd: string,
+): string | undefined {
+  const pathKeys = PATH_INPUTS[action.toolName as keyof typeof PATH_INPUTS];
+  if (!pathKeys) return undefined;
+  const value = pathKeys
+    .map((key) => action.input[key])
+    .find((candidate): candidate is string => typeof candidate === "string" && Boolean(candidate.trim()));
+  if (!value) return undefined;
+  try {
+    const candidate = canonicalPath(toLiteralAbsolute(cwd, value));
+    return dangerousPathDecision(action.toolName, candidate) ? undefined : candidate;
+  } catch {
+    return undefined;
+  }
+}
+
 function presetForTools(tools: ReadonlySet<string>): RelationshipAccessPreset {
   if (["Write", "Edit", "GitAdd", "GitCommit"].some((tool) => tools.has(tool))) return "edit-project";
   if (["Read", "GitStatus", "GitDiff", "GitLog"].some((tool) => tools.has(tool))) return "read-project";

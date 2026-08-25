@@ -95,4 +95,22 @@ describe("bridge continuation recovery", () => {
     });
     expect(store.find(other.continuationId)?.state).toBe("resuming");
   });
+
+  it("waits for the exact local grant before rebuilding an approved continuation", async () => {
+    const store = new ContinuationStore(new DatabaseSync(":memory:"));
+    const checkpoint = approved(store);
+    const runtime = adapter();
+    let locallyActive = false;
+    runtime.canActivateContinuation = vi.fn(async () => locallyActive);
+    const recovery = new ContinuationRecovery(store, runtime);
+
+    await recovery.recover();
+    expect(runtime.rebuildContinuation).not.toHaveBeenCalled();
+    expect(store.find(checkpoint.continuationId)?.state).toBe("approved_pending_activation");
+
+    locallyActive = true;
+    await recovery.recover();
+    expect(runtime.rebuildContinuation).toHaveBeenCalledOnce();
+    expect(store.find(checkpoint.continuationId)?.state).toBe("resuming");
+  });
 });

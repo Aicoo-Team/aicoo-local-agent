@@ -1,9 +1,12 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/claude-code-adapter.js";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
+import { ContinuationStore } from "../../src/shared/continuation-store.js";
+import { upsertTrustedToolPolicy } from "../../src/security/trusted-tool-policy.js";
 import { FakeClaudeAgentDriver } from "../helpers/fake-claude-driver.js";
 
 describe("ClaudeCodeAdapter managed sessions", () => {
@@ -223,6 +226,87 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(asked).toEqual(["Read", "Edit"]);
   });
 
+  it("creates a durable rebuild continuation for an out-of-boundary file request", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-boundary-expansion-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const outside = join(directory, "outside");
+    mkdirSync(project);
+    mkdirSync(outside);
+    const requestedFile = join(outside, "README.md");
+    writeFileSync(requestedFile, "outside project");
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [project],
+      }],
+    }));
+    const requests: Array<Record<string, unknown>> = [];
+    const driver = new FakeClaudeAgentDriver();
+    driver.resultDelayMs = 5_000;
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          requests.push(input as unknown as Record<string, unknown>);
+          return {
+            approvalId: "appr_expand",
+            status: "allow",
+            decision: "allow",
+            activation: {
+              grantId: "grant_expand",
+              grantRevision: 2,
+              canonicalFolder: realpathSync.native(outside),
+              accessPreset: "read-project",
+              expectedBoundaryManifestHash: "manifest_expand",
+            },
+          };
+        },
+        async getToolApproval() {
+          return { status: "pending", decision: null };
+        },
+      },
+    });
+    const store = new ContinuationStore(new DatabaseSync(":memory:"));
+    adapter.configureContinuationStore(store);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    await adapter.deliverToSession("claude-managed-1", inbound("msg_expand"), "new_turn");
+
+    const decision = await driver.starts.at(-1)!.options.canUseTool?.(
+      "Read",
+      { file_path: requestedFile },
+      { signal: new AbortController().signal, toolUseID: "t1", requestId: "r1" },
+    );
+
+    expect(decision).toMatchObject({ behavior: "deny" });
+    expect(requests).toEqual([expect.objectContaining({
+      communicationSessionId: "comm_1",
+      sessionHandle: "claude-managed-1",
+      messageId: "msg_expand",
+      boundaryExpansion: expect.objectContaining({
+        attemptId: "t1",
+        canonicalResource: realpathSync.native(requestedFile),
+        requestedAccessPreset: "read-project",
+        requiresSessionRebuild: true,
+      }),
+    })]);
+    expect(store.list()).toEqual([expect.objectContaining({
+      state: "approved_pending_activation",
+      messageId: "msg_expand",
+      runtimeTurnId: expect.any(String),
+      approvedCanonicalFolder: realpathSync.native(outside),
+    })]);
+  });
+
   it("injects a remote reply as context-only and does not create an automatic reply loop", async () => {
     const driver = new FakeClaudeAgentDriver();
     const adapter = makeAdapter(driver);
@@ -394,6 +478,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     mkdirSync(second);
     mkdirSync(config);
     const policyFile = join(config, "relationships.json");
+    const trustedToolPolicyFile = join(config, "trusted-tools.json");
     writeFileSync(policyFile, JSON.stringify({
       version: 1,
       relationships: [{
@@ -403,12 +488,30 @@ describe("ClaudeCodeAdapter managed sessions", () => {
         folders: [first, second],
       }],
     }));
+    upsertTrustedToolPolicy({
+      file: trustedToolPolicyFile,
+      policyId: "grant_2",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      requesterPrincipalId: "prn_a",
+      requesterDeviceId: "device-a1",
+      folder: second,
+      accessPreset: "read-project",
+      scope: "bridge_run",
+      bridgeInstanceId: "bridge_1",
+      createdFrom: "approval_prompt",
+      createdBy: "prn_b",
+      serverRevision: 2,
+    });
     const driver = new FakeClaudeAgentDriver("resumed answer");
     driver.resultDelayMs = 50;
     const adapter = new ClaudeCodeAdapter({
       stateFile: ":memory:",
       cwd: directory,
       relationshipPolicyFile: policyFile,
+      trustedToolPolicyFile,
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
       bridgeInstanceId: "bridge_1",
       driver,
       turnAckTimeoutMs: 500,

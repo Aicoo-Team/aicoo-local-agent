@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { BoundaryExpansionCoordinator } from "../../src/shared/boundary-expansion.js";
+import { requestBoundaryExpansionForTool } from "../../src/shared/boundary-expansion-request.js";
 import { ContinuationStore } from "../../src/shared/continuation-store.js";
 
 const base = {
@@ -96,5 +97,47 @@ describe("boundary expansion coordinator", () => {
       state: "activation_failed",
       errorCode: "approved_boundary_does_not_cover_request",
     });
+  });
+
+  it("never offers a boundary expansion for credential files", async () => {
+    const store = new ContinuationStore(new DatabaseSync(":memory:"));
+    let asked = false;
+    const result = await requestBoundaryExpansionForTool({
+      store,
+      gateway: {
+        async requestToolApproval() {
+          asked = true;
+          return { approvalId: "must_not_ask", status: "pending", decision: null };
+        },
+        async getToolApproval() {
+          return { status: "pending", decision: null };
+        },
+      },
+      message: {
+        id: "msg_secret",
+        clientMessageId: "client_secret",
+        communicationSessionId: "comm_secret",
+        senderPrincipalId: "prn_a",
+        senderDeviceId: "device_a",
+        target: { kind: "runtime_session", principalId: "prn_b", endpointId: "ep_b", sessionHandle: "rs_b" },
+        kind: "task_invite",
+        payload: { task: { text: "Read .env" } },
+        sequence: 1,
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        trust: "untrusted_external_content",
+      },
+      sessionHandle: "claude-managed-1",
+      runtimeTurnId: "turn_secret",
+      attemptId: "tool_secret",
+      toolName: "Read",
+      toolInput: { file_path: "/srv/project/.env" },
+      cwd: "/srv/project",
+      summary: "Read /srv/project/.env",
+    });
+
+    expect(result).toBeUndefined();
+    expect(asked).toBe(false);
+    expect(store.list()).toEqual([]);
   });
 });

@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CodexAdapter } from "../../src/adapters/codex/codex-adapter.js";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
 import { upsertRelationshipPreset } from "../../src/security/relationship-policy.js";
+import { ContinuationStore } from "../../src/shared/continuation-store.js";
+import { upsertTrustedToolPolicy } from "../../src/security/trusted-tool-policy.js";
 import { FakeCodexDriver } from "../helpers/fake-codex-driver.js";
 
 describe("CodexAdapter managed sessions", () => {
@@ -102,6 +104,83 @@ describe("CodexAdapter managed sessions", () => {
       paths: ["/srv/outside.ts"],
     })).resolves.toBe("decline");
     expect(asked).toEqual(["GitStatus"]);
+  });
+
+  it("creates a durable rebuild continuation for an out-of-boundary file change", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-boundary-expansion-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const outside = join(directory, "outside");
+    mkdirSync(project);
+    mkdirSync(outside);
+    const requestedFile = join(outside, "index.ts");
+    writeFileSync(requestedFile, "export {};");
+    const policyFile = join(directory, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "edit-project",
+      folder: project,
+    });
+    const requests: Array<Record<string, unknown>> = [];
+    const driver = new FakeCodexDriver("done");
+    driver.resultDelayMs = 5_000;
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          requests.push(input as unknown as Record<string, unknown>);
+          return {
+            approvalId: "appr_expand",
+            status: "allow",
+            decision: "allow",
+            activation: {
+              grantId: "grant_expand",
+              grantRevision: 2,
+              canonicalFolder: realpathSync.native(outside),
+              accessPreset: "edit-project",
+              expectedBoundaryManifestHash: "manifest_expand",
+            },
+          };
+        },
+        async getToolApproval() {
+          return { status: "pending", decision: null };
+        },
+      },
+    });
+    const store = new ContinuationStore(new DatabaseSync(":memory:"));
+    adapter.configureContinuationStore(store);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_expand"), "new_turn");
+
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "fileChange",
+      summary: `Modify: ${requestedFile}`,
+      paths: [requestedFile],
+    })).resolves.toBe("decline");
+
+    expect(requests).toEqual([expect.objectContaining({
+      communicationSessionId: "comm_1",
+      sessionHandle: "codex-managed-1",
+      messageId: "msg_expand",
+      boundaryExpansion: expect.objectContaining({
+        canonicalResource: realpathSync.native(requestedFile),
+        requestedAccessPreset: "edit-project",
+        requiresSessionRebuild: true,
+      }),
+    })]);
+    expect(store.list()).toEqual([expect.objectContaining({
+      state: "approved_pending_activation",
+      messageId: "msg_expand",
+      runtimeTurnId: expect.any(String),
+      approvedCanonicalFolder: realpathSync.native(outside),
+    })]);
   });
 
   it("turns a read-project relationship preset into a Codex sandbox profile", async () => {
@@ -253,6 +332,7 @@ describe("CodexAdapter managed sessions", () => {
     mkdirSync(second);
     mkdirSync(config);
     const policyFile = join(config, "relationships.json");
+    const trustedToolPolicyFile = join(config, "trusted-tools.json");
     writeFileSync(policyFile, JSON.stringify({
       version: 1,
       relationships: [{
@@ -262,12 +342,30 @@ describe("CodexAdapter managed sessions", () => {
         folders: [first, second],
       }],
     }));
+    upsertTrustedToolPolicy({
+      file: trustedToolPolicyFile,
+      policyId: "grant_2",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      requesterPrincipalId: "prn_a",
+      requesterDeviceId: "device_a",
+      folder: second,
+      accessPreset: "read-project",
+      scope: "bridge_run",
+      bridgeInstanceId: "bridge_1",
+      createdFrom: "approval_prompt",
+      createdBy: "prn_b",
+      serverRevision: 2,
+    });
     const driver = new FakeCodexDriver("resumed answer");
     driver.resultDelayMs = 50;
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
       cwd: directory,
       relationshipPolicyFile: policyFile,
+      trustedToolPolicyFile,
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
       bridgeInstanceId: "bridge_1",
       driver,
       turnAckTimeoutMs: 500,
