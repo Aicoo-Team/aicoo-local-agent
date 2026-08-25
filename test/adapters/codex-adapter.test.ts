@@ -6,7 +6,10 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { CodexAdapter } from "../../src/adapters/codex/codex-adapter.js";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
-import { upsertRelationshipPreset } from "../../src/security/relationship-policy.js";
+import {
+  setRelationshipMcpGrants,
+  upsertRelationshipPreset,
+} from "../../src/security/relationship-policy.js";
 import { ContinuationStore } from "../../src/shared/continuation-store.js";
 import { upsertTrustedToolPolicy } from "../../src/security/trusted-tool-policy.js";
 import { FakeCodexDriver } from "../helpers/fake-codex-driver.js";
@@ -121,6 +124,16 @@ describe("CodexAdapter managed sessions", () => {
       preset: "edit-project",
       folder: project,
     });
+    setRelationshipMcpGrants({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      grants: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["read", "search"],
+      }],
+    });
     const driver = new FakeCodexDriver("token ghp_abcdefghijklmnopqrstuvwxyz123456");
     driver.resultDelayMs = 100;
     const asked: string[] = [];
@@ -153,6 +166,12 @@ describe("CodexAdapter managed sessions", () => {
       summary: "Run: npm test",
     })).resolves.toBe("acceptForSession");
     expect(driver.turns[0]?.writableRoots).toEqual([realpathSync.native(project)]);
+    const fullProfile = readFileSync(
+      join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"),
+      "utf8",
+    );
+    expect(fullProfile).toContain('[mcp_servers."docs"]');
+    expect(fullProfile).toContain('enabled_tools = ["read", "search"]');
     expect(asked).toEqual(["Bash"]);
 
     await expect(driver.turns[0]!.onApproval?.({
@@ -270,6 +289,12 @@ describe("CodexAdapter managed sessions", () => {
       preset: "read-project",
       folder: project,
     });
+    setRelationshipMcpGrants({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      grants: [{ name: "docs", url: "https://mcp.example.com/v1", enabledTools: ["read"] }],
+    });
     const driver = new FakeCodexDriver("README says to run npm test.");
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
@@ -300,6 +325,7 @@ describe("CodexAdapter managed sessions", () => {
     expect(profile).toContain("Aicoo c2c relationship (read-project)");
     expect(profile).toContain('extends = ":read-only"');
     expect(profile).toContain(`${JSON.stringify(realpathSync.native(project))} = true`);
+    expect(profile).not.toContain("[mcp_servers.");
   });
 
   it("fails closed for ambiguous projects and uses the explicitly selected folder", async () => {

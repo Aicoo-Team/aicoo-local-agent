@@ -76,6 +76,28 @@ describe("codex permission profile", () => {
     expect(profile).toContain('"*SECRET*"');
   });
 
+  it("adds only explicitly granted remote MCP tools to the private Codex home", () => {
+    const profile = renderCodexPermissionProfile({
+      preset: "read-project",
+      folders: ["/srv/p"],
+      mcpServers: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["search", "read"],
+        bearerTokenEnvVar: "DOCS_AUTH",
+      }],
+    })!;
+    expect(profile).toContain('mcp_oauth_credentials_store = "file"');
+    expect(profile).toContain('[history]\npersistence = "none"');
+    expect(profile).toContain('[memories]\ndisable_on_external_context = true');
+    expect(profile).toContain('[mcp_servers."docs"]');
+    expect(profile).toContain('enabled_tools = ["read", "search"]');
+    expect(profile).toContain('[mcp_servers."docs".tools."read"]\napproval_mode = "approve"');
+    expect(profile).toContain('"DOCS_AUTH"');
+    expect(profile).not.toContain("command =");
+    expect(profile).not.toContain("http_headers");
+  });
+
   it("writes a private CODEX_HOME so the owner's own config cannot leak in", () => {
     const dir = tempDir("codex-profile-");
     const authFile = join(dir, "source-auth.json");
@@ -173,6 +195,25 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
 
     const network = probe(codexHome, granted, ["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", "https://example.com"]);
     expect(network.ok && /^[23]\d\d$/.test(network.output.trim()), "network egress must be refused").toBe(false);
+  });
+
+  it("accepts the generated remote MCP policy as valid Codex configuration", () => {
+    const root = mkdtempSync(join(homedir(), ".aicoo-mcp-config-test-"));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const granted = join(root, "granted");
+    mkdirSync(granted);
+    const prepared = writeCodexPermissionProfile(join(root, "codexhome"), {
+      preset: "read-project",
+      folders: [granted],
+      mcpServers: [{
+        name: "local_docs",
+        url: "http://127.0.0.1:43177/mcp",
+        enabledTools: ["read", "search"],
+      }],
+    })!;
+
+    const result = probe(prepared.codexHome, granted, ["true"]);
+    expect(result.ok, `Codex rejected the generated MCP profile: ${result.output}`).toBe(true);
   });
 });
 

@@ -26,6 +26,11 @@ import {
   type TrustedToolPolicy,
   type TrustedToolPolicyIdentity,
 } from "./trusted-tool-policy.js";
+import {
+  parseRemoteMcpGrants,
+  remoteMcpGrantsSchema,
+  type RemoteMcpGrant,
+} from "./mcp-capability-grant.js";
 
 const policySchema = z.object({
   version: z.literal(1),
@@ -34,6 +39,7 @@ const policySchema = z.object({
     deviceId: z.string().trim().min(1),
     tools: z.array(z.string().trim().min(1)).default([]),
     folders: z.array(z.string().trim().min(1)).default([]),
+    mcpServers: remoteMcpGrantsSchema.optional(),
   }).strict()),
 }).strict();
 
@@ -65,6 +71,7 @@ interface CompiledRelationship {
   deviceId: string;
   tools: ReadonlySet<string>;
   folders: readonly string[];
+  mcpServers: readonly RemoteMcpGrant[];
 }
 
 interface RelationshipPolicyOptions extends Partial<TrustedToolPolicyIdentity> {
@@ -150,6 +157,7 @@ export class RelationshipPolicy {
       tools: new Set(relationship.tools),
       folders: relationship.folders.map((folder) =>
         canonicalPath(toLiteralAbsolute(cwd, folder))),
+      mcpServers: parseRemoteMcpGrants(relationship.mcpServers ?? []),
     }));
     for (const relationship of this.#relationships) {
       for (const folder of relationship.folders) {
@@ -206,6 +214,13 @@ export class RelationshipPolicy {
         .map((policy) => policy.canonicalFolder),
     ])]
       .sort();
+  }
+
+  /** Exact remote MCP grants for this verified device, usable only with an active project boundary. */
+  mcpServersFor(message: InboundMessage | undefined): RemoteMcpGrant[] {
+    if (!message?.senderDeviceId || this.accessFor(message).status !== "selected") return [];
+    return parseRemoteMcpGrants(this.relationshipsFor(message).flatMap((relationship) =>
+      relationship.mcpServers));
   }
 
   sandboxDenyReadPaths(): string[] {
@@ -661,6 +676,7 @@ export function upsertRelationshipPolicy(input: {
   deviceId: string;
   tools: readonly string[];
   folders: readonly string[];
+  mcpServers?: readonly RemoteMcpGrant[];
 }): RelationshipPolicyDocument {
   const unsupported = input.tools.find((tool) => !POLICY_SUPPORTED_TOOL_SET.has(tool));
   if (unsupported) throw new Error(`Unsupported relationship tool ${unsupported}`);
@@ -678,11 +694,15 @@ export function upsertRelationshipPolicy(input: {
       throw new Error("Relationship policy must be stored outside the granted folder");
     }
   }
+  const previous = existing.relationships.find((relationship) =>
+    relationship.principalId === input.principalId && relationship.deviceId === input.deviceId);
+  const mcpServers = parseRemoteMcpGrants(input.mcpServers ?? previous?.mcpServers ?? []);
   const nextRelationship: RelationshipPolicyDocument["relationships"][number] = {
     principalId: input.principalId,
     deviceId: input.deviceId,
     tools: [...new Set(input.tools)].sort(),
     folders: canonicalFolders.sort(),
+    ...(mcpServers.length > 0 ? { mcpServers } : {}),
   };
   const relationships = existing.relationships.filter((relationship) =>
     relationship.principalId !== input.principalId || relationship.deviceId !== input.deviceId);
@@ -693,6 +713,26 @@ export function upsertRelationshipPolicy(input: {
   const document: RelationshipPolicyDocument = { version: 1, relationships };
   writePolicyDocument(input.file, document);
   return document;
+}
+
+/** Replace one verified peer device's MCP grants without changing its project access preset. */
+export function setRelationshipMcpGrants(input: {
+  file: string;
+  principalId: string;
+  deviceId: string;
+  grants: unknown;
+}): RelationshipPolicyDocument {
+  const existing = readPolicyDocument(input.file);
+  const relationship = existing.relationships.find((candidate) =>
+    candidate.principalId === input.principalId && candidate.deviceId === input.deviceId);
+  return upsertRelationshipPolicy({
+    file: input.file,
+    principalId: input.principalId,
+    deviceId: input.deviceId,
+    tools: relationship?.tools ?? [],
+    folders: relationship?.folders ?? [],
+    mcpServers: parseRemoteMcpGrants(input.grants),
+  });
 }
 
 function readPolicyDocument(file: string): RelationshipPolicyDocument {

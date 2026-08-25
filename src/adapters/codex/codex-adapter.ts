@@ -399,6 +399,9 @@ export class CodexAdapter implements RuntimeAdapter {
             preset: accessPreset,
             folders: grantedFolders,
             writableFolders,
+            ...(this.#config.capabilitySurface === "full-agent"
+              ? { mcpServers: policy.mcpServersFor(message) }
+              : {}),
           });
         }
       } catch (error) {
@@ -538,6 +541,9 @@ export class CodexAdapter implements RuntimeAdapter {
       preset: access.preset,
       folders: access.folders,
       writableFolders: access.writableFolders,
+      ...(this.#config.capabilitySurface === "full-agent"
+        ? { mcpServers: this.relationshipPolicy().mcpServersFor(message) }
+        : {}),
     })) throw new Error("approved boundary could not produce a Codex permission profile");
     session.providerThreadId = undefined;
     this.#db.prepare(

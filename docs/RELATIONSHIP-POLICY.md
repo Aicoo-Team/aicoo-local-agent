@@ -102,7 +102,17 @@ The generated file is ordinary JSON for auditability and advanced editing:
       "principalId": "USER_UUID",
       "deviceId": "VERIFIED_DEVICE_ID",
       "tools": ["Read"],
-      "folders": ["/path/to/project"]
+      "folders": ["/path/to/project"],
+      "mcpServers": [
+        {
+          "name": "docs",
+          "url": "https://mcp.example.com/v1",
+          "enabledTools": ["read", "search"],
+          "bearerTokenEnvVar": "DOCS_MCP_TOKEN",
+          "startupTimeoutSec": 10,
+          "toolTimeoutSec": 60
+        }
+      ]
     }
   ]
 }
@@ -133,7 +143,16 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
   sandboxed to the selected folders, and owner-approved. Direct runtime network
   access remains denied.
 - Claude's wider tool and MCP surface uses the same owner gate. Codex keeps the
-  owner's MCP/plugin configuration isolated pending explicit per-integration grants.
+  owner's ambient MCP/plugin configuration isolated.
+- Codex MCP access requires full-agent mode, an active project boundary, an exact
+  verified user+device grant, an exact remote URL, and at least one named tool.
+- Only HTTPS and exact loopback HTTP endpoints are accepted. URLs containing
+  credentials, queries, or fragments are rejected, as are stdio commands and
+  static headers. Authentication may reference one explicitly named environment
+  variable without writing its value into the generated configuration.
+- The generated private Codex home disables conversation history and memory
+  generation for external context, uses a private file OAuth store, hides every
+  unlisted MCP tool, and bounds startup/tool execution time.
 
 The hosted control plane must include `senderDeviceId` in dispatch envelopes,
 and `requesterDeviceId` in grant responses, both derived from authenticated

@@ -2,6 +2,11 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from "n
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { RelationshipAccessPreset } from "../../security/relationship-policy.js";
+import {
+  parseRemoteMcpGrants,
+  renderCodexRemoteMcpGrants,
+  type RemoteMcpGrantInput,
+} from "../../security/mcp-capability-grant.js";
 
 /**
  * Codex permission profiles: kernel-enforced scoping for a c2c relationship.
@@ -40,6 +45,8 @@ export interface CodexPermissionProfileInput {
   profileName?: string;
   /** Override used by tests; defaults to the active Codex login's auth.json. */
   authFile?: string;
+  /** Exact relationship grants; never inferred by copying the owner's Codex configuration. */
+  mcpServers?: readonly RemoteMcpGrantInput[];
 }
 
 /**
@@ -62,13 +69,34 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   const writable = writableFolders.length > 0;
   const base = writable ? ":workspace" : ":read-only";
   const workspaceAccess = writableFolders.length === folders.length ? "write" : "read";
+  const mcpServers = parseRemoteMcpGrants(input.mcpServers ?? []);
+  const mcpConfig = renderCodexRemoteMcpGrants(mcpServers);
+  const shellEnvironmentExclusions = [...new Set([
+    "*TOKEN*",
+    "*SECRET*",
+    "*PASSWORD*",
+    "*PASSWD*",
+    "*API_KEY*",
+    "*PRIVATE_KEY*",
+    "DATABASE_URL",
+    ...mcpServers.flatMap((server) => server.bearerTokenEnvVar ? [server.bearerTokenEnvVar] : []),
+  ])];
 
   return [
     `default_permissions = ${tomlString(name)}`,
+    // The private home must not fall back to owner OAuth stored in a system keyring. A granted
+    // server either uses its named bearer environment variable or connects without credentials.
+    'mcp_oauth_credentials_store = "file"',
+    "",
+    "[history]",
+    'persistence = "none"',
+    "",
+    "[memories]",
+    "disable_on_external_context = true",
     "",
     "[shell_environment_policy]",
     'inherit = "core"',
-    'exclude = ["*TOKEN*", "*SECRET*", "*PASSWORD*", "*PASSWD*", "*API_KEY*", "*PRIVATE_KEY*", "DATABASE_URL"]',
+    `exclude = [${shellEnvironmentExclusions.map(tomlString).join(", ")}]`,
     "",
     `[permissions.${name}]`,
     `description = "Aicoo c2c relationship (${input.preset})"`,
@@ -92,6 +120,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     // copy them out; keeping egress closed is what makes granting a folder a bounded decision.
     "enabled = false",
     "",
+    ...(mcpConfig ? [mcpConfig, ""] : []),
   ].join("\n");
 }
 

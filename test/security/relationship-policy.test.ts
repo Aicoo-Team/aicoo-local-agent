@@ -14,6 +14,7 @@ import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
 import {
   RelationshipPolicy,
   resetRelationshipPolicy,
+  setRelationshipMcpGrants,
   upsertRelationshipPreset,
 } from "../../src/security/relationship-policy.js";
 
@@ -161,6 +162,59 @@ describe("RelationshipPolicy", () => {
 
     const document = JSON.parse(readFileSync(file, "utf8")) as { relationships: unknown[] };
     expect(document.relationships).toHaveLength(1);
+  });
+
+  it("binds MCP grants to the exact peer device and an active project selection", () => {
+    const directory = makeDirectory();
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const file = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "read-project",
+      folder: project,
+    });
+    setRelationshipMcpGrants({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      grants: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["read", "search"],
+      }],
+    });
+
+    const policy = RelationshipPolicy.fromFile(file, directory);
+    expect(policy.mcpServersFor(inbound())).toEqual([{
+      name: "docs",
+      url: "https://mcp.example.com/v1",
+      enabledTools: ["read", "search"],
+      startupTimeoutSec: 10,
+      toolTimeoutSec: 60,
+    }]);
+    expect(policy.mcpServersFor(inbound({ senderDeviceId: "device-a2" }))).toEqual([]);
+
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "edit-project",
+      folder: project,
+    });
+    expect(RelationshipPolicy.fromFile(file, directory).mcpServersFor(inbound()))
+      .toHaveLength(1);
+    setRelationshipMcpGrants({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      grants: [],
+    });
+    expect(RelationshipPolicy.fromFile(file, directory).mcpServersFor(inbound())).toEqual([]);
   });
 
   it("requires explicit project selection when one verified device has multiple folders", () => {

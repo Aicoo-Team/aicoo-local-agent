@@ -258,7 +258,9 @@ kernel boundary, a live owner-approval route, and an interruptible approval path
 In that mode, arbitrary shell is available only inside the active project boundary
 and only after owner approval. Claude can expose its wider managed tool/MCP surface
 through the same gate. Codex owner MCP/plugin configuration remains isolated until
-it can be copied as an explicit per-integration grant instead of as ambient trust.
+an integration is represented by an explicit relationship grant. Codex currently
+projects remote HTTP MCP grants with exact server URLs and tool allowlists; it never
+copies ambient owner configuration, stdio launch commands, or static headers.
 See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
 
 ## Develop
