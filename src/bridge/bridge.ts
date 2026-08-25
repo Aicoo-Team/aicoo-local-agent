@@ -1,4 +1,5 @@
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
+import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
 import { FakeRuntimeAdapter } from "../adapters/fake/fake-adapter.js";
 import {
   upsertRelationshipPolicy,
@@ -67,15 +68,18 @@ export class RuntimeBridge {
   #beforeExitHandler?: (code: number) => void;
   readonly #bridgeInstanceId: string;
   readonly #continuationRecovery: ContinuationRecovery;
+  readonly #boundaryTelemetry: BoundaryTelemetry;
 
   constructor(private readonly options: BridgeOptions) {
     this.#bridgeInstanceId = options.bridgeInstanceId ?? id("bridge");
     const continuationStore = new ContinuationStore(options.spool.db);
+    this.#boundaryTelemetry = new BoundaryTelemetry(options.spool.db);
     options.adapter.configureContinuationStore?.(continuationStore);
     this.#continuationRecovery = new ContinuationRecovery(
       continuationStore,
       options.adapter,
       options.log,
+      this.#boundaryTelemetry,
     );
   }
 
@@ -342,6 +346,15 @@ export class RuntimeBridge {
         throw new Error("Received an event for a different endpoint");
       }
       const stored = this.options.spool.storeDispatch(event);
+      if (stored.inserted && stored.message.envelope.kind === "task_invite") {
+        const localHandle = this.#serverToNative.get(stored.message.sessionHandle)
+          ?? stored.message.sessionHandle;
+        this.#boundaryTelemetry.recordEligibleTask({
+          messageId: stored.message.messageId,
+          localHandle,
+          correlationId: stored.message.envelope.correlationId ?? stored.message.messageId,
+        });
+      }
       // Prompt best-effort device-ack — but NON-FATAL: on failure/timeout we leave the message
       // 'received' and the injector re-acks it (see Injector.ackReceived), so a slow ack can
       // never throw out of here and wedge the stream / stall the cursor. Skip expired messages

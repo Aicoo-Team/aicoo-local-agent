@@ -1,4 +1,5 @@
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
+import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
 import { ContinuationStore } from "../shared/continuation-store.js";
 import { SessionRebuildCoordinator } from "../shared/session-rebuild.js";
 
@@ -19,6 +20,7 @@ export class ContinuationRecovery {
     private readonly store: ContinuationStore,
     private readonly adapter: RuntimeAdapter,
     private readonly log?: (line: string) => void,
+    private readonly boundaryTelemetry?: BoundaryTelemetry,
   ) {
     this.#coordinator = new SessionRebuildCoordinator(store);
   }
@@ -37,6 +39,8 @@ export class ContinuationRecovery {
           this.adapter.canActivateContinuation
           && !(await this.adapter.canActivateContinuation(checkpoint))
         ) return;
+        const startedState = checkpoint.state;
+        const startedAt = Date.now();
         const result = await this.#coordinator.execute(checkpoint.continuationId, {
           quiesce: (current) => quiesceContinuation.call(this.adapter, current),
           rebuildAndAttest: async (current) => {
@@ -50,6 +54,21 @@ export class ContinuationRecovery {
             }
           },
         });
+        if (startedState !== "resuming") {
+          const failed = result.state === "activation_failed" || result.state === "resume_failed";
+          this.boundaryTelemetry?.recordTransition({
+            transitionId: `continuation:${checkpoint.continuationId}`,
+            messageId: checkpoint.messageId,
+            kind: "post_start_rebuild",
+            cause: "approval_boundary_expansion",
+            boundaryKey: result.boundaryManifestHash
+              ?? result.expectedBoundaryManifestHash
+              ?? checkpoint.continuationId,
+            success: !failed && result.state === "resuming",
+            latencyMs: Date.now() - startedAt,
+            ...(failed && result.errorCode ? { failureCode: result.errorCode } : {}),
+          });
+        }
         if (result.state === "resuming") this.#resumedThisProcess.add(checkpoint.continuationId);
         if (result.state === "activation_failed" || result.state === "resume_failed") {
           this.log?.(`[bridge] continuation ${checkpoint.continuationId} failed: ${result.errorCode}`);

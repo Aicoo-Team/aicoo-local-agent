@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
+import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
 import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
 import { BridgeSpool } from "../bridge/spool.js";
@@ -56,6 +57,7 @@ import {
   waitForBridgeReady,
 } from "./onboarding.js";
 import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
+import { evaluateCapabilityRollout } from "../shared/capability-rollout.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
@@ -1005,6 +1007,21 @@ program.command("doctor")
       mode: "text-only",
       checks,
     });
+  });
+
+program.command("capability-readiness")
+  .description("show whether local C2C rebuild evidence permits wider agent capabilities")
+  .option("--spool <file>", "bridge spool to inspect", DEFAULT_SPOOL)
+  .action((options) => {
+    const spool = new BridgeSpool(options.spool);
+    try {
+      print({
+        surface: "full-agent-capability",
+        ...evaluateCapabilityRollout(new BoundaryTelemetry(spool.db).snapshot()),
+      });
+    } finally {
+      spool.close();
+    }
   });
 
 program.command("install-codex-skill")

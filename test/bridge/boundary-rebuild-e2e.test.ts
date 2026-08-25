@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CodexAdapter } from "../../src/adapters/codex/codex-adapter.js";
+import { BoundaryTelemetry } from "../../src/adapters/boundary-telemetry.js";
 import type {
   CodexDriver,
   CodexThreadEvent,
@@ -226,6 +227,14 @@ describe("two-bridge boundary rebuild E2E", () => {
         boundaryManifestHash: expectedBoundaryManifestHash,
       }),
     ]);
+    expect(new BoundaryTelemetry(bSpool.db).snapshot()).toMatchObject({
+      eligibleTasks: 1,
+      postStartRebuildTasks: 1,
+      totalPostStartRebuilds: 1,
+      failedPostStartRebuilds: 0,
+      rebuildRate: 1,
+      rebuildsByCause: { approval_boundary_expansion: 1 },
+    });
   });
 });
 
