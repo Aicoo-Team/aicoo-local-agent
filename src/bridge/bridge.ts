@@ -21,6 +21,8 @@ import type {
 } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
+import { ContinuationStore } from "../shared/continuation-store.js";
+import { ContinuationRecovery } from "./continuation-recovery.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
 import { BridgeSpool } from "./spool.js";
 
@@ -64,9 +66,15 @@ export class RuntimeBridge {
   #publishedDefaultRoute?: string;
   #beforeExitHandler?: (code: number) => void;
   readonly #bridgeInstanceId: string;
+  readonly #continuationRecovery: ContinuationRecovery;
 
   constructor(private readonly options: BridgeOptions) {
     this.#bridgeInstanceId = options.bridgeInstanceId ?? id("bridge");
+    this.#continuationRecovery = new ContinuationRecovery(
+      new ContinuationStore(options.spool.db),
+      options.adapter,
+      options.log,
+    );
   }
 
   get endpointId(): string | undefined {
@@ -158,6 +166,7 @@ export class RuntimeBridge {
       this.#serverToNative,
       this.options.hooks ?? noOpInjectionHooks,
     );
+    await this.#continuationRecovery.recover();
     this.#beforeExitHandler = (code) => {
       if (!this.#controller.signal.aborted) {
         (this.options.log ?? console.error)(
@@ -444,6 +453,7 @@ export class RuntimeBridge {
         canonicalFolder: policy.canonicalFolder,
       });
       this.options.log?.(`trusted tool policy applied: ${accessPreset} for ${requesterPrincipalId}`);
+      await this.#continuationRecovery.recover();
     } catch (error) {
       this.options.log?.(`trusted tool policy update failed: ${String(error)}`);
     }
@@ -620,6 +630,9 @@ export class RuntimeBridge {
       try {
         for await (const event of this.options.adapter.subscribeSessionEvents(nativeHandle, cursor)) {
           if (this.#controller.signal.aborted) return;
+          if (event.type === "turn_failed") {
+            this.#continuationRecovery.handleRuntimeEvent(nativeHandle, event);
+          }
           if (event.type === "reply" && event.inReplyTo) {
             const original = this.options.spool.getMessage(event.inReplyTo);
             if (!original) {
@@ -658,6 +671,9 @@ export class RuntimeBridge {
                 correlationId,
                 ...(collaborationReply ? { collaborationTurn: collaborationReply.turn } : {}),
               });
+              // Completion follows durable reply storage. A crash can replay an unsent reply,
+              // but must never leave a completed continuation with no answer to deliver.
+              this.#continuationRecovery.handleRuntimeEvent(nativeHandle, event);
             }
           }
           if (event.cursor) {

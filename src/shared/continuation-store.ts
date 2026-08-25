@@ -135,6 +135,25 @@ export class ContinuationStore {
     return rows.map(fromRow);
   }
 
+  findResuming(input: {
+    sessionHandle: string;
+    messageId: string;
+    correlationId?: string;
+  }): ContinuationCheckpoint | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM c2c_continuations
+       WHERE state = 'resuming' AND session_handle = ? AND message_id = ?
+         AND (? IS NULL OR correlation_id = ?)
+       ORDER BY updated_at DESC LIMIT 1`,
+    ).get(
+      input.sessionHandle,
+      input.messageId,
+      input.correlationId ?? null,
+      input.correlationId ?? null,
+    ) as ContinuationRow | undefined;
+    return row ? fromRow(row) : undefined;
+  }
+
   markApproved(
     continuationId: string,
     approval: {

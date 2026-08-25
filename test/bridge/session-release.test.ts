@@ -11,6 +11,7 @@ import type {
   RuntimeSessionBinding,
 } from "../../src/shared/contracts.js";
 import { ApiError, type HttpMessageTransport } from "../../src/shared/http-client.js";
+import { ContinuationStore } from "../../src/shared/continuation-store.js";
 import {
   markTrustedToolPolicyUsed,
   readTrustedToolPolicies,
@@ -450,6 +451,75 @@ describe("RuntimeBridge communication session release", () => {
       revision: 7,
       canonicalFolder: realpathSync.native(folder),
     });
+  });
+
+  it("resumes an approved durable continuation when its trusted policy becomes active", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-continuation-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const trustedToolPolicyFile = join(directory, "trusted-tools.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const { bridge, spool, adapter } = setup({
+      trustedToolPolicyFile,
+      bridgeInstanceId: "bridge-run-new",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      transport: transport({ acknowledgeTrustedToolPolicy: vi.fn(async () => undefined) }),
+    });
+    const store = new ContinuationStore(spool.db);
+    const checkpoint = store.create({
+      idempotencyKey: "comm_resume:msg_resume:tool_resume",
+      correlationId: "corr_resume",
+      communicationSessionId: "comm_resume",
+      messageId: "msg_resume",
+      sessionHandle: "native-session",
+      runtimeTurnId: "turn_resume",
+      originalMessage: { kind: "text", payload: { text: "Read the shared folder" } },
+      requestedCapability: {
+        toolName: "Read",
+        canonicalResource: join(folder, "README.md"),
+        summary: "Read the shared README",
+      },
+    });
+    store.markApproved(checkpoint.continuationId, {
+      grantId: "ttp_server_resume",
+      grantRevision: 8,
+      approvedCanonicalFolder: realpathSync.native(folder),
+      approvedAccessPreset: "read-project",
+      expectedBoundaryManifestHash: "manifest_resume",
+    });
+    adapter.quiesceContinuation = vi.fn(async () => undefined);
+    adapter.rebuildContinuation = vi.fn(async () => ({ boundaryManifestHash: "manifest_resume" }));
+    adapter.resumeContinuation = vi.fn(async () => ({ status: "runtime_acked", runtimeAckId: "ack_resume" }));
+
+    const policyEvent: RuntimeEvent = {
+      cursor: "policy-trusted-resume",
+      type: "trusted_tool_policy.upserted",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        policyId: "ttp_server_resume",
+        ownerPrincipalId: "prn_b",
+        ownerDeviceId: "device_b",
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        canonicalFolder: folder,
+        accessPreset: "read-project",
+        scope: "bridge_run",
+        bridgeInstanceId: "bridge-run-new",
+        revision: 8,
+        createdFrom: "approval_prompt",
+        createdBy: "prn_b",
+        createdAt: new Date().toISOString(),
+      },
+    };
+    await callHandleEvent(bridge, policyEvent);
+    await callHandleEvent(bridge, policyEvent);
+
+    expect(adapter.quiesceContinuation).toHaveBeenCalledOnce();
+    expect(adapter.rebuildContinuation).toHaveBeenCalledOnce();
+    expect(adapter.resumeContinuation).toHaveBeenCalledOnce();
+    expect(store.find(checkpoint.continuationId)?.state).toBe("resuming");
   });
 
   it("reports durable trusted-policy usage and removes only acknowledged sequences", async () => {
