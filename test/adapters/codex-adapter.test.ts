@@ -243,6 +243,86 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[0]?.prompt).toContain(`- ${realpathSync.native(second)}`);
   });
 
+  it("quiesces an old turn, rebuilds its approved profile, and resumes on the original correlation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-continuation-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first");
+    const second = join(directory, "second");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeCodexDriver("resumed answer");
+    driver.resultDelayMs = 50;
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      bridgeInstanceId: "bridge_1",
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    const original = inbound("msg_continuation", {
+      kind: "task_invite",
+      correlationId: "corr_continuation",
+      payload: { task: { text: "Compare first and second", projectAccessId: first } },
+    });
+    const events = collectEvents(adapter, "codex-managed-1", 3);
+    expect(await adapter.deliverToSession("codex-managed-1", original, "queue"))
+      .toMatchObject({ status: "runtime_acked" });
+    const checkpoint = {
+      continuationId: "cont_1",
+      idempotencyKey: "comm_1:msg_continuation:tool_1",
+      correlationId: "corr_continuation",
+      communicationSessionId: "comm_1",
+      messageId: original.id,
+      sessionHandle: "codex-managed-1",
+      runtimeTurnId: "tool_1",
+      originalMessage: original,
+      requestedCapability: {
+        toolName: "Read",
+        canonicalResource: join(second, "README.md"),
+        summary: "Read second README",
+      },
+      state: "rebuilding_session" as const,
+      grantId: "grant_2",
+      grantRevision: 2,
+      approvedCanonicalFolder: realpathSync.native(second),
+      approvedAccessPreset: "read-project" as const,
+      expectedBoundaryManifestHash: "set by server",
+    };
+
+    await adapter.quiesceContinuation(checkpoint);
+    await expect(adapter.rebuildContinuation(checkpoint)).resolves.toEqual({
+      boundaryManifestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    await expect(adapter.resumeContinuation(checkpoint)).resolves.toMatchObject({ status: "runtime_acked" });
+    const profile = readFileSync(join(driver.turns.at(-1)!.permissionProfile!.codexHome, "config.toml"), "utf8");
+    expect(profile).toContain(JSON.stringify(realpathSync.native(first)));
+    expect(profile).toContain(JSON.stringify(realpathSync.native(second)));
+
+    const delivered = await events;
+    expect(delivered.filter((event) => event.type === "reply")).toEqual([
+      expect.objectContaining({
+        inReplyTo: original.id,
+        correlationId: "corr_continuation",
+        payload: expect.objectContaining({ text: "resumed answer" }),
+      }),
+    ]);
+  });
+
   it("uses the kernel profile without a second local approval layer", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-collab-policy-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));

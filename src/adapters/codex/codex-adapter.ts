@@ -15,6 +15,9 @@ import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from ".
 import { CodexExecDriver, type CodexDriver, type CodexThreadEvent, type CodexTurn, type CodexTurnStartInput } from "./driver.js";
 import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 import { writeCodexPermissionProfile } from "./permission-profile.js";
+import { createBoundaryManifest } from "../../shared/boundary-manifest.js";
+import type { ContinuationCheckpoint } from "../../shared/continuation-store.js";
+import { continuationInboundMessage } from "../../shared/continuation-message.js";
 
 export interface CodexAdapterConfig {
   stateFile: string;
@@ -62,6 +65,7 @@ interface ActiveTurn {
   turn: CodexTurn;
   done: Promise<void>;
   pendingAck?: PendingAck;
+  suppressed?: boolean;
 }
 
 interface PendingAck {
@@ -425,6 +429,73 @@ export class CodexAdapter implements RuntimeAdapter {
     }
   }
 
+  async quiesceContinuation(checkpoint: ContinuationCheckpoint): Promise<void> {
+    const session = this.continuationSession(checkpoint);
+    const active = session.activeTurn;
+    if (active) {
+      active.suppressed = true;
+      this.rejectPendingAck(active, new Error("session rebuilding after approved boundary expansion"));
+      active.turn.close();
+      await active.done.catch(() => undefined);
+      if (session.activeTurn === active) session.activeTurn = undefined;
+    }
+    this.markIdle(session);
+  }
+
+  async rebuildContinuation(checkpoint: ContinuationCheckpoint): Promise<{ boundaryManifestHash: string }> {
+    const session = this.continuationSession(checkpoint);
+    if (session.activeTurn) throw new Error("continuation session was not quiesced");
+    const message = continuationInboundMessage(checkpoint);
+    const access = this.relationshipPolicy().accessFor(message);
+    if (
+      access.status !== "selected"
+      || !checkpoint.approvedCanonicalFolder
+      || !access.folders.includes(checkpoint.approvedCanonicalFolder)
+      || !checkpoint.grantId
+      || checkpoint.grantRevision === undefined
+      || !checkpoint.approvedAccessPreset
+      || !this.#config.bridgeInstanceId
+      || !message.senderDeviceId
+    ) throw new Error("approved boundary is not active in the local policy");
+    const profileRoot = this.#config.permissionProfileRoot
+      ?? `${resolve(this.#config.relationshipPolicyFile!)}.codex-profiles`;
+    if (!writeCodexPermissionProfile(join(profileRoot, session.localHandle), {
+      preset: access.preset,
+      folders: access.folders,
+      writableFolders: access.writableFolders,
+    })) throw new Error("approved boundary could not produce a Codex permission profile");
+    const { hash } = createBoundaryManifest({
+      runtime: "codex",
+      adapterVersion: CodexAdapter.adapterVersion,
+      bridgeInstanceId: this.#config.bridgeInstanceId,
+      requesterPrincipalId: message.senderPrincipalId,
+      requesterDeviceId: message.senderDeviceId,
+      grantId: checkpoint.grantId,
+      grantRevision: checkpoint.grantRevision,
+      preset: checkpoint.approvedAccessPreset,
+      folders: access.folders,
+      writableFolders: access.writableFolders,
+    });
+    return { boundaryManifestHash: hash };
+  }
+
+  async resumeContinuation(checkpoint: ContinuationCheckpoint): Promise<{ status: string; runtimeAckId?: string }> {
+    return this.deliverToSession(
+      checkpoint.sessionHandle,
+      continuationInboundMessage(checkpoint),
+      "new_turn",
+    );
+  }
+
+  private continuationSession(checkpoint: ContinuationCheckpoint): ManagedSession {
+    const session = this.#sessions.get(checkpoint.sessionHandle);
+    if (!session || session.state === "closed") throw new Error("continuation session is unavailable");
+    if (session.boundCommunicationSessionId !== checkpoint.communicationSessionId) {
+      throw new Error("continuation communication session does not match the managed runtime");
+    }
+    return session;
+  }
+
   private async consumeTurn(session: ManagedSession, active: ActiveTurn): Promise<void> {
     let turnCompleted = false;
     let replyText: string | undefined;
@@ -440,6 +511,7 @@ export class CodexAdapter implements RuntimeAdapter {
         });
         if (turnCompleted) break;
       }
+      if (active.suppressed) return;
       if (!turnCompleted && !this.#closing) {
         this.failTurn(session, active, "codex stream ended before the turn completed");
         return;
@@ -448,7 +520,9 @@ export class CodexAdapter implements RuntimeAdapter {
         this.finishTurn(session, active, replyText);
       }
     } catch (error) {
-      if (!this.#closing) this.failTurn(session, active, error instanceof Error ? error.message : String(error));
+      if (!this.#closing && !active.suppressed) {
+        this.failTurn(session, active, error instanceof Error ? error.message : String(error));
+      }
     } finally {
       if (session.activeTurn === active) session.activeTurn = undefined;
     }
