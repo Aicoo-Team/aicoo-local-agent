@@ -1,4 +1,5 @@
 import type { MessageEnvelope } from "../shared/contracts.js";
+import type { ContinuationCheckpoint } from "../shared/continuation-store.js";
 
 export interface RuntimeSessionDescriptor {
   sessionHandle: string;
@@ -35,6 +36,9 @@ export interface RuntimeAdapter {
   }>;
   releaseCommunicationSession?(communicationSessionId: string): Promise<void>;
   prepareCommunicationSession?(sessionHandle: string, communicationSessionId: string): Promise<void>;
+  quiesceContinuation?(checkpoint: ContinuationCheckpoint): Promise<void>;
+  rebuildContinuation?(checkpoint: ContinuationCheckpoint): Promise<{ boundaryManifestHash: string }>;
+  resumeContinuation?(checkpoint: ContinuationCheckpoint): Promise<{ status: string; runtimeAckId?: string }>;
   deliverToSession(
     sessionHandle: string,
     message: InboundMessage,

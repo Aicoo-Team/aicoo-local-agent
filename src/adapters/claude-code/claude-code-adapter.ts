@@ -12,6 +12,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   projectAccessAllowsAction,
+  projectAccessSelectors,
   RelationshipPolicy,
   type ProjectAccess,
 } from "../../security/relationship-policy.js";
@@ -19,6 +20,8 @@ import { parseSafeGitCommand, safeGitShellInput } from "../../security/safe-git.
 import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
+import { createBoundaryManifest } from "../../shared/boundary-manifest.js";
+import type { ContinuationCheckpoint } from "../../shared/continuation-store.js";
 import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from "../runtime-adapter.js";
 import {
   OfficialClaudeAgentDriver,
@@ -400,6 +403,96 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     ) {
       await this.resetSession(session);
     }
+  }
+
+  async quiesceContinuation(checkpoint: ContinuationCheckpoint): Promise<void> {
+    const session = this.continuationSession(checkpoint);
+    session.resetting = true;
+    for (const pending of session.pendingAcks.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("session rebuilding after approved boundary expansion"));
+    }
+    session.pendingAcks.clear();
+    session.acceptedTurns = [];
+    session.accepting = false;
+    session.abortController.abort();
+    session.queue.close();
+    session.query?.close();
+    await session.consumer?.catch(() => undefined);
+    session.abortController = new AbortController();
+    session.queue = new AsyncMessageQueue<SDKUserMessage>();
+    session.query = undefined;
+    session.consumer = undefined;
+    session.providerSessionId = randomUUID();
+    session.initialized = false;
+    session.sandboxPrincipalId = undefined;
+    session.sandboxDeviceId = undefined;
+    session.sandboxBoundaryKey = undefined;
+    session.sandboxAccess = undefined;
+    session.state = "idle";
+    this.#db.prepare(
+      `UPDATE managed_sessions
+       SET provider_session_id = ?, initialized = 0, state = 'idle', last_active_at = ?
+       WHERE local_handle = ?`,
+    ).run(session.providerSessionId, nowIso(), session.localHandle);
+    session.resetting = false;
+  }
+
+  async rebuildContinuation(checkpoint: ContinuationCheckpoint): Promise<{ boundaryManifestHash: string }> {
+    const session = this.continuationSession(checkpoint);
+    if (session.query || session.consumer || session.initialized) {
+      throw new Error("continuation session was not quiesced");
+    }
+    const message = continuationInboundMessage(checkpoint);
+    const access = this.relationshipPolicy()?.accessFor(message);
+    if (
+      !access || access.status !== "selected"
+      || !checkpoint.approvedCanonicalFolder
+      || !access.folders.includes(checkpoint.approvedCanonicalFolder)
+      || !checkpoint.grantId
+      || checkpoint.grantRevision === undefined
+      || !checkpoint.approvedAccessPreset
+      || !this.#config.bridgeInstanceId
+      || !message.senderDeviceId
+    ) {
+      throw new Error("approved boundary is not active in the local policy");
+    }
+    await this.launchSession(session, message);
+    session.sandboxPrincipalId = message.senderPrincipalId;
+    session.sandboxDeviceId = message.senderDeviceId;
+    session.sandboxBoundaryKey = sandboxBoundaryKey(access);
+    session.sandboxAccess = access;
+    const { hash } = createBoundaryManifest({
+      runtime: "claude-code",
+      adapterVersion: ClaudeCodeAdapter.adapterVersion,
+      bridgeInstanceId: this.#config.bridgeInstanceId,
+      requesterPrincipalId: message.senderPrincipalId,
+      requesterDeviceId: message.senderDeviceId,
+      grantId: checkpoint.grantId,
+      grantRevision: checkpoint.grantRevision,
+      preset: checkpoint.approvedAccessPreset,
+      folders: access.folders,
+      writableFolders: access.writableFolders,
+    });
+    return { boundaryManifestHash: hash };
+  }
+
+  async resumeContinuation(checkpoint: ContinuationCheckpoint): Promise<{ status: string; runtimeAckId?: string }> {
+    const result = await this.deliverToSession(
+      checkpoint.sessionHandle,
+      continuationInboundMessage(checkpoint),
+      "new_turn",
+    );
+    return result;
+  }
+
+  private continuationSession(checkpoint: ContinuationCheckpoint): ManagedSession {
+    const session = this.#sessions.get(checkpoint.sessionHandle);
+    if (!session || session.state === "closed") throw new Error("continuation session is unavailable");
+    if (session.boundCommunicationSessionId !== checkpoint.communicationSessionId) {
+      throw new Error("continuation communication session does not match the managed runtime");
+    }
+    return session;
   }
 
   private loadOrCreateSessions(count: number): void {
@@ -914,6 +1007,53 @@ function sandboxBoundaryKey(access: ProjectAccess | undefined): string | undefin
     folders: [...access.folders].sort(),
     writableFolders: [...access.writableFolders].sort(),
   });
+}
+
+function continuationInboundMessage(checkpoint: ContinuationCheckpoint): InboundMessage {
+  const original = checkpoint.originalMessage as Partial<InboundMessage>;
+  if (
+    typeof original.id !== "string"
+    || typeof original.clientMessageId !== "string"
+    || typeof original.senderPrincipalId !== "string"
+    || !original.target
+    || !original.payload
+    || typeof original.payload !== "object"
+  ) {
+    throw new Error("continuation original message is invalid");
+  }
+  if (original.communicationSessionId !== checkpoint.communicationSessionId) {
+    throw new Error("continuation original message has a different communication session");
+  }
+  const selectors = projectAccessSelectors(original as InboundMessage);
+  const approvedFolder = checkpoint.approvedCanonicalFolder;
+  if (!approvedFolder) throw new Error("continuation has no approved folder");
+  const originalTask = original.payload.task;
+  const taskRecord = originalTask && typeof originalTask === "object" && !Array.isArray(originalTask)
+    ? originalTask as Record<string, unknown>
+    : { text: typeof originalTask === "string" ? originalTask : "Resume the original task" };
+  return {
+    ...(original as InboundMessage),
+    id: original.id,
+    clientMessageId: original.clientMessageId,
+    communicationSessionId: checkpoint.communicationSessionId,
+    correlationId: checkpoint.correlationId,
+    kind: "task_invite",
+    payload: {
+      ...original.payload,
+      task: {
+        ...taskRecord,
+        projectAccessIds: [...new Set([...selectors, approvedFolder])].sort(),
+        continuation: {
+          continuationId: checkpoint.continuationId,
+          grantId: checkpoint.grantId,
+          grantRevision: checkpoint.grantRevision,
+          boundaryRebuild: true,
+          completedSideEffects: [],
+        },
+      },
+    },
+    trust: "untrusted_external_content",
+  };
 }
 
 /**

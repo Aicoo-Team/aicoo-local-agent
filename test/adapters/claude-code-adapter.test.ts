@@ -384,6 +384,85 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     });
   });
 
+  it("quiesces an old turn, rebuilds its approved boundary, and resumes on the original correlation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-continuation-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first");
+    const second = join(directory, "second");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeClaudeAgentDriver("resumed answer");
+    driver.resultDelayMs = 50;
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      bridgeInstanceId: "bridge_1",
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    const original = inbound("msg_continuation", {
+      kind: "task_invite",
+      correlationId: "corr_continuation",
+      payload: { task: { text: "Compare first and second", projectAccessId: first } },
+    });
+    const events = collectEvents(adapter, "claude-managed-1", 3);
+    expect(await adapter.deliverToSession("claude-managed-1", original, "queue"))
+      .toMatchObject({ status: "runtime_acked" });
+    const checkpoint = {
+      continuationId: "cont_1",
+      idempotencyKey: "comm_1:msg_continuation:tool_1",
+      correlationId: "corr_continuation",
+      communicationSessionId: "comm_1",
+      messageId: original.id,
+      sessionHandle: "claude-managed-1",
+      runtimeTurnId: "tool_1",
+      originalMessage: original,
+      requestedCapability: {
+        toolName: "Read",
+        canonicalResource: join(second, "README.md"),
+        summary: "Read second README",
+      },
+      state: "rebuilding_session" as const,
+      grantId: "grant_2",
+      grantRevision: 2,
+      approvedCanonicalFolder: realpathSync.native(second),
+      approvedAccessPreset: "read-project" as const,
+      expectedBoundaryManifestHash: "set by server",
+    };
+
+    await adapter.quiesceContinuation(checkpoint);
+    const attestation = await adapter.rebuildContinuation(checkpoint);
+    expect(attestation.boundaryManifestHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(driver.starts.at(-1)?.options.additionalDirectories).toEqual(
+      [realpathSync.native(first), realpathSync.native(second)].sort(),
+    );
+    await expect(adapter.resumeContinuation(checkpoint)).resolves.toMatchObject({ status: "runtime_acked" });
+
+    const delivered = await events;
+    expect(delivered.filter((event) => event.type === "reply")).toEqual([
+      expect.objectContaining({
+        inReplyTo: original.id,
+        correlationId: "corr_continuation",
+        payload: expect.objectContaining({ text: "resumed answer" }),
+      }),
+    ]);
+  });
+
   it("binds a managed Claude conversation to one communication session", async () => {
     const driver = new FakeClaudeAgentDriver();
     const adapter = makeAdapter(driver);

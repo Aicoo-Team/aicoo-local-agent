@@ -22,7 +22,7 @@ export interface ContinuationCheckpoint {
   messageId: string;
   sessionHandle: string;
   runtimeTurnId: string;
-  originalMessage: Record<string, unknown>;
+  originalMessage: object;
   requestedCapability: {
     toolName: string;
     canonicalResource: string;
@@ -318,7 +318,7 @@ function fromRow(row: ContinuationRow): ContinuationCheckpoint {
     messageId: row.message_id,
     sessionHandle: row.session_handle,
     runtimeTurnId: row.runtime_turn_id,
-    originalMessage: JSON.parse(row.original_message_json) as Record<string, unknown>,
+    originalMessage: JSON.parse(row.original_message_json) as object,
     requestedCapability: JSON.parse(row.requested_capability_json) as ContinuationCheckpoint["requestedCapability"],
     state: row.state,
     ...(row.grant_id ? { grantId: row.grant_id } : {}),
