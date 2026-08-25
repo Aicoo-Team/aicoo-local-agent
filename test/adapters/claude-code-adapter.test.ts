@@ -617,6 +617,24 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(driver.starts.at(-1)?.options.sessionId).toBe(adapter.providerSessionId("claude-managed-1"));
   });
 
+  it("invalidates a Claude conversation only for the exact relationship device", async () => {
+    const driver = new FakeClaudeAgentDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const events = collectEvents(adapter, "claude-managed-1", 2);
+    await adapter.deliverToSession("claude-managed-1", inbound("msg_policy"), "queue");
+    await events;
+    const providerSessionId = adapter.providerSessionId("claude-managed-1");
+
+    await adapter.invalidateRelationshipSessions("prn_other", "device-a1");
+    expect(adapter.providerSessionId("claude-managed-1")).toBe(providerSessionId);
+
+    await adapter.invalidateRelationshipSessions("prn_a", "device-a1");
+    expect(adapter.providerSessionId("claude-managed-1")).not.toBe(providerSessionId);
+  });
+
   it("discards an initialized legacy conversation that was never bound to a relationship", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-state-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));

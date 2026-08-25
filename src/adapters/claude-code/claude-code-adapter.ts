@@ -433,6 +433,16 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     await Promise.all(resets);
   }
 
+  async invalidateRelationshipSessions(principalId: string, deviceId: string): Promise<void> {
+    const resets: Promise<void>[] = [];
+    for (const session of this.#sessions.values()) {
+      if (session.sandboxPrincipalId === principalId && session.sandboxDeviceId === deviceId) {
+        resets.push(this.resetSession(session));
+      }
+    }
+    await Promise.all(resets);
+  }
+
   async prepareCommunicationSession(sessionHandle: string, communicationSessionId: string): Promise<void> {
     const session = this.#sessions.get(sessionHandle);
     if (

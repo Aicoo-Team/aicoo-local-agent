@@ -135,6 +135,11 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 - Each Claude conversation and Codex thread binds to one communication session,
   rejects messages from a different relationship, and is released when that
   communication session is revoked or expired.
+- A relationship policy update validates its complete folder, tool, and MCP
+  grant before changing local state. A real change immediately invalidates only
+  runtime sessions bound to that exact verified user+device, for both Codex and
+  Claude Code, so an active session cannot retain revoked capability. Replayed
+  events with identical policy are no-ops and do not restart the runtime.
 - In restricted mode, both runtimes expose only the narrow project capability
   surface and constrained Git operations allowed by the active relationship.
 - Full-agent mode is explicit and stays closed until rebuild-health evidence,

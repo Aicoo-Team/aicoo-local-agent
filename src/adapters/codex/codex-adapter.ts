@@ -58,6 +58,8 @@ interface ManagedSession {
   localHandle: string;
   providerThreadId?: string;
   boundCommunicationSessionId?: string;
+  relationshipPrincipalId?: string;
+  relationshipDeviceId?: string;
   label: string;
   state: "idle" | "busy" | "closed";
   activeTurn?: ActiveTurn;
@@ -377,6 +379,8 @@ export class CodexAdapter implements RuntimeAdapter {
         "UPDATE managed_sessions SET bound_comm_session_id = ?, last_active_at = ? WHERE local_handle = ?",
       ).run(communicationSessionId, nowIso(), session.localHandle);
     }
+    session.relationshipPrincipalId = message.senderPrincipalId;
+    session.relationshipDeviceId = message.senderDeviceId;
 
     const contextOnly = Boolean(message.replyTo) && message.collaborationTurn?.expectsReply !== true;
     let permissionProfile: ReturnType<typeof writeCodexPermissionProfile>;
@@ -487,6 +491,19 @@ export class CodexAdapter implements RuntimeAdapter {
     const resets: Promise<void>[] = [];
     for (const session of this.#sessions.values()) {
       if (session.boundCommunicationSessionId === communicationSessionId) {
+        resets.push(this.resetSession(session));
+      }
+    }
+    await Promise.all(resets);
+  }
+
+  async invalidateRelationshipSessions(principalId: string, deviceId: string): Promise<void> {
+    const resets: Promise<void>[] = [];
+    for (const session of this.#sessions.values()) {
+      if (
+        session.relationshipPrincipalId === principalId
+        && session.relationshipDeviceId === deviceId
+      ) {
         resets.push(this.resetSession(session));
       }
     }
@@ -740,6 +757,8 @@ export class CodexAdapter implements RuntimeAdapter {
     }
     session.providerThreadId = undefined;
     session.boundCommunicationSessionId = undefined;
+    session.relationshipPrincipalId = undefined;
+    session.relationshipDeviceId = undefined;
     session.state = "idle";
     this.#db.prepare(
       `UPDATE managed_sessions

@@ -377,6 +377,127 @@ describe("RuntimeBridge communication session release", () => {
     });
   });
 
+  it("invalidates only the affected peer device session after a relationship grant changes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-policy-session-invalidation-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const { bridge, adapter } = setup({ relationshipPolicyFile: policyFile });
+    const policyEvent: RuntimeEvent = {
+      cursor: "policy-invalidate-1",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        access: "read-project",
+        folderPath: folder,
+      },
+    };
+
+    await callHandleEvent(bridge, policyEvent);
+    await callHandleEvent(bridge, policyEvent);
+
+    expect(adapter.invalidateRelationshipSessions).toHaveBeenCalledOnce();
+    expect(adapter.invalidateRelationshipSessions).toHaveBeenCalledWith("prn_a", "device-a1");
+  });
+
+  it("applies MCP-only grant updates and invalidates the affected peer device session", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-policy-mcp-update-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    const { bridge, adapter } = setup({ relationshipPolicyFile: policyFile });
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-mcp-1",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        mcpServers: [{
+          name: "github",
+          url: "https://mcp.example.com/github",
+          enabledTools: ["list_pull_requests"],
+        }],
+      },
+    });
+
+    expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: [],
+        folders: [],
+        mcpServers: [{
+          name: "github",
+          url: "https://mcp.example.com/github",
+          enabledTools: ["list_pull_requests"],
+          startupTimeoutSec: 10,
+          toolTimeoutSec: 60,
+        }],
+      }],
+    });
+    expect(adapter.invalidateRelationshipSessions).toHaveBeenCalledWith("prn_a", "device-a1");
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-mcp-2",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        mcpServers: [],
+      },
+    });
+
+    expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: [],
+        folders: [],
+      }],
+    });
+    expect(adapter.invalidateRelationshipSessions).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a malformed MCP grant before applying another relationship change", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-policy-invalid-mcp-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const { bridge, adapter } = setup({ relationshipPolicyFile: policyFile });
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-invalid-mcp-1",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        access: "read-project",
+        folderPath: folder,
+        mcpServers: [{
+          name: "unsafe",
+          url: "https://user:secret@mcp.example.com",
+          enabledTools: ["read"],
+        }],
+      },
+    });
+
+    expect(() => readFileSync(policyFile, "utf8")).toThrow();
+    expect(adapter.invalidateRelationshipSessions).not.toHaveBeenCalled();
+  });
+
   it("ignores a folder policy event from an earlier bridge run", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-stale-policy-update-"));
     const policyFile = join(directory, "relationships.json");
@@ -655,6 +776,7 @@ describe("RuntimeBridge communication session release", () => {
     adapter: RuntimeAdapter & {
       releaseCommunicationSession: ReturnType<typeof vi.fn>;
       prepareCommunicationSession: ReturnType<typeof vi.fn>;
+      invalidateRelationshipSessions: ReturnType<typeof vi.fn>;
     };
   } {
     const spool = new BridgeSpool(":memory:");
@@ -673,9 +795,11 @@ describe("RuntimeBridge communication session release", () => {
       deliverToSession: vi.fn(),
       releaseCommunicationSession: vi.fn(async () => undefined),
       prepareCommunicationSession: vi.fn(async () => undefined),
+      invalidateRelationshipSessions: vi.fn(async () => undefined),
     } as unknown as RuntimeAdapter & {
       releaseCommunicationSession: ReturnType<typeof vi.fn>;
       prepareCommunicationSession: ReturnType<typeof vi.fn>;
+      invalidateRelationshipSessions: ReturnType<typeof vi.fn>;
     };
     const bridge = new RuntimeBridge({
       transport: options?.transport ?? transport(),

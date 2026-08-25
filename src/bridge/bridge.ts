@@ -1,7 +1,9 @@
+import { readFileSync } from "node:fs";
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
 import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
 import { FakeRuntimeAdapter } from "../adapters/fake/fake-adapter.js";
 import {
+  setRelationshipMcpGrants,
   upsertRelationshipPolicy,
   upsertRelationshipPreset,
   type RelationshipAccessPreset,
@@ -14,6 +16,7 @@ import {
   upsertTrustedToolPolicy,
 } from "../security/trusted-tool-policy.js";
 import { isFileAccessPreset } from "../security/relationship-access.js";
+import { parseRemoteMcpGrants } from "../security/mcp-capability-grant.js";
 import type {
   CollaborationTurnInput,
   LocalAgentDelegationInput,
@@ -422,7 +425,7 @@ export class RuntimeBridge {
         }
       }
     } else if (event.type === "relationship.policy_update") {
-      this.applyRelationshipPolicyUpdate(event.data);
+      await this.applyRelationshipPolicyUpdate(event.data);
     } else if (event.type === "trusted_tool_policy.upserted") {
       await this.applyTrustedToolPolicyUpdate(event.data);
     } else if (event.type === "trusted_tool_policy.revoked") {
@@ -500,7 +503,7 @@ export class RuntimeBridge {
     }
   }
 
-  private applyRelationshipPolicyUpdate(data: Record<string, unknown>): void {
+  private async applyRelationshipPolicyUpdate(data: Record<string, unknown>): Promise<void> {
     if (!this.options.relationshipPolicyFile) {
       this.options.log?.("relationship policy update ignored: no relationship policy file configured");
       return;
@@ -515,6 +518,7 @@ export class RuntimeBridge {
       return;
     }
     const hasExplicitTools = Object.prototype.hasOwnProperty.call(data, "tools");
+    const hasMcpServers = Object.prototype.hasOwnProperty.call(data, "mcpServers");
     const explicitTools = Array.isArray(data.tools)
       && data.tools.every((tool) => typeof tool === "string" && tool.trim())
       ? data.tools.map((tool) => String(tool).trim())
@@ -522,13 +526,19 @@ export class RuntimeBridge {
     if (
       !principalId
       || !deviceId
-      || (hasExplicitTools ? explicitTools === undefined : !isRelationshipAccessPreset(preset))
+      || (hasExplicitTools && explicitTools === undefined)
+      || (preset !== undefined && !isRelationshipAccessPreset(preset))
+      || (!hasExplicitTools && !hasMcpServers && !isRelationshipAccessPreset(preset))
     ) {
-      this.options.log?.("relationship policy update ignored: missing or invalid principal, device, tools, or preset");
+      this.options.log?.("relationship policy update ignored: missing or invalid principal, device, tools, MCP grants, or preset");
       return;
     }
     try {
-      if (explicitTools) {
+      // Validate every part before the first write so a malformed MCP grant cannot
+      // partially apply an otherwise valid folder/tool update.
+      const mcpServers = hasMcpServers ? parseRemoteMcpGrants(data.mcpServers) : undefined;
+      const before = relationshipPolicyContents(this.options.relationshipPolicyFile);
+      if (explicitTools !== undefined) {
         upsertRelationshipPolicy({
           file: this.options.relationshipPolicyFile,
           principalId,
@@ -539,7 +549,7 @@ export class RuntimeBridge {
         this.options.log?.(
           `relationship policy updated for ${principalId} (tools: ${explicitTools.join(", ") || "none"})`,
         );
-      } else {
+      } else if (isRelationshipAccessPreset(preset)) {
         upsertRelationshipPreset({
           file: this.options.relationshipPolicyFile,
           principalId,
@@ -548,6 +558,18 @@ export class RuntimeBridge {
           ...(folder ? { folder } : {}),
         });
         this.options.log?.(`relationship policy updated for ${principalId} (${preset})`);
+      }
+      if (hasMcpServers) {
+        setRelationshipMcpGrants({
+          file: this.options.relationshipPolicyFile,
+          principalId,
+          deviceId,
+          grants: mcpServers,
+        });
+        this.options.log?.(`relationship MCP grants updated for ${principalId}`);
+      }
+      if (before !== relationshipPolicyContents(this.options.relationshipPolicyFile)) {
+        await this.options.adapter.invalidateRelationshipSessions?.(principalId, deviceId);
       }
     } catch (error) {
       this.options.log?.(`relationship policy update failed: ${String(error)}`);
@@ -759,6 +781,15 @@ export class RuntimeBridge {
       .map((mapping) => mapping.serverHandle)
       .find((serverHandle) => serverHandle !== activatedServerHandle);
     if (replacement) this.#pendingDefaultRoute = replacement;
+  }
+}
+
+function relationshipPolicyContents(file: string): string | undefined {
+  try {
+    return readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
 }
 

@@ -36,6 +36,7 @@ export interface RuntimeAdapter {
     payload?: Record<string, unknown>;
   }>;
   releaseCommunicationSession?(communicationSessionId: string): Promise<void>;
+  invalidateRelationshipSessions?(principalId: string, deviceId: string): Promise<void>;
   prepareCommunicationSession?(sessionHandle: string, communicationSessionId: string): Promise<void>;
   canActivateContinuation?(checkpoint: ContinuationCheckpoint): Promise<boolean>;
   quiesceContinuation?(checkpoint: ContinuationCheckpoint): Promise<void>;

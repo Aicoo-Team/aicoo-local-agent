@@ -818,6 +818,24 @@ describe("CodexAdapter managed sessions", () => {
     expect(adapter.providerThreadId("codex-managed-1")).not.toBe(firstProviderThreadId);
   });
 
+  it("invalidates a Codex thread only for the exact relationship device", async () => {
+    const driver = new FakeCodexDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_policy"), "queue");
+    await events;
+    const providerThreadId = adapter.providerThreadId("codex-managed-1");
+
+    await adapter.invalidateRelationshipSessions("prn_other", "device_a");
+    expect(adapter.providerThreadId("codex-managed-1")).toBe(providerThreadId);
+
+    await adapter.invalidateRelationshipSessions("prn_a", "device_a");
+    expect(adapter.providerThreadId("codex-managed-1")).toBeUndefined();
+  });
+
   it("discards an unbound legacy Codex thread instead of resuming it for a relationship", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-legacy-state-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
