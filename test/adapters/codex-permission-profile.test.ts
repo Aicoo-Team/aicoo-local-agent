@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -100,7 +100,11 @@ describe("codex permission profile", () => {
 
   it("writes a private CODEX_HOME so the owner's own config cannot leak in", () => {
     const dir = tempDir("codex-profile-");
-    const authFile = join(dir, "source-auth.json");
+    const ownerHome = join(dir, "owner-home");
+    const ownerPlugin = join(ownerHome, "plugins", "owner-private-plugin");
+    mkdirSync(ownerPlugin, { recursive: true });
+    writeFileSync(join(ownerPlugin, "plugin.json"), '{"name":"owner-private-plugin"}');
+    const authFile = join(ownerHome, "auth.json");
     writeFileSync(authFile, '{"token":"test-only"}', { mode: 0o600 });
     const prepared = writeCodexPermissionProfile(join(dir, "home"), {
       preset: "read-project",
@@ -109,6 +113,9 @@ describe("codex permission profile", () => {
     })!;
     expect(prepared.profileName).toBe(CODEX_PROFILE_NAME);
     expect(readFileSync(join(prepared.codexHome, "auth.json"), "utf8")).toBe('{"token":"test-only"}');
+    // A plugin can bundle skills, MCP servers, and executable hooks. Copying the owner's
+    // plugin directory would grant all of those without a relationship-level capability record.
+    expect(existsSync(join(prepared.codexHome, "plugins"))).toBe(false);
     expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain('":root" = "deny"');
   });
 });

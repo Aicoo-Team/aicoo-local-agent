@@ -158,6 +158,12 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 - The generated private Codex home disables conversation history and memory
   generation for external context, uses a private file OAuth store, hides every
   unlisted MCP tool, and bounds startup/tool execution time.
+- Whole Codex plugin bundles are intentionally not inherited or grantable in this
+  phase. A plugin may include skills, MCP servers, browser capabilities, or executable
+  hooks; granting its name would not express which of those powers the owner approved.
+  Owners can grant the plugin's remote MCP endpoint and exact tool allowlist instead.
+  Native plugin grants require a separate manifest-level capability contract and the
+  same new-session invalidation lifecycle before they can be enabled.
 
 The hosted control plane must include `senderDeviceId` in dispatch envelopes,
 and `requesterDeviceId` in grant responses, both derived from authenticated

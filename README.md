@@ -26,9 +26,9 @@ The central rule: **a message conveys intent and context, not authority.**
 - **Receiver isolation.** By default the receiving session is a **tools-disabled, text-only**
   responder: it may read the message and answer in plain text, but it cannot run commands,
   touch the filesystem, browse, or exfiltrate data. Tool access is off unless the owner opts in.
-- **Tool access is currently disabled.** Relationship policies can record verified user/device
-  identity for future presets, but Claude Code and Codex adapters run text-only today. File/tool
-  access stays off until OS-level sandboxing, audit, and revocation semantics are in place.
+- **Tool access is explicit and gated.** Every relationship starts text-only. The owner may grant
+  read/edit project access, and the wider full-agent surface stays closed until OS-level
+  sandboxing, approval, redaction, and rebuild-health gates pass.
 - **Grant-scoped, revocable delivery.** A sender can only message a recipient through an active,
   time-boxed **communication grant** that the recipient (or an offer they published) authorized.
   Every injection is **re-validated against the control plane at delivery time**, so a revoked or
@@ -261,6 +261,9 @@ through the same gate. Codex owner MCP/plugin configuration remains isolated unt
 an integration is represented by an explicit relationship grant. Codex currently
 projects remote HTTP MCP grants with exact server URLs and tool allowlists; it never
 copies ambient owner configuration, stdio launch commands, or static headers.
+Whole Codex plugins are not yet grantable: plugins may also contain skills, hooks, and
+other capabilities that the MCP-only relationship contract cannot scope honestly. Grant
+the plugin's remote MCP server and exact tools instead; plugin bundles remain isolated.
 See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
 
 ## Develop
