@@ -8,6 +8,7 @@ import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
 import { bridgeHealthIsFresh, parseBridgeHealth } from "../bridge/health.js";
 import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
+import { readProcessWatchdogDiagnostic, startProcessWatchdog } from "../bridge/process-watchdog.js";
 import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport, type ResolvedPersonResponse } from "../shared/http-client.js";
@@ -1043,6 +1044,16 @@ program.command("doctor")
               ? {}
               : { next: "Restart the bridge and inspect bridge.log for heartbeat or event-loop failures." }),
           });
+          const processWatchdog = readProcessWatchdogDiagnostic(`${resolve(options.spool)}.watchdog.json`);
+          if (processWatchdog) {
+            checks.push({
+              name: "processWatchdog",
+              ok: false,
+              detail: processWatchdog,
+              next: "The independent watchdog stopped a stalled bridge. Restart it, then attach bridge.log "
+                + "and this watchdog diagnostic to the incident report.",
+            });
+          }
         } finally {
           spool.close();
         }
@@ -1203,6 +1214,11 @@ async function startBridge(options: {
   spool.setIdentity("ownerDeviceId", ownerIdentity.deviceId);
   spool.setIdentity("bridgeInstanceId", bridgeInstanceId);
   spool.setIdentity("spoolFile", resolve(options.spool));
+  // This watchdog owns a separate event loop. Unlike heartbeat timers in this process, it can
+  // still stop the daemon if runtime execution completely starves the bridge's main thread.
+  const processWatchdog = startProcessWatchdog({
+    diagnosticFile: `${resolve(options.spool)}.watchdog.json`,
+  });
   const bridge = new RuntimeBridge({
     transport,
     spool,
@@ -1234,7 +1250,16 @@ async function startBridge(options: {
       console.log(`[local-helper] not started: ${String(error)}`);
     }
   }
-  const started = await bridge.start();
+  let started: Awaited<ReturnType<RuntimeBridge["start"]>>;
+  try {
+    started = await bridge.start();
+  } catch (error) {
+    await processWatchdog.stop();
+    localHelper?.close();
+    if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
+    spool.close();
+    throw error;
+  }
   if (options.json) {
     console.log(JSON.stringify({
       status: "ready",
@@ -1262,6 +1287,7 @@ async function startBridge(options: {
   }
   const shutdown = async () => {
     await bridge.stop();
+    await processWatchdog.stop();
     localHelper?.close();
     if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
     spool.deleteIdentity("relationshipPolicyFile");

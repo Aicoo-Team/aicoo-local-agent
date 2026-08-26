@@ -83,7 +83,10 @@ npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapte
 The bridge registers its endpoint/sessions, persists local state in the spool, and publishes a
 default route automatically from the heartbeat loop. Claude standby slots remain cold until an
 inbound task arrives; they do not keep idle provider processes running. Sustained heartbeat
-failures are persisted as local bridge health and use bounded exponential backoff.
+failures are persisted as local bridge health and use bounded exponential backoff. An independent
+worker also monitors main-event-loop progress. If the bridge is completely stalled for two minutes,
+the worker records a `<spool>.watchdog.json` diagnostic and terminates the daemon rather than letting
+it consume CPU indefinitely.
 
 **3. Check readiness**:
 
@@ -93,7 +96,8 @@ npm run ccd -- --server http://127.0.0.1:7790 --token <token> doctor --spool me.
 ```
 
 `doctor` reports `localBridgeHealth` from the spool. A stale health timestamp is treated as a
-failure, so a blocked event loop cannot continue presenting an old healthy result.
+failure, so a blocked event loop cannot continue presenting an old healthy result. It also reports
+the watchdog diagnostic when the independent worker terminated a stalled bridge.
 
 **4. Drive the two-user flow** — request a grant, accept it, send a message, watch delivery:
 
