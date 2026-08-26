@@ -76,6 +76,31 @@ describe("safe Git collaboration tools", () => {
       .toContain("shell staged");
   });
 
+  it("renders every Windows Claude Git command for Git Bash with native Git isolation", () => {
+    const repository = makeRepository();
+    const operations = [
+      safeGitOperation({ toolName: "GitStatus", repository }),
+      safeGitOperation({ toolName: "GitDiff", repository }),
+      safeGitOperation({ toolName: "GitLog", repository }),
+      safeGitOperation({ toolName: "GitAdd", repository, paths: ["notes.txt"] }),
+      safeGitOperation({ toolName: "GitCommit", repository, message: "windows test" }),
+    ];
+
+    for (const operation of operations) {
+      expect(operation).toBeDefined();
+      const input = safeGitShellInput(operation!, "win32");
+      expect(input.command).toContain("GIT_CONFIG_NOSYSTEM='1'");
+      expect(input.command).toContain("GIT_CONFIG_GLOBAL='NUL'");
+      expect(input.command).toContain("GIT_TERMINAL_PROMPT='0'");
+      expect(input.command).toContain("core.hooksPath=NUL");
+      expect(input.command).not.toContain("/dev/null");
+    }
+
+    const add = safeGitShellInput(operations[3]!, "win32");
+    expect(add.command).toContain("hash-object");
+    expect(add.command).toContain("update-index");
+  });
+
   function makeRepository(): string {
     const directory = mkdtempSync(join(tmpdir(), "ccd-safe-git-"));
     directories.push(directory);

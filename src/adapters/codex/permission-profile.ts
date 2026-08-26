@@ -92,6 +92,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   ])];
   const developerDirectory = folders.length > 0 ? resolveDeveloperDirectory(input) : undefined;
   const runtimeTempDirectory = folders.length > 0 ? input.runtimeTempDirectory : undefined;
+  const gitConfigGlobal = nullDevice(input.platform ?? process.platform);
 
   return [
     `default_permissions = ${tomlString(name)}`,
@@ -109,7 +110,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     'inherit = "core"',
     `exclude = [${shellEnvironmentExclusions.map(tomlString).join(", ")}]`,
     ...(runtimeTempDirectory ? [
-      `set = { TMPDIR = ${tomlString(runtimeTempDirectory)}, GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }`,
+      `set = { TMPDIR = ${tomlString(runtimeTempDirectory)}, GIT_CONFIG_GLOBAL = ${tomlString(gitConfigGlobal)}, GIT_CONFIG_NOSYSTEM = "1" }`,
     ] : []),
     "",
     `[permissions.${name}]`,
@@ -183,6 +184,7 @@ export function writeCodexPermissionProfile(
   chmodSync(directory, 0o700);
   const hasProjectAccess = input.preset !== "chat-only"
     && input.folders.some((folder) => folder.trim().length > 0);
+  const gitConfigGlobal = nullDevice(input.platform ?? process.platform);
   const runtimeTempDirectory = hasProjectAccess ? join(directory, "tmp") : undefined;
   if (runtimeTempDirectory) {
     mkdirSync(runtimeTempDirectory, { recursive: true, mode: 0o700 });
@@ -207,11 +209,15 @@ export function writeCodexPermissionProfile(
     ...(runtimeTempDirectory ? {
       environment: {
         TMPDIR: runtimeTempDirectory,
-        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_GLOBAL: gitConfigGlobal,
         GIT_CONFIG_NOSYSTEM: "1",
       },
     } : {}),
   };
+}
+
+function nullDevice(platform: NodeJS.Platform): string {
+  return platform === "win32" ? "NUL" : "/dev/null";
 }
 
 function tomlString(value: string): string {

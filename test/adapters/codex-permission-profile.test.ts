@@ -52,6 +52,24 @@ describe("codex permission profile", () => {
     expect(profile).toContain('"/Library/Developer/CommandLineTools" = "read"');
   });
 
+  it("uses the native null device for Git in Windows project sessions", () => {
+    const dir = tempDir("codex-windows-profile-");
+    const prepared = writeCodexPermissionProfile(join(dir, "home"), {
+      preset: "read-project",
+      folders: ["C:\\work\\project"],
+      platform: "win32",
+      authFile: join(dir, "missing-auth.json"),
+    })!;
+    const profile = readFileSync(join(prepared.codexHome, "config.toml"), "utf8");
+
+    expect(prepared.environment).toMatchObject({
+      GIT_CONFIG_GLOBAL: "NUL",
+      GIT_CONFIG_NOSYSTEM: "1",
+    });
+    expect(profile).toContain('GIT_CONFIG_GLOBAL = "NUL"');
+    expect(profile).not.toContain("/Library/Developer/CommandLineTools");
+  });
+
   it("grants write only for edit-project", () => {
     const read = renderCodexPermissionProfile({ preset: "read-project", folders: ["/srv/p"] })!;
     const edit = renderCodexPermissionProfile({ preset: "edit-project", folders: ["/srv/p"] })!;
