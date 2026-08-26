@@ -1,4 +1,5 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { RelationshipAccessPreset } from "../../security/relationship-policy.js";
@@ -47,6 +48,12 @@ export interface CodexPermissionProfileInput {
   authFile?: string;
   /** Exact relationship grants; never inferred by copying the owner's Codex configuration. */
   mcpServers?: readonly RemoteMcpGrantInput[];
+  /** Test seam for platform-specific system-tool dependencies. */
+  platform?: NodeJS.Platform;
+  /** Test seam; production discovers the active macOS toolchain with xcode-select. */
+  developerDirectory?: string;
+  /** Private scratch directory for system-tool caches; never shared with the project. */
+  runtimeTempDirectory?: string;
 }
 
 /**
@@ -83,6 +90,8 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     "DATABASE_URL",
     ...mcpServers.flatMap((server) => server.bearerTokenEnvVar ? [server.bearerTokenEnvVar] : []),
   ])];
+  const developerDirectory = folders.length > 0 ? resolveDeveloperDirectory(input) : undefined;
+  const runtimeTempDirectory = folders.length > 0 ? input.runtimeTempDirectory : undefined;
 
   return [
     `default_permissions = ${tomlString(name)}`,
@@ -99,6 +108,9 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     "[shell_environment_policy]",
     'inherit = "core"',
     `exclude = [${shellEnvironmentExclusions.map(tomlString).join(", ")}]`,
+    ...(runtimeTempDirectory ? [
+      `set = { TMPDIR = ${tomlString(runtimeTempDirectory)}, GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }`,
+    ] : []),
     "",
     `[permissions.${name}]`,
     `description = "Aicoo c2c relationship (${input.preset})"`,
@@ -114,6 +126,8 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     // then add back only what a process needs to start.
     '":root" = "deny"',
     '":minimal" = "read"',
+    ...(developerDirectory ? [`${tomlString(developerDirectory)} = "read"`] : []),
+    ...(runtimeTempDirectory ? [`${tomlString(runtimeTempDirectory)} = "write"`] : []),
     ...writableFolders.map((folder) => `${tomlString(folder)} = "write"`),
     "",
     ...(folders.length > 0 ? [
@@ -130,11 +144,30 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   ].join("\n");
 }
 
+function resolveDeveloperDirectory(input: CodexPermissionProfileInput): string | undefined {
+  if ((input.platform ?? process.platform) !== "darwin") return undefined;
+  if (input.developerDirectory !== undefined) return input.developerDirectory.trim() || undefined;
+
+  try {
+    const selected = execFileSync("/usr/bin/xcode-select", ["-p"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    }).trim();
+    if (!selected || !existsSync(selected)) return undefined;
+    return realpathSync.native(selected);
+  } catch {
+    return undefined;
+  }
+}
+
 export interface PreparedCodexProfile {
   /** Value for the CODEX_HOME environment variable of the spawned process. */
   codexHome: string;
   profileName: string;
   workspaceRoots?: string[];
+  /** Environment required by platform tools without inheriting owner configuration. */
+  environment?: Record<string, string>;
 }
 
 /**
@@ -146,10 +179,17 @@ export function writeCodexPermissionProfile(
   directory: string,
   input: CodexPermissionProfileInput,
 ): PreparedCodexProfile | undefined {
-  const profile = renderCodexPermissionProfile(input);
-  if (!profile) return undefined;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);
+  const hasProjectAccess = input.preset !== "chat-only"
+    && input.folders.some((folder) => folder.trim().length > 0);
+  const runtimeTempDirectory = hasProjectAccess ? join(directory, "tmp") : undefined;
+  if (runtimeTempDirectory) {
+    mkdirSync(runtimeTempDirectory, { recursive: true, mode: 0o700 });
+    chmodSync(runtimeTempDirectory, 0o700);
+  }
+  const profile = renderCodexPermissionProfile({ ...input, ...(runtimeTempDirectory ? { runtimeTempDirectory } : {}) });
+  if (!profile) return undefined;
   writeFileSync(join(directory, "config.toml"), profile, { mode: 0o600 });
   // CODEX_HOME isolates the owner's settings, plugins and MCP configuration, but Codex also
   // locates its login there. Copy only the credential file into the private home; the generated
@@ -164,6 +204,13 @@ export function writeCodexPermissionProfile(
     codexHome: directory,
     profileName: input.profileName ?? CODEX_PROFILE_NAME,
     workspaceRoots: [...new Set(input.folders)],
+    ...(runtimeTempDirectory ? {
+      environment: {
+        TMPDIR: runtimeTempDirectory,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+      },
+    } : {}),
   };
 }
 

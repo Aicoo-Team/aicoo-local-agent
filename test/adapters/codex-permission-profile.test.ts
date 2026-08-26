@@ -41,6 +41,17 @@ describe("codex permission profile", () => {
     expect(profile).toContain('"." = "read"');
   });
 
+  it("lets macOS developer-tool shims read the selected toolchain", () => {
+    const profile = renderCodexPermissionProfile({
+      preset: "read-project",
+      folders: ["/srv/project"],
+      platform: "darwin",
+      developerDirectory: "/Library/Developer/CommandLineTools",
+    })!;
+
+    expect(profile).toContain('"/Library/Developer/CommandLineTools" = "read"');
+  });
+
   it("grants write only for edit-project", () => {
     const read = renderCodexPermissionProfile({ preset: "read-project", folders: ["/srv/p"] })!;
     const edit = renderCodexPermissionProfile({ preset: "edit-project", folders: ["/srv/p"] })!;
@@ -98,6 +109,20 @@ describe("codex permission profile", () => {
     expect(profile).not.toContain("http_headers");
   });
 
+  it("does not expose the macOS toolchain or scratch directory to MCP-only sessions", () => {
+    const profile = renderCodexPermissionProfile({
+      preset: "chat-only",
+      folders: [],
+      platform: "darwin",
+      developerDirectory: "/Library/Developer/CommandLineTools",
+      runtimeTempDirectory: "/private/aicoo/session-tmp",
+      mcpServers: [{ name: "docs", url: "https://mcp.example.com/v1", enabledTools: ["search"] }],
+    })!;
+
+    expect(profile).not.toContain("/Library/Developer/CommandLineTools");
+    expect(profile).not.toContain("/private/aicoo/session-tmp");
+  });
+
   it("writes a private CODEX_HOME so the owner's own config cannot leak in", () => {
     const dir = tempDir("codex-profile-");
     const ownerHome = join(dir, "owner-home");
@@ -112,6 +137,14 @@ describe("codex permission profile", () => {
       authFile,
     })!;
     expect(prepared.profileName).toBe(CODEX_PROFILE_NAME);
+    expect(prepared.environment).toMatchObject({
+      TMPDIR: join(prepared.codexHome, "tmp"),
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+    });
+    expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain(
+      `set = { TMPDIR = ${JSON.stringify(join(prepared.codexHome, "tmp"))}, GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }`,
+    );
     expect(readFileSync(join(prepared.codexHome, "auth.json"), "utf8")).toBe('{"token":"test-only"}');
     // A plugin can bundle skills, MCP servers, and executable hooks. Copying the owner's
     // plugin directory would grant all of those without a relationship-level capability record.
@@ -162,7 +195,7 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
     writeFileSync(join(granted, "readme.txt"), "IN-SCOPE-FILE\n");
     writeFileSync(join(outside, "secret.txt"), "CANARY-SHOULD-NOT-LEAK\n");
     const prepared = writeCodexPermissionProfile(join(root, "codexhome"), { preset, folders: [granted] })!;
-    return { granted, outside, codexHome: prepared.codexHome };
+    return { granted, outside, codexHome: prepared.codexHome, environment: prepared.environment };
   }
 
   it("read-project reads inside the grant and nothing outside it", () => {
@@ -181,6 +214,27 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
 
     const write = probe(codexHome, granted, ["sh", "-c", `echo x > ${join(granted, "w.txt")}`]);
     expect(write.ok, "read-project must not be able to write").toBe(false);
+  });
+
+  it.skipIf(process.platform !== "darwin")("lets Apple Git reach its selected developer toolchain", () => {
+    const { granted, codexHome, environment } = setup("read-project");
+
+    const git = (() => {
+      try {
+        const output = execFileSync("codex", ["sandbox", "-P", CODEX_PROFILE_NAME, "-C", granted, "--", "/usr/bin/git", "--version"], {
+          env: { ...process.env, ...environment, CODEX_HOME: codexHome },
+          encoding: "utf8",
+          stdio: "pipe",
+          timeout: 60_000,
+        });
+        return { ok: true, output };
+      } catch (error) {
+        const err = error as { stdout?: string; stderr?: string };
+        return { ok: false, output: `${err.stdout ?? ""}${err.stderr ?? ""}` };
+      }
+    })();
+    expect(git.ok, `Apple Git should work inside the scoped sandbox: ${git.output}`).toBe(true);
+    expect(git.output).toContain("git version");
   });
 
   it("edit-project writes inside the grant, but never outside it and never to the network", () => {

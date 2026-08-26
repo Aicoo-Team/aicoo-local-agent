@@ -29,6 +29,7 @@ import { ContinuationStore } from "../shared/continuation-store.js";
 import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import { ContinuationRecovery } from "./continuation-recovery.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
+import { HeartbeatWatchdog } from "./health.js";
 import { BridgeSpool } from "./spool.js";
 
 /**
@@ -40,6 +41,8 @@ import { BridgeSpool } from "./spool.js";
  * routing, which presents to the sender as "their local agent is not running".
  */
 const DEFAULT_HEARTBEAT_MS = 10_000;
+const DEFAULT_HEARTBEAT_FAILURE_THRESHOLD = 3;
+const DEFAULT_HEARTBEAT_MAX_BACKOFF_MS = 60_000;
 
 export interface BridgeOptions {
   transport: HttpMessageTransport;
@@ -50,6 +53,8 @@ export interface BridgeOptions {
   adapterVersion?: string;
   workspaceBoundary?: string;
   heartbeatMs?: number;
+  heartbeatFailureThreshold?: number;
+  heartbeatMaxBackoffMs?: number;
   injectorMs?: number;
   relationshipPolicyFile?: string;
   trustedToolPolicyFile?: string;
@@ -77,11 +82,19 @@ export class RuntimeBridge {
   readonly #bridgeInstanceId: string;
   readonly #continuationRecovery: ContinuationRecovery;
   readonly #boundaryTelemetry: BoundaryTelemetry;
+  readonly #heartbeatWatchdog: HeartbeatWatchdog;
 
   constructor(private readonly options: BridgeOptions) {
     this.#bridgeInstanceId = options.bridgeInstanceId ?? id("bridge");
     const continuationStore = new ContinuationStore(options.spool.db);
     this.#boundaryTelemetry = new BoundaryTelemetry(options.spool.db);
+    const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    this.#heartbeatWatchdog = new HeartbeatWatchdog({
+      heartbeatMs,
+      maxBackoffMs: options.heartbeatMaxBackoffMs ?? DEFAULT_HEARTBEAT_MAX_BACKOFF_MS,
+      failureThreshold: options.heartbeatFailureThreshold ?? DEFAULT_HEARTBEAT_FAILURE_THRESHOLD,
+      persist: (state) => options.spool.setIdentity("bridgeHealth", JSON.stringify(state)),
+    });
     options.adapter.configureContinuationStore?.(continuationStore);
     this.#continuationRecovery = new ContinuationRecovery(
       continuationStore,
@@ -222,6 +235,7 @@ export class RuntimeBridge {
 
   async stop(): Promise<void> {
     this.#controller.abort();
+    this.#heartbeatWatchdog.stop();
     if (this.#beforeExitHandler) {
       process.off("beforeExit", this.#beforeExitHandler);
       this.#beforeExitHandler = undefined;
@@ -628,22 +642,49 @@ export class RuntimeBridge {
   }
 
   private async runHeartbeat(): Promise<void> {
+    let nextHeartbeatInMs = this.options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    let unhealthyReported = false;
     while (!this.#controller.signal.aborted) {
-      await delay(this.options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, this.#controller.signal);
+      const delayStartedAt = Date.now();
+      await delay(nextHeartbeatInMs, this.#controller.signal);
       if (this.#controller.signal.aborted) return;
+      const eventLoopLagMs = Math.max(0, Date.now() - delayStartedAt - nextHeartbeatInMs);
       try {
         await this.options.transport.heartbeatEndpoint(this.requireEndpoint());
+        const health = this.#heartbeatWatchdog.recordSuccess(eventLoopLagMs);
+        nextHeartbeatInMs = health.nextHeartbeatInMs;
+        if (health.status === "healthy" && unhealthyReported) {
+          this.options.log?.("[bridge] HEALTHY: heartbeat recovered; C2C presence is online again.");
+          unhealthyReported = false;
+        } else if (health.status === "degraded") {
+          this.options.log?.(
+            `[bridge] DEGRADED: heartbeat succeeded, but the event loop was delayed by ${eventLoopLagMs}ms.`,
+          );
+        }
       } catch (error) {
+        let authenticationFailure = false;
         if (error instanceof ApiError && error.status === 401) {
+          authenticationFailure = true;
           const recovered = await this.options.transport.recoverAuthentication();
           if (recovered.recovered) {
             this.options.log?.(`[bridge] Device token refreshed from ${recovered.source}; heartbeat will resume.`);
           } else {
             this.options.log?.(`[bridge] Device token rejected (401); recovery pending: ${recovered.reason}.`);
           }
-          continue;
         }
+        const health = this.#heartbeatWatchdog.recordFailure(error, eventLoopLagMs);
+        nextHeartbeatInMs = health.nextHeartbeatInMs;
         this.options.log?.(`heartbeat failed: ${String(error)}`);
+        if (health.status === "unhealthy" && !unhealthyReported) {
+          unhealthyReported = true;
+          this.options.log?.(
+            `[bridge] UNHEALTHY: ${health.consecutiveHeartbeatFailures} consecutive heartbeat failures; `
+              + `presence is offline. Retrying with ${health.nextHeartbeatInMs}ms backoff. `
+              + `Run 'ccd doctor --spool ${this.options.spool.getIdentity("spoolFile") ?? "<bridge.spool>"}' `
+              + "and inspect bridge.log.",
+          );
+        }
+        if (authenticationFailure) continue;
       }
       await this.flushRelationshipMcpAcknowledgements();
       // Publish the default route from here, not start(): by the first heartbeat the

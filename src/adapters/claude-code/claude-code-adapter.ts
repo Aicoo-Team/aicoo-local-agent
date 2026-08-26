@@ -192,9 +192,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     if (this.#closed) throw new Error("ClaudeCodeAdapter is closed");
     if (this.#initialized) return;
     this.#closing = false;
-    for (const session of this.#sessions.values()) {
-      if (session.state !== "closed") await this.startSession(session);
-    }
+    // Keep standby slots as durable descriptors only. Starting the Claude SDK here creates one
+    // child process and one live query stream per slot even when no peer task exists. Besides
+    // wasting memory, field evidence showed those idle streams could starve the bridge heartbeat.
+    // The first sender-scoped delivery launches the slot with its exact sandbox boundary.
     this.#initialized = true;
   }
 
@@ -347,7 +348,6 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     if (session.state === "busy" || session.accepting || session.pendingAcks.size > 0 || session.acceptedTurns.length > 0) {
       return { status: "queued_busy" } as const;
     }
-    if (!session.query) return { status: "runtime_unavailable" } as const;
     const communicationSessionId = message.communicationSessionId;
     if (!communicationSessionId) return { status: "permission_required" } as const;
     if (
@@ -370,6 +370,18 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       return { status: "project_access_required" } as const;
     }
     const selectedBoundaryKey = sandboxBoundaryKey(projectAccess);
+    if (!session.query && session.boundCommunicationSessionId === communicationSessionId) {
+      try {
+        await this.launchSession(session, message);
+        session.sandboxPrincipalId = message.senderPrincipalId;
+        session.sandboxDeviceId = message.senderDeviceId;
+        session.sandboxBoundaryKey = selectedBoundaryKey;
+        session.sandboxAccess = projectAccess;
+      } catch (error) {
+        this.#config.log?.(`Claude persisted session failed to resume: ${String(error)}`);
+        return { status: "runtime_unavailable" } as const;
+      }
+    }
     if (message.kind === "task_invite" && projectAccess?.status === "selected") {
       this.#boundaryTelemetry.recordEligibleTask({
         messageId: message.id,
@@ -701,7 +713,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
        WHERE local_handle = ?`,
     ).run(session.providerSessionId, nowIso(), session.localHandle);
     session.resetting = false;
-    if (this.#initialized && !this.#closing && !this.#closed) await this.startSession(session);
+    // Leave a released slot cold. The next inbound task will start it with that sender's exact
+    // relationship boundary instead of keeping an unbound provider process alive indefinitely.
   }
 
   private async relaunchForSender(session: ManagedSession, message: InboundMessage): Promise<void> {

@@ -5,6 +5,7 @@ import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
 import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
+import { bridgeHealthIsFresh, parseBridgeHealth } from "../bridge/health.js";
 import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
 import { BridgeSpool } from "../bridge/spool.js";
@@ -436,7 +437,15 @@ program.command("start")
     await startBridge({ ...options, hosted: true, server: hostedServerUrl() });
   });
 
-program.command("whoami").action(async () => print(await makeClient().whoami()));
+program.command("whoami")
+  .description("show the Aicoo identity bound to this machine")
+  .option("--spool <file>", "bridge spool whose saved device credential should be used", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .action(async (options, command) => {
+    const server = commandLineOption(command, "server", options.server);
+    const spool = commandLineOption(command, "spool", options.spool);
+    print(await makeHostedClient(server, spool).whoami());
+  });
 
 const trustedTools = program.command("trusted-access")
   .alias("trusted-tools")
@@ -1022,6 +1031,18 @@ program.command("doctor")
             detail: { endpointId, sessions },
             ...(endpointId && sessions.length > 0 ? {} : { next: "Start the bridge with this spool file." }),
           });
+          const bridgeHealth = parseBridgeHealth(spool.getIdentity("bridgeHealth"));
+          const bridgeHealthFresh = bridgeHealth ? bridgeHealthIsFresh(bridgeHealth) : false;
+          checks.push({
+            name: "localBridgeHealth",
+            ok: bridgeHealthFresh
+              && (bridgeHealth?.status === "healthy" || bridgeHealth?.status === "starting"),
+            detail: bridgeHealth ? { ...bridgeHealth, fresh: bridgeHealthFresh } : { status: "unknown" },
+            ...(bridgeHealthFresh
+              && (bridgeHealth?.status === "healthy" || bridgeHealth?.status === "starting")
+              ? {}
+              : { next: "Restart the bridge and inspect bridge.log for heartbeat or event-loop failures." }),
+          });
         } finally {
           spool.close();
         }
@@ -1181,6 +1202,7 @@ async function startBridge(options: {
   spool.setIdentity("ownerPrincipalId", ownerIdentity.principalId);
   spool.setIdentity("ownerDeviceId", ownerIdentity.deviceId);
   spool.setIdentity("bridgeInstanceId", bridgeInstanceId);
+  spool.setIdentity("spoolFile", resolve(options.spool));
   const bridge = new RuntimeBridge({
     transport,
     spool,

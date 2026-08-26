@@ -188,6 +188,32 @@ describe("trusted collaborator access presets", () => {
     )).toMatchObject({ behavior: "deny" });
   });
 
+  it("lets the local owner revoke a synchronized policy without supplying its server revision", () => {
+    // Regression: `ccd trusted-access revoke` omitted serverRevision, which became revision zero
+    // and was rejected as stale for every policy originally synchronized from Aicoo settings.
+    const fixture = setup();
+    const policy = upsertTrustedToolPolicy({
+      file: fixture.trustedFile,
+      policyId: "ttp_server_managed",
+      ownerPrincipalId: "owner",
+      ownerDeviceId: "owner-device",
+      requesterPrincipalId: "requester",
+      requesterDeviceId: "requester-device",
+      folder: fixture.project,
+      accessPreset: "edit-project",
+      scope: "persistent",
+      createdFrom: "settings",
+      createdBy: "owner",
+      serverRevision: 9,
+    });
+
+    expect(revokeTrustedToolPolicy({
+      file: fixture.trustedFile,
+      policyId: policy.policyId,
+      revokedBy: "owner",
+    })).toMatchObject({ status: "revoked", revokedBy: "owner" });
+  });
+
   it("rejects filesystem roots", () => {
     const fixture = setup();
     expect(() => upsertTrustedToolPolicy({

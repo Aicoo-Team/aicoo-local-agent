@@ -16,6 +16,26 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   });
 
+  it("keeps standby sessions cold until an inbound task needs one", async () => {
+    // Regression: pre-launching every standby Claude stream left idle SDK processes attached to
+    // the bridge and could starve heartbeat processing while no C2C task was running.
+    const driver = new FakeClaudeAgentDriver("lazy reply");
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+
+    expect(await adapter.listSessions()).toHaveLength(1);
+    expect(driver.starts).toHaveLength(0);
+
+    await expect(adapter.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_lazy_start"),
+      "new_turn",
+    )).resolves.toMatchObject({ status: "runtime_acked" });
+    expect(driver.starts).toHaveLength(1);
+  });
+
   it("starts a policy-gated managed stream and ACKs only the provider echo", async () => {
     const driver = new FakeClaudeAgentDriver("P1_REPLY_OK");
     const adapter = makeAdapter(driver);
@@ -28,6 +48,8 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       state: "idle",
       allowInbound: true,
     })]);
+    const events = collectEvents(adapter, "claude-managed-1", 2);
+    const result = await adapter.deliverToSession("claude-managed-1", inbound("msg_initial"), "new_turn");
     const options = driver.starts.at(-1)!.options;
     expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
     expect(options.allowedTools).toEqual([]);
@@ -67,8 +89,6 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
     });
 
-    const events = collectEvents(adapter, "claude-managed-1", 2);
-    const result = await adapter.deliverToSession("claude-managed-1", inbound("msg_initial"), "new_turn");
     expect(result.status).toBe("runtime_acked");
     if (result.status === "runtime_acked") expect(result.runtimeAckId).toMatch(/^claude:[^:]+:[^:]+$/);
     expect(await events).toEqual([
@@ -423,7 +443,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
       kind: "task_invite",
       payload: { task: "Summarize the project and explain its current state." },
     }), "queue")).toEqual({ status: "project_access_required" });
-    expect(driver.starts).toHaveLength(1);
+    expect(driver.starts).toHaveLength(0);
   });
 
   it("reuses one Claude boundary for the same objective-preflight project set", async () => {
@@ -670,14 +690,18 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     await first.initialize();
     const providerSessionId = first.providerSessionId("claude-managed-1");
     await first.close();
+    const legacyDb = new DatabaseSync(stateFile);
+    legacyDb.prepare(
+      "UPDATE managed_sessions SET initialized = 1, bound_comm_session_id = NULL WHERE local_handle = ?",
+    ).run("claude-managed-1");
+    legacyDb.close();
 
     const secondDriver = new FakeClaudeAgentDriver();
     const second = new ClaudeCodeAdapter({ stateFile, cwd: directory, driver: secondDriver });
     cleanups.push(() => second.close());
     await second.initialize();
     expect(second.providerSessionId("claude-managed-1")).not.toBe(providerSessionId);
-    expect(secondDriver.starts[0]?.options.resume).toBeUndefined();
-    expect(secondDriver.starts[0]?.options.sessionId).toBe(second.providerSessionId("claude-managed-1"));
+    expect(secondDriver.starts).toHaveLength(0);
   });
 
   it("resumes a provider conversation only for its persisted communication session", async () => {
@@ -702,12 +726,20 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     cleanups.push(() => second.close());
     await second.initialize();
     expect(second.providerSessionId("claude-managed-1")).toBe(providerSessionId);
-    expect(secondDriver.starts[0]?.options.resume).toBe(providerSessionId);
+    expect(secondDriver.starts).toHaveLength(0);
     expect(await second.deliverToSession(
       "claude-managed-1",
       inbound("msg_wrong_grant", { communicationSessionId: "comm_other" }),
       "queue",
     )).toEqual({ status: "permission_required" });
+    const resumedEvents = collectEvents(second, "claude-managed-1", 2);
+    expect(await second.deliverToSession(
+      "claude-managed-1",
+      inbound("msg_resume", { communicationSessionId: "comm_bound" }),
+      "queue",
+    )).toMatchObject({ status: "runtime_acked" });
+    await resumedEvents;
+    expect(secondDriver.starts[0]?.options.resume).toBe(providerSessionId);
   });
 });
 

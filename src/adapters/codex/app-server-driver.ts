@@ -68,7 +68,11 @@ class CodexAppServerTurn implements CodexTurn {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: input.permissionProfile
-        ? { ...process.env, CODEX_HOME: input.permissionProfile.codexHome }
+        ? {
+            ...process.env,
+            ...input.permissionProfile.environment,
+            CODEX_HOME: input.permissionProfile.codexHome,
+          }
         : process.env,
       windowsVerbatimArguments: false,
     });
