@@ -66,7 +66,9 @@ export interface TeamAgentContact {
   principalId: string;
   handle: string | null;
   displayName: string;
-  teamRole: string;
+  teamRole?: string;
+  /** Absent on older servers; current servers report every discovery source. */
+  relationships?: Array<"team" | "friend">;
   role: string;
   connectionState: TeamAgentConnectionState;
   availability: "available" | "away" | "unknown";
@@ -79,6 +81,9 @@ export interface TeamAgentDirectory {
   team: { id: string; name: string } | null;
   agents: TeamAgentContact[];
 }
+
+export type AgentContact = TeamAgentContact;
+export type AgentDirectory = TeamAgentDirectory;
 
 export type Endpoint = RuntimeEndpoint;
 

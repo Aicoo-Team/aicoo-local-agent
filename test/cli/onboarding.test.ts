@@ -185,6 +185,7 @@ describe("local-agent onboarding", () => {
           handle: "alex",
           displayName: "Alex Chen",
           teamRole: "member",
+          relationships: ["team"],
           role: "Engineering",
           connectionState: "contact",
           availability: "unknown",
@@ -209,8 +210,8 @@ describe("local-agent onboarding", () => {
         },
       ],
     })).toEqual([
-      "Bridge connected. Here are the agents in Research and what they can help with:",
-      "- Alex Engineering Agent — Alex Chen's agent (Engineering; contact) — Technical feasibility",
+      "Bridge connected. Here are your Team and connected friend agents:",
+      "- Alex Engineering Agent [Team] — Alex Chen's agent (Engineering; contact) — Technical feasibility",
       "Give me a task, or tell me whose agent you want to connect with.",
     ]);
   });
@@ -219,6 +220,74 @@ describe("local-agent onboarding", () => {
     expect(formatTeamAgentWelcome({
       team: { id: "team-1", name: "Research" },
       agents: [],
-    })).toContain("No other team agents are available yet. The first task plan will still be created locally.");
+    })).toContain("The first task plan will still be created locally.");
+  });
+
+  it("introduces accepted friend agents even when the owner has no Team", () => {
+    const output = formatTeamAgentWelcome({
+      team: null,
+      agents: [
+        {
+          principalId: "friend-1",
+          handle: "sam",
+          displayName: "Sam Lee",
+          relationships: ["friend"],
+          role: "Designer",
+          connectionState: "connected",
+          availability: "available",
+          agentCard: {
+            name: "Sam's agent",
+            description: "Design collaboration",
+            supportedInterfaces: [],
+            provider: { organization: "Aicoo", url: "https://www.aicoo.io" },
+            version: "1.0.0",
+            capabilities: {},
+            defaultInputModes: ["text/plain"],
+            defaultOutputModes: ["text/plain"],
+            skills: [],
+          },
+          accessibleResources: [],
+          authorityBoundaries: [],
+        },
+      ],
+    });
+
+    expect(output[0]).toBe("Bridge connected. Here are your Team and connected friend agents:");
+    expect(output[1]).toContain("Sam's agent [Friend]");
+  });
+
+  it("labels a peer discovered through both relationships only once", () => {
+    const output = formatTeamAgentWelcome({
+      team: { id: "team-1", name: "Research" },
+      agents: [
+        {
+          principalId: "peer-1",
+          handle: "sam",
+          displayName: "Sam Lee",
+          teamRole: "member",
+          relationships: ["team", "friend"],
+          role: "Engineering",
+          connectionState: "connected",
+          availability: "away",
+          agentCard: {
+            name: "Sam's agent",
+            description: "Engineering collaboration",
+            supportedInterfaces: [],
+            provider: { organization: "Aicoo", url: "https://www.aicoo.io" },
+            version: "1.0.0",
+            capabilities: {},
+            defaultInputModes: ["text/plain"],
+            defaultOutputModes: ["text/plain"],
+            skills: [],
+          },
+          accessibleResources: [],
+          authorityBoundaries: [],
+        },
+      ],
+    });
+
+    expect(output.filter((line) => line.includes("Sam's agent"))).toEqual([
+      "- Sam's agent [Team + Friend] — Sam Lee's agent (Engineering; connected, away) — Engineering collaboration",
+    ]);
   });
 });

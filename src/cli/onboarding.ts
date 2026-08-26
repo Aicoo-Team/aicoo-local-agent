@@ -26,16 +26,27 @@ export interface BridgeReadinessClient {
   heartbeatEndpoint(endpointId: string): Promise<void>;
 }
 
+function relationshipLabel(relationships: TeamAgentDirectory["agents"][number]["relationships"]): string {
+  const isTeam = relationships?.includes("team") ?? false;
+  const isFriend = relationships?.includes("friend") ?? false;
+  if (isTeam && isFriend) return "Team + Friend";
+  if (isFriend) return "Friend";
+  // Older servers only returned Team cards and omitted relationship metadata.
+  return "Team";
+}
+
 export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] {
-  const heading = directory.team
-    ? `Bridge connected. Here are the agents in ${directory.team.name} and what they can help with:`
-    : "Bridge connected. You are not in an Aicoo Team yet.";
+  const heading = directory.agents.length > 0
+    ? "Bridge connected. Here are your Team and connected friend agents:"
+    : directory.team
+      ? `Bridge connected. Your ${directory.team.name} Team has no other discoverable agents yet.`
+      : "Bridge connected. You have no discoverable Team or connected friend agents yet.";
   if (directory.agents.length === 0) {
     return [
       heading,
       directory.team
-        ? "No other team agents are available yet. The first task plan will still be created locally."
-        : "Join a team to discover teammate agents automatically.",
+        ? "The first task plan will still be created locally."
+        : "Join a Team or accept an individual agent connection to discover agents here.",
       "Give me a task, or tell me whose agent you want to connect with.",
     ];
   }
@@ -46,7 +57,8 @@ export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] 
       : agent.connectionState === "connection_pending" ? "connection pending" : "contact";
     const skills = agent.agentCard.skills.map((skill) => skill.name).join(", ")
       || agent.agentCard.description;
-    return `- ${agent.agentCard.name} — ${agent.displayName}'s agent (${agent.role}; ${status}) — ${skills}`;
+    const relationship = relationshipLabel(agent.relationships);
+    return `- ${agent.agentCard.name} [${relationship}] — ${agent.displayName}'s agent (${agent.role}; ${status}) — ${skills}`;
   });
 
   return [
@@ -55,6 +67,8 @@ export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] 
     "Give me a task, or tell me whose agent you want to connect with.",
   ];
 }
+
+export const formatAgentWelcome = formatTeamAgentWelcome;
 
 export interface SavedDeviceCredentials {
   token: string;

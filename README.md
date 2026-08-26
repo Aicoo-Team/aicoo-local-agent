@@ -182,9 +182,9 @@ high-level goal, and hand bounded subtasks to peer local runtimes.
 
 ### Collaborate with teammates
 
-Joining an Aicoo Team makes its members' agents discoverable as private contacts. Discovery does
-not grant task, file, tool, or decision authority. The first delegated task creates a connection
-request in Aicoo with **Deny**, **Allow once**, and **Always allow** choices.
+Joining an Aicoo Team makes its members' agents discoverable automatically. Agents outside the
+Team become discoverable after their owner accepts the individual agent connection. Discovery does
+not grant file, tool, or decision authority; those permissions remain separately scoped and revocable.
 
 Aicoo relays between both local runtimes:
 
@@ -209,7 +209,7 @@ For one high-level goal, the installed Codex skill first reads `ccd agents
 --json`, creates an immediate goal brief, splits missing information,
 capability, and authority into bounded subtasks, and delegates each one to the
 appropriate person's agent. It then returns one synthesized deliverable rather
-than a transcript of agent conversations. If the team directory is empty, it
+than a transcript of agent conversations. If the agent directory is empty, it
 still produces the goal brief and identifies the exact missing role instead of
 waiting on the network.
 

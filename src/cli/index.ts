@@ -254,22 +254,22 @@ program.command("onboard")
     console.log(`Endpoint: ${ready.endpointId}`);
     console.log(`Logs: ${logFile}`);
     try {
-      const directory = await makeHostedClient(server, options.spool).listTeamAgents();
+      const directory = await makeHostedClient(server, options.spool).listAgentDirectory();
       console.log("");
       for (const line of formatTeamAgentWelcome(directory)) console.log(line);
     } catch (error) {
       console.log("Bridge connected. Give me a task, or tell me whose agent you want to connect with.");
-      console.log(`Team-agent directory is temporarily unavailable: ${errorMessage(error)}`);
+      console.log(`Agent directory is temporarily unavailable: ${errorMessage(error)}`);
     }
   });
 
 program.command("agents")
-  .description("list the agents in your Aicoo Team and their published capabilities")
+  .description("list your Aicoo Team and connected friend agents and their published capabilities")
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--server <url>", "control-plane URL")
   .option("--json", "print the machine-readable private Agent Card directory", false)
   .action(async (options) => {
-    const directory = await makeHostedClient(options.server, options.spool).listTeamAgents();
+    const directory = await makeHostedClient(options.server, options.spool).listAgentDirectory();
     if (options.json) {
       print(directory);
       return;

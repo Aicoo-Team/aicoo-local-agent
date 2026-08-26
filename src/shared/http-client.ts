@@ -316,7 +316,17 @@ export class HttpMessageTransport implements MessageTransport {
   }
 
   async listTeamAgents(): Promise<TeamAgentDirectory> {
-    return this.requestJson("/api/v1/local-agent/team-agents");
+    return this.listAgentDirectory();
+  }
+
+  async listAgentDirectory(): Promise<TeamAgentDirectory> {
+    try {
+      return await this.requestJson("/api/v1/local-agent/agent-directory");
+    } catch (error) {
+      // Rollout compatibility: older Aicoo servers expose the same shape at the Team-only path.
+      if (!(error instanceof ApiError) || error.status !== 404) throw error;
+      return this.requestJson("/api/v1/local-agent/team-agents");
+    }
   }
 
   async getDefaultRoute(): Promise<{ endpointId: string; sessionHandle: string; updatedAt: string }> {
