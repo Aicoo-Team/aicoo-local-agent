@@ -39,6 +39,8 @@ try {
   $dialog.Dispose()
 }
 `.trim();
+const FOLDER_PICKER_TITLE = "Choose a folder to share with the peer local agent";
+const FILE_PICKER_TITLE = "Choose a file to share with the peer local agent";
 
 const ALLOWED_ORIGINS = new Set([
   "https://www.aicoo.io",
@@ -139,6 +141,7 @@ export class DefaultNativePicker implements NativePicker {
     const currentPlatform = this.getPlatform();
     if (currentPlatform === "darwin") return runAppleScriptPicker(APPLE_FOLDER_SCRIPT, this.runCommand);
     if (currentPlatform === "win32") return runPowerShellPicker(WINDOWS_FOLDER_SCRIPT, this.runCommand);
+    if (currentPlatform === "linux") return runLinuxPicker("folder", this.runCommand);
     return pickerUnavailable();
   }
 
@@ -146,6 +149,7 @@ export class DefaultNativePicker implements NativePicker {
     const currentPlatform = this.getPlatform();
     if (currentPlatform === "darwin") return runAppleScriptPicker(APPLE_FILE_SCRIPT, this.runCommand);
     if (currentPlatform === "win32") return runPowerShellPicker(WINDOWS_FILE_SCRIPT, this.runCommand);
+    if (currentPlatform === "linux") return runLinuxPicker("file", this.runCommand);
     return pickerUnavailable();
   }
 }
@@ -195,6 +199,40 @@ async function runPowerShellPicker(script: string, runner: CommandRunner): Promi
   return pickerUnavailable();
 }
 
+async function runLinuxPicker(kind: "folder" | "file", runner: CommandRunner): Promise<PickerResult> {
+  const title = kind === "folder" ? FOLDER_PICKER_TITLE : FILE_PICKER_TITLE;
+  const candidates: ReadonlyArray<{ file: string; args: readonly string[] }> = [
+    {
+      file: "zenity",
+      args: [
+        "--file-selection",
+        ...(kind === "folder" ? ["--directory"] : []),
+        `--title=${title}`,
+      ],
+    },
+    {
+      file: "kdialog",
+      args: kind === "folder"
+        ? ["--getexistingdirectory", ".", "--title", title]
+        : ["--getopenfilename", ".", "*", "--title", title],
+    },
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const { stdout } = await runner(candidate.file, candidate.args);
+      const selected = stripTrailingLineEnding(stdout);
+      return selected ? { ok: true, path: selected } : pickerCancelled();
+    } catch (error) {
+      if (isCommandMissing(error) || isLinuxDisplayUnavailable(error)) continue;
+      if (isDialogCancellation(error)) return pickerCancelled();
+      return pickerUnavailable();
+    }
+  }
+
+  return pickerUnavailable();
+}
+
 function stripTrailingLineEnding(value: string): string {
   return value.endsWith("\r\n") ? value.slice(0, -2) : value.endsWith("\n") ? value.slice(0, -1) : value;
 }
@@ -206,6 +244,23 @@ function decodePowerShellPath(value: string): string | undefined {
 
 function isCommandMissing(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function isDialogCancellation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === 1;
+}
+
+function isLinuxDisplayUnavailable(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const maybe = error as { stderr?: string; message?: string };
+  const text = `${maybe.stderr ?? ""}\n${maybe.message ?? ""}`.toLowerCase();
+  return [
+    "cannot open display",
+    "cannot connect to display",
+    "could not connect to display",
+    "no display",
+    "qt.qpa.xcb",
+  ].some((marker) => text.includes(marker));
 }
 
 function pickerCancelled(): PickerResult {
