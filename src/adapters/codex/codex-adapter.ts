@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import {
   projectAccessAllowsAction,
   RelationshipPolicy,
+  taskRequiresProjectAccess,
   type ProjectAccess,
 } from "../../security/relationship-policy.js";
 import { parseSafeGitCommand } from "../../security/safe-git.js";
@@ -254,6 +255,14 @@ export class CodexAdapter implements RuntimeAdapter {
       if (!/duplicate column/i.test(String(error))) throw error;
     }
     this.loadOrCreateSessions(config.sessionCount ?? 1);
+    if (config.capabilitySurface === "full-agent") {
+      // Codex fixes MCP and kernel capabilities when a provider thread is created. A bridge
+      // restart may load different relationship grants, so resuming a persisted full-agent
+      // thread could silently keep the old surface. Rebuild once per bridge run; in-run policy
+      // changes use invalidateRelationshipSessions and remain limited to the affected device.
+      this.#db.prepare("UPDATE managed_sessions SET provider_thread_id = NULL").run();
+      for (const session of this.#sessions.values()) session.providerThreadId = undefined;
+    }
     this.#events.setMaxListeners(100);
   }
 
@@ -276,6 +285,44 @@ export class CodexAdapter implements RuntimeAdapter {
     } catch {
       return false;
     }
+  }
+
+  async attestBoundaryActivation(input: {
+    continuationId: string;
+    grantId: string;
+    grantRevision: number;
+    canonicalFolder: string;
+    accessPreset: "read-project" | "edit-project";
+  }): Promise<string | undefined> {
+    const checkpoint = this.#continuationStore?.find(input.continuationId);
+    if (!checkpoint || !this.#config.bridgeInstanceId) return undefined;
+    const proposed: ContinuationCheckpoint = {
+      ...checkpoint,
+      grantId: input.grantId,
+      grantRevision: input.grantRevision,
+      approvedCanonicalFolder: input.canonicalFolder,
+      approvedAccessPreset: input.accessPreset,
+    };
+    const message = continuationInboundMessage(proposed);
+    const access = this.relationshipPolicy().accessFor(message);
+    if (
+      access.status !== "selected"
+      || !access.folders.includes(input.canonicalFolder)
+      || !access.selectedPolicyIds?.includes(input.grantId)
+      || !message.senderDeviceId
+    ) return undefined;
+    return createBoundaryManifest({
+      runtime: "codex",
+      adapterVersion: CodexAdapter.adapterVersion,
+      bridgeInstanceId: this.#config.bridgeInstanceId,
+      requesterPrincipalId: message.senderPrincipalId,
+      requesterDeviceId: message.senderDeviceId,
+      grantId: input.grantId,
+      grantRevision: input.grantRevision,
+      preset: input.accessPreset,
+      folders: access.folders,
+      writableFolders: access.writableFolders,
+    }).hash;
   }
 
   async initialize(): Promise<void> {
@@ -396,16 +443,17 @@ export class CodexAdapter implements RuntimeAdapter {
         accessPreset = access.preset;
         grantedFolders = access.folders;
         writableFolders = access.writableFolders;
-        if (accessPreset !== "chat-only" && grantedFolders.length > 0) {
+        const mcpServers = this.#config.capabilitySurface === "full-agent"
+          ? policy.mcpServersFor(message)
+          : [];
+        if ((accessPreset !== "chat-only" && grantedFolders.length > 0) || mcpServers.length > 0) {
           const profileRoot = this.#config.permissionProfileRoot
             ?? `${resolve(this.#config.relationshipPolicyFile)}.codex-profiles`;
           permissionProfile = writeCodexPermissionProfile(join(profileRoot, session.localHandle), {
             preset: accessPreset,
             folders: grantedFolders,
             writableFolders,
-            ...(this.#config.capabilitySurface === "full-agent"
-              ? { mcpServers: policy.mcpServersFor(message) }
-              : {}),
+            ...(mcpServers.length > 0 ? { mcpServers } : {}),
           });
         }
       } catch (error) {
@@ -422,6 +470,10 @@ export class CodexAdapter implements RuntimeAdapter {
       this.#config.log?.("codex project access denied: the requested project grant was not found");
       return { status: "project_access_not_found" } as const;
     }
+    if (!contextOnly && projectAccessStatus === "none" && taskRequiresProjectAccess(message)) {
+      this.#config.log?.("codex project access denied: the task requires a project but no grant is active");
+      return { status: "project_access_required" } as const;
+    }
 
     const runtimeTurnId = randomUUID();
     const projectAccessPreset = accessPreset === "chat-only" ? undefined : accessPreset;
@@ -432,7 +484,7 @@ export class CodexAdapter implements RuntimeAdapter {
         ? formatSandboxedRequest(message, projectAccessPreset!, grantedFolders)
         : formatInbound(message, contextOnly),
       cwd: turnCwd,
-      ...(hasProjectAccess ? { permissionProfile } : {}),
+      ...(permissionProfile ? { permissionProfile } : {}),
       ...(hasProjectAccess && this.#config.capabilitySurface === "full-agent"
         ? { writableRoots: writableFolders }
         : {}),

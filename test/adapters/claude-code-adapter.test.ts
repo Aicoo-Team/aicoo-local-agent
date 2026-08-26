@@ -400,6 +400,32 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(options.additionalDirectories).toEqual([realpathSync.native(second)]);
   });
 
+  it("rejects a project-scoped task before Claude starts when the peer has no project grant", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-no-project-access-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{ principalId: "prn_a", deviceId: "device-a1", tools: [], folders: [] }],
+    }));
+    const driver = new FakeClaudeAgentDriver("must not run");
+    const adapter = new ClaudeCodeAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_no_access", {
+      kind: "task_invite",
+      payload: { task: "Summarize the project and explain its current state." },
+    }), "queue")).toEqual({ status: "project_access_required" });
+    expect(driver.starts).toHaveLength(1);
+  });
+
   it("reuses one Claude boundary for the same objective-preflight project set", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-multi-project-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -821,6 +847,30 @@ describe("CodeAdapter just-in-time tool approval", () => {
     return policyFile;
   }
 
+  function mcpOnlyPolicyFile(bearerTokenEnvVar: string): string {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-claude-mcp-policy-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: [],
+        folders: [],
+        mcpServers: [{
+          name: "docs",
+          url: "https://mcp.example.com/v1",
+          enabledTools: ["read"],
+          bearerTokenEnvVar,
+          startupTimeoutSec: 10,
+          toolTimeoutSec: 60,
+        }],
+      }],
+    }));
+    return policyFile;
+  }
+
   function folderBoundaryPolicyFile(): string {
     const directory = mkdtempSync(join(tmpdir(), "ccd-claude-folder-boundary-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -944,8 +994,8 @@ describe("CodeAdapter just-in-time tool approval", () => {
     ]));
     expect(options.disallowedTools).toEqual([]);
     expect(options.settingSources).toEqual(["user", "project", "local"]);
-    expect(options.mcpServers).toBeUndefined();
-    expect(options.strictMcpConfig).toBe(false);
+    expect(options.mcpServers).toEqual({});
+    expect(options.strictMcpConfig).toBe(true);
     expect(options.managedSettings).toMatchObject({
       sandbox: {
         enabled: true,
@@ -1008,6 +1058,45 @@ describe("CodeAdapter just-in-time tool approval", () => {
         updatedToolOutput: { output: "leaked [REDACTED]" },
       },
     });
+  });
+
+  it("projects only exact MCP grants into an MCP-only full-agent session", async () => {
+    const tokenVariable = "AICOO_TEST_CLAUDE_MCP_TOKEN";
+    process.env[tokenVariable] = "test-token";
+    cleanups.push(() => { delete process.env[tokenVariable]; });
+    const g = gateway("allow");
+    const options = await startedAdapter(g, mcpOnlyPolicyFile(tokenVariable), "collab-mcp", "full-agent");
+
+    expect(options.mcpServers).toEqual({
+      docs: {
+        type: "http",
+        url: "https://mcp.example.com/v1",
+        headers: { Authorization: "Bearer test-token" },
+        tools: [{
+          name: "read",
+          permission_policy: "always_ask",
+          org_max_permission: "ask",
+        }],
+        timeout: 60_000,
+        alwaysLoad: true,
+      },
+    });
+    expect(options.strictMcpConfig).toBe(true);
+    expect(options.additionalDirectories).toBeUndefined();
+
+    expect(await options.canUseTool?.(
+      "mcp__docs__read",
+      { query: "release notes" },
+      permissionContext(),
+    )).toMatchObject({ behavior: "allow" });
+    expect(await options.canUseTool?.(
+      "mcp__docs__write",
+      { content: "not granted" },
+      permissionContext(),
+    )).toMatchObject({ behavior: "deny" });
+    expect(g.asked).toEqual([
+      expect.objectContaining({ toolName: "mcp__docs__read" }),
+    ]);
   });
 
   it("does not offer approval when no active boundary can honor the path", async () => {

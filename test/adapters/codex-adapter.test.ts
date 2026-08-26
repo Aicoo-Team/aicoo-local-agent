@@ -196,6 +196,49 @@ describe("CodexAdapter managed sessions", () => {
     ]);
   });
 
+  it("attaches exact MCP grants in full-agent mode without requiring folder access", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-mcp-only-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    setRelationshipMcpGrants({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      grants: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["read", "search"],
+      }],
+    });
+    const driver = new FakeCodexDriver("MCP request completed.");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      capabilitySurface: "full-agent",
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_mcp_only", {
+      payload: { text: "Use the granted docs MCP search tool." },
+    }), "new_turn");
+
+    expect(driver.turns[0]?.permissionProfile).toBeDefined();
+    expect(driver.turns[0]?.permissionProfile?.workspaceRoots).toEqual([]);
+    const profile = readFileSync(
+      join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"),
+      "utf8",
+    );
+    expect(profile).toContain("Aicoo c2c relationship (chat-only)");
+    expect(profile).toContain('[mcp_servers."docs"]');
+    expect(profile).toContain('enabled_tools = ["read", "search"]');
+    expect(profile).not.toContain("[permissions.aicoo-c2c.workspace_roots]");
+    await events;
+  });
+
   it("creates a durable rebuild continuation for an out-of-boundary file change", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-boundary-expansion-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -373,6 +416,32 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[0]?.cwd).toBe(realpathSync.native(second));
     expect(driver.turns[0]?.prompt).toContain(realpathSync.native(second));
     expect(driver.turns[0]?.prompt).not.toContain(`- ${realpathSync.native(first)}`);
+  });
+
+  it("rejects a project-scoped task before Codex starts when the peer has no project grant", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-no-project-access-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{ principalId: "prn_a", deviceId: "device_a", tools: [], folders: [] }],
+    }));
+    const driver = new FakeCodexDriver("must not run");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_no_access", {
+      kind: "task_invite",
+      payload: { task: "Summarize the project and explain its current state." },
+    }), "queue")).toEqual({ status: "project_access_required" });
+    expect(driver.turns).toHaveLength(0);
   });
 
   it("preflights several objective-named projects into one Codex boundary", async () => {
@@ -946,6 +1015,44 @@ describe("CodexAdapter managed sessions", () => {
     expect(second.providerThreadId("codex-managed-1")).toBe(providerThreadId);
     expect((await second.deliverToSession("codex-managed-1", inbound("msg_resume"), "queue")).status).toBe("runtime_acked");
     expect(secondDriver.turns[0]?.resumeThreadId).toBe(providerThreadId);
+  });
+
+  it("rebuilds persisted full-agent threads after a bridge restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-full-agent-restart-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const stateFile = join(directory, "sessions.db");
+    const firstDriver = new FakeCodexDriver();
+    const first = new CodexAdapter({
+      stateFile,
+      cwd: directory,
+      driver: firstDriver,
+      turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
+    });
+    await first.initialize();
+    const firstEvents = collectEvents(first, "codex-managed-1", 2);
+    await first.deliverToSession("codex-managed-1", inbound("msg_full_agent_seed"), "queue");
+    await firstEvents;
+    const oldThreadId = first.providerThreadId("codex-managed-1");
+    expect(oldThreadId).toMatch(/^fake-codex-thread-/);
+    await first.close();
+
+    const secondDriver = new FakeCodexDriver();
+    const second = new CodexAdapter({
+      stateFile,
+      cwd: directory,
+      driver: secondDriver,
+      turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
+    });
+    cleanups.push(() => second.close());
+    await second.initialize();
+    expect(second.providerThreadId("codex-managed-1")).toBeUndefined();
+    const secondEvents = collectEvents(second, "codex-managed-1", 2);
+    await second.deliverToSession("codex-managed-1", inbound("msg_full_agent_after_restart"), "queue");
+    await secondEvents;
+    expect(secondDriver.turns[0]?.resumeThreadId).toBeUndefined();
+    expect(second.providerThreadId("codex-managed-1")).not.toBe(oldThreadId);
   });
 
   it("reconciles persisted sessions to a smaller configured count", async () => {

@@ -216,9 +216,9 @@ export class RelationshipPolicy {
       .sort();
   }
 
-  /** Exact remote MCP grants for this verified device, usable only with an active project boundary. */
+  /** Exact remote MCP grants for this verified peer device; project access is governed separately. */
   mcpServersFor(message: InboundMessage | undefined): RemoteMcpGrant[] {
-    if (!message?.senderDeviceId || this.accessFor(message).status !== "selected") return [];
+    if (!message?.senderDeviceId) return [];
     return parseRemoteMcpGrants(this.relationshipsFor(message).flatMap((relationship) =>
       relationship.mcpServers));
   }
@@ -551,6 +551,27 @@ export function projectAccessSelectors(message: InboundMessage | undefined): str
   return typeof selector === "string" && selector.trim() && selector.length <= 1_024
     ? [selector.trim()]
     : ["\u0000invalid-project-selection"];
+}
+
+/**
+ * Detect objectives that cannot be answered honestly from chat-only context. This intentionally
+ * requires both an inspection-style action and a local-resource noun so general engineering
+ * questions remain available without a folder grant.
+ */
+export function taskRequiresProjectAccess(message: InboundMessage | undefined): boolean {
+  if (message?.kind !== "task_invite") return false;
+  if (projectAccessSelectors(message).length > 0) return true;
+  const task = message.payload.task;
+  const text = typeof task === "string"
+    ? task
+    : task && typeof task === "object" && !Array.isArray(task)
+      ? (task as Record<string, unknown>).text
+      : undefined;
+  if (typeof text !== "string" || !text.trim()) return false;
+  const normalized = text.toLowerCase();
+  const action = /\b(summar(?:ize|ise)|inspect|review|analy[sz]e|explain|describe|read|check|compare|modify|edit|fix|test|build|run)\b/u;
+  const resource = /\b(project|repository|repo|codebase|source|files?|folders?|readme|implementation|git|branch|diff)\b/u;
+  return action.test(normalized) && resource.test(normalized);
 }
 
 /**

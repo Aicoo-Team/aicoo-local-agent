@@ -104,6 +104,7 @@ class CodexAppServerTurn implements CodexTurn {
     try {
       await this.#request("initialize", {
         clientInfo: { name: "aicoo-local-agent", version: "0.3.1", title: "Aicoo Local Agent" },
+        capabilities: { experimentalApi: true },
       });
       this.#notify("initialized", {});
 

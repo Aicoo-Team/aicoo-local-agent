@@ -50,14 +50,17 @@ export interface CodexPermissionProfileInput {
 }
 
 /**
- * `chat-only` gets no profile at all — the caller keeps the text-only path, where Codex is given
- * no folders and told not to touch anything. A profile with zero workspace roots would still
- * grant `:minimal`, so returning undefined keeps that distinction honest.
+ * Plain `chat-only` gets no profile at all. When exact MCP tools are granted, however, it gets a
+ * private profile with no workspace roots so Codex can load only those tools without gaining
+ * project access or inheriting the owner's settings.
  */
 export function renderCodexPermissionProfile(input: CodexPermissionProfileInput): string | undefined {
-  if (input.preset === "chat-only") return undefined;
-  const folders = [...new Set(input.folders)].filter((folder) => folder.trim().length > 0);
-  if (folders.length === 0) return undefined;
+  const mcpServers = parseRemoteMcpGrants(input.mcpServers ?? []);
+  if (input.preset === "chat-only" && mcpServers.length === 0) return undefined;
+  const folders = input.preset === "chat-only"
+    ? []
+    : [...new Set(input.folders)].filter((folder) => folder.trim().length > 0);
+  if (folders.length === 0 && mcpServers.length === 0) return undefined;
 
   const name = input.profileName ?? CODEX_PROFILE_NAME;
   // read-project may only read; edit-project may also write. Codex resolves "deny" ahead of any
@@ -69,7 +72,6 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   const writable = writableFolders.length > 0;
   const base = writable ? ":workspace" : ":read-only";
   const workspaceAccess = writableFolders.length === folders.length ? "write" : "read";
-  const mcpServers = parseRemoteMcpGrants(input.mcpServers ?? []);
   const mcpConfig = renderCodexRemoteMcpGrants(mcpServers);
   const shellEnvironmentExclusions = [...new Set([
     "*TOKEN*",
@@ -102,9 +104,11 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     `description = "Aicoo c2c relationship (${input.preset})"`,
     `extends = "${base}"`,
     "",
-    `[permissions.${name}.workspace_roots]`,
-    ...folders.map((folder) => `${tomlString(folder)} = true`),
-    "",
+    ...(folders.length > 0 ? [
+      `[permissions.${name}.workspace_roots]`,
+      ...folders.map((folder) => `${tomlString(folder)} = true`),
+      "",
+    ] : []),
     `[permissions.${name}.filesystem]`,
     // Order matters far less than presence: deny the root read the preset would otherwise grant,
     // then add back only what a process needs to start.
@@ -112,9 +116,11 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     '":minimal" = "read"',
     ...writableFolders.map((folder) => `${tomlString(folder)} = "write"`),
     "",
-    `[permissions.${name}.filesystem.":workspace_roots"]`,
-    `"." = "${workspaceAccess}"`,
-    "",
+    ...(folders.length > 0 ? [
+      `[permissions.${name}.filesystem.":workspace_roots"]`,
+      `"." = "${workspaceAccess}"`,
+      "",
+    ] : []),
     `[permissions.${name}.network]`,
     // Off for every preset. A peer's agent that can read your files and reach the network can
     // copy them out; keeping egress closed is what makes granting a folder a bounded decision.

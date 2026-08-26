@@ -184,6 +184,17 @@ describe("CodexAppServerDriver", () => {
     expect(JSON.parse(result.replyText ?? "{}")).not.toHaveProperty("sandboxPolicy");
   });
 
+  it("negotiates the experimental API before sending runtime workspace roots", async () => {
+    // Regression: Codex rejected every injected turn until the bridge exhausted its retries.
+    const result = await run({
+      permissionProfile: { codexHome: "/tmp/aicoo-profile", profileName: "aicoo-c2c" },
+      env: { FAKE_SKIP_APPROVAL: "1", FAKE_REQUIRE_EXPERIMENTAL_API: "1" },
+    });
+
+    expect(result.events).toContainEqual(expect.objectContaining({ type: "turn.completed" }));
+    expect(result.events).not.toContainEqual(expect.objectContaining({ type: "error", fatal: true }));
+  });
+
   it("terminates a full-capability turn that exceeds its execution budget", async () => {
     const result = await run({
       turnTimeoutMs: 25,
