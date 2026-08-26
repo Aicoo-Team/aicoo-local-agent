@@ -43,6 +43,55 @@ function adapter() {
 }
 
 describe("bridge continuation recovery", () => {
+  it("recovers a slow owner decision after the bridge process restarted", async () => {
+    // Regression: the durable approval existed, but the in-memory polling promise was gone.
+    const store = new ContinuationStore(new DatabaseSync(":memory:"));
+    const pending = store.create({
+      idempotencyKey: "comm_slow:msg_slow:tool_slow",
+      correlationId: "corr_slow",
+      communicationSessionId: "comm_slow",
+      messageId: "msg_slow",
+      sessionHandle: "native_slow",
+      runtimeTurnId: "turn_slow",
+      originalMessage: { kind: "task_invite", payload: { task: { text: "Inspect Project B" } } },
+      requestedCapability: {
+        toolName: "Read",
+        canonicalResource: "/srv/project-b/README.md",
+        summary: "Read Project B README",
+      },
+    });
+    store.attachApproval(pending.continuationId, "appr_slow");
+    const runtime = adapter();
+    const recovery = new ContinuationRecovery(store, runtime, undefined, undefined, {
+      async requestToolApproval() {
+        throw new Error("recovery must not create another approval");
+      },
+      async getToolApproval(approvalId) {
+        expect(approvalId).toBe("appr_slow");
+        return {
+          status: "allow",
+          decision: "allow",
+          activation: {
+            grantId: "grant_slow",
+            grantRevision: 4,
+            canonicalFolder: "/srv/project-b",
+            accessPreset: "read-project",
+            expectedBoundaryManifestHash: "manifest_slow",
+          },
+        };
+      },
+    });
+
+    await recovery.recover();
+
+    expect(store.find(pending.continuationId)).toMatchObject({
+      approvalId: "appr_slow",
+      state: "resuming",
+      grantId: "grant_slow",
+    });
+    expect(runtime.resumeContinuation).toHaveBeenCalledOnce();
+  });
+
   it("rebuilds each approved continuation once and completes it from the matching reply", async () => {
     const store = new ContinuationStore(new DatabaseSync(":memory:"));
     const checkpoint = approved(store);

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { MessageEnvelope } from "../../src/shared/contracts.js";
+import type { MessageDelivery, MessageEnvelope } from "../../src/shared/contracts.js";
 import {
   authorityDecisionFromEnvelope,
+  delegationDeliveryFailure,
   isFinalDelegationReplyEnvelope,
 } from "../../src/cli/delegation-replies.js";
 
@@ -51,7 +52,7 @@ describe("delegation reply completion", () => {
     }))).toBe(false);
   });
 
-  it("keeps waiting when the peer agent reaches a human authority boundary", () => {
+  it("returns an owner-needed response when no approval continuation was advertised", () => {
     expect(isFinalDelegationReplyEnvelope(envelope({
       collaborationTurn: {
         turnId: "turn-2",
@@ -62,7 +63,17 @@ describe("delegation reply completion", () => {
         expectsReply: false,
         outcome: "needs_owner",
       },
-    }))).toBe(false);
+    }))).toBe(true);
+  });
+
+  it("turns a project-access delivery failure into an actionable result", () => {
+    expect(delegationDeliveryFailure({
+      status: "failed",
+      resultCode: "project_access_required",
+    } as MessageDelivery)).toBe(
+      "project_access_required: the peer has not granted access to a project for this request",
+    );
+    expect(delegationDeliveryFailure({ status: "runtime_pending" } as MessageDelivery)).toBeUndefined();
   });
 
   it.each(["allow", "deny"] as const)("accepts a synchronized %s decision as final", (decision) => {

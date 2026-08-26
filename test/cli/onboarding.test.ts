@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   authorizeDevice,
   formatTeamAgentWelcome,
+  launchDetachedBridge,
   nodeMeetsMinimumVersion,
   readRunningProcessId,
   waitForBridgeReady,
@@ -139,6 +140,40 @@ describe("local-agent onboarding", () => {
     writeFileSync(pidFile, "4321\n");
     expect(readRunningProcessId(pidFile, (pid) => pid === 4321)).toBe(4321);
     expect(readRunningProcessId(pidFile, () => false)).toBeUndefined();
+  });
+
+  it("propagates the selected server and spool to managed agent commands", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-onboarding-env-"));
+    const spawnProcess = vi.fn().mockReturnValue({ pid: 4321, unref: vi.fn() });
+
+    launchDetachedBridge({
+      cliEntry: "/tmp/ccd.js",
+      runtime: "codex",
+      spoolFile: join(directory, "omkar.spool"),
+      logFile: join(directory, "bridge.log"),
+      pidFile: join(directory, "bridge.pid"),
+      serverUrl: "http://localhost:3000",
+      capabilitySurface: "full-agent",
+      spawnProcess: spawnProcess as never,
+    });
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      process.execPath,
+      expect.any(Array),
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CCD_SERVER_URL: "http://localhost:3000",
+          CCD_SPOOL: join(directory, "omkar.spool"),
+        }),
+      }),
+    );
+    expect(spawnProcess.mock.calls[0]?.[1]).toEqual(expect.arrayContaining([
+      "--codex-app-server",
+    ]));
+    expect(spawnProcess.mock.calls[0]?.[1]).toEqual(expect.arrayContaining([
+      "--capability-surface",
+      "full-agent",
+    ]));
   });
 
   it("introduces team agents after the bridge connects", () => {

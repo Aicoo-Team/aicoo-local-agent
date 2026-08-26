@@ -45,6 +45,7 @@ import { parseGoalPlan } from "../shared/goal-plan.js";
 import { runGoalPlan } from "./goal-runner.js";
 import {
   authorityDecisionFromEnvelope,
+  delegationDeliveryFailure,
   isFinalDelegationReplyEnvelope,
 } from "./delegation-replies.js";
 import {
@@ -67,7 +68,9 @@ import {
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
 const PREVIEW_AICOO_SERVER_URL = "https://www.yourcoo.ai";
-const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
+const DEFAULT_SPOOL = process.env.CCD_SPOOL?.trim()
+  ? resolve(process.env.CCD_SPOOL)
+  : join(homedir(), ".aicoo", "local-agent", "bridge.spool");
 
 const program = new Command()
   .name("ccd")
@@ -156,6 +159,9 @@ program.command("onboard")
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--workspace <dir>", "workspace exposed to the local runtime", process.cwd())
   .option("--server <url>", "control-plane URL")
+  .addOption(new Option("--capability-surface <surface>", "peer agent capability surface")
+    .choices(["restricted", "full-agent"])
+    .default("restricted"))
   .option("--ready-timeout <milliseconds>", "time to wait for bidirectional readiness", "30000")
   .option("--no-open", "print the approval URL instead of opening a browser")
   .action(async (options) => {
@@ -214,6 +220,7 @@ program.command("onboard")
         pidFile,
         serverUrl: server,
         workspace: options.workspace,
+        capabilitySurface: options.capabilitySurface,
       });
       console.log(`✓ Local bridge started in the background (${started.pid})`);
     }
@@ -322,6 +329,11 @@ program.command("goal")
             spool,
             identifiers.correlationId,
             timeoutMs,
+            delegation.status === "delegated"
+              ? { transport: client, messageId: delegation.receipt.messageId }
+              : delegation.status === "folder_access_requested"
+                ? { transport: client, messageId: delegation.messageId }
+              : undefined,
           );
           if (!reply) {
             return {
@@ -881,6 +893,11 @@ program.command("delegate")
           spool,
           result.correlationId ?? correlationId,
           Number.parseInt(options.timeout, 10) * 1000,
+          result.status === "delegated"
+            ? { transport: client, messageId: result.receipt.messageId }
+            : result.status === "folder_access_requested"
+              ? { transport: client, messageId: result.messageId }
+            : undefined,
         );
         const replyText = reply.envelope.payload.text;
         console.log("");
@@ -1087,6 +1104,13 @@ async function startBridge(options: {
   server?: string;
   json?: boolean;
 }): Promise<void> {
+  // Managed Codex/Claude turns inherit this bridge process environment. Preserve the exact
+  // control plane and identity spool selected for this bridge so `ccd agents/delegate/goal`
+  // invoked by the installed skill cannot silently fall back to another account or localhost.
+  process.env.CCD_SPOOL = resolve(options.spool);
+  process.env.CCD_SERVER_URL = options.server
+    ?? process.env.CCD_SERVER_URL
+    ?? program.opts<{ server?: string }>().server;
   ensureParentDirectory(options.spool);
   const readinessSpool = new BridgeSpool(options.spool);
   let boundaryMetrics: ReturnType<BoundaryTelemetry["snapshot"]>;
@@ -1499,13 +1523,16 @@ async function waitForDelegationReply(
   spool: BridgeSpool,
   correlationId: string,
   timeoutMs: number,
+  delivery?: DelegationDeliveryMonitor,
 ): Promise<ReturnType<BridgeSpool["findReplyByCorrelation"]> & {}> {
   const deadline = Date.now() + timeoutMs;
+  let nextDeliveryCheckAt = 0;
   while (Date.now() < deadline) {
     const reply = spool.findReplyByCorrelation(correlationId);
-    // A bounded collaboration can exchange follow-up turns. Keep waiting for questions and
-    // owner decisions, but return a peer's completion proposal as the delegated artifact.
+    // A bounded collaboration can exchange follow-up turns. Tool-boundary approvals do not
+    // emit a peer reply until resume completes, so a received needs_owner reply is actionable.
     if (isFinalDelegationReply(reply)) return reply;
+    nextDeliveryCheckAt = await throwIfDelegationFailed(delivery, nextDeliveryCheckAt);
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Timed out waiting for the peer reply (${correlationId})`);
@@ -1515,14 +1542,40 @@ async function waitForDelegationReplyOrUndefined(
   spool: BridgeSpool,
   correlationId: string,
   timeoutMs: number,
+  delivery?: DelegationDeliveryMonitor,
 ): Promise<ReturnType<BridgeSpool["findReplyByCorrelation"]>> {
   const deadline = Date.now() + timeoutMs;
+  let nextDeliveryCheckAt = 0;
   while (Date.now() < deadline) {
     const reply = spool.findReplyByCorrelation(correlationId);
     if (isFinalDelegationReply(reply)) return reply;
+    nextDeliveryCheckAt = await throwIfDelegationFailed(delivery, nextDeliveryCheckAt);
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return undefined;
+}
+
+type DelegationDeliveryMonitor = {
+  transport: Pick<HttpMessageTransport, "getMessageStatus">;
+  messageId: string;
+};
+
+async function throwIfDelegationFailed(
+  delivery: DelegationDeliveryMonitor | undefined,
+  nextCheckAt: number,
+): Promise<number> {
+  if (!delivery || Date.now() < nextCheckAt) return nextCheckAt;
+  const retryAt = Date.now() + 1_000;
+  let status;
+  try {
+    status = await delivery.transport.getMessageStatus(delivery.messageId);
+  } catch {
+    // Status polling is advisory while the correlated reply channel remains healthy.
+    return retryAt;
+  }
+  const failure = delegationDeliveryFailure(status);
+  if (failure) throw new Error(failure);
+  return retryAt;
 }
 
 function isFinalDelegationReply(

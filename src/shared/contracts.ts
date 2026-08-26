@@ -314,6 +314,8 @@ export type LocalAgentDelegationResponse =
       duplicate: boolean;
       approvalKind: "folder";
       approvalId: string;
+      /** Parked message whose delivery becomes terminal if access or collaboration is denied. */
+      messageId: string;
     }
   | {
       status: "delegated";

@@ -53,6 +53,7 @@ export interface AwaitToolApprovalOptions {
   /** Injected so tests don't spend real time asleep. */
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  onApprovalCreated?: (approvalId: string) => void | Promise<void>;
 }
 
 const DEFAULT_POLL_MS = 2_000;
@@ -75,6 +76,7 @@ export async function awaitToolApproval(
   let requested: ToolApprovalState & { approvalId: string };
   try {
     requested = await gateway.requestToolApproval(input);
+    await options.onApprovalCreated?.(requested.approvalId);
   } catch (error) {
     return denied(`could not ask ${input.toolName} approval: ${String(error)}`, options.log);
   }

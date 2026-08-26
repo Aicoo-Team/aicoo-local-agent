@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import {
   ApiError,
   type PollDeviceCodeResponse,
@@ -8,6 +8,7 @@ import {
   type StartDeviceCodeResponse,
 } from "../shared/http-client.js";
 import type { TeamAgentDirectory } from "../shared/contracts.js";
+import type { CapabilitySurface } from "../shared/capability-rollout.js";
 
 const MINIMUM_NODE_VERSION = [22, 5, 0] as const;
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
@@ -170,6 +171,7 @@ export function launchDetachedBridge(options: {
   pidFile: string;
   serverUrl: string;
   workspace?: string;
+  capabilitySurface?: CapabilitySurface;
   spawnProcess?: typeof spawn;
 }): { pid: number } {
   mkdirSync(dirname(options.logFile), { recursive: true });
@@ -181,16 +183,28 @@ export function launchDetachedBridge(options: {
       ...process.execArgv,
       options.cliEntry,
       "start",
+      // App-server carries the named permission profile and runtime workspace roots together.
+      // The legacy exec path can advertise edit-project while its managed apply_patch helper
+      // still loses the writable root and fails inside the kernel sandbox.
       "--adapter",
       options.runtime,
+      ...(options.runtime === "codex" ? ["--codex-app-server"] : []),
       "--spool",
       options.spoolFile,
       ...(options.workspace ? ["--workspace", options.workspace] : []),
+      ...(options.capabilitySurface
+        ? ["--capability-surface", options.capabilitySurface]
+        : []),
     ], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
       windowsHide: true,
-      env: { ...process.env, CCD_AICOO: "1", CCD_SERVER_URL: options.serverUrl },
+      env: {
+        ...process.env,
+        CCD_AICOO: "1",
+        CCD_SERVER_URL: options.serverUrl,
+        CCD_SPOOL: resolve(options.spoolFile),
+      },
     });
   } finally {
     closeSync(logFd);

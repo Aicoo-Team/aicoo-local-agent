@@ -16,6 +16,7 @@ export type ContinuationState =
 
 export interface ContinuationCheckpoint {
   continuationId: string;
+  approvalId?: string;
   idempotencyKey: string;
   correlationId: string;
   communicationSessionId: string;
@@ -41,6 +42,7 @@ export interface ContinuationCheckpoint {
 export type CreateContinuationInput = Omit<
   ContinuationCheckpoint,
   "continuationId" | "state" | "grantId" | "grantRevision" | "approvedCanonicalFolder"
+  | "approvalId"
   | "approvedAccessPreset" | "expectedBoundaryManifestHash"
   | "boundaryManifestHash" | "errorCode"
 >;
@@ -51,6 +53,7 @@ export class ContinuationStore {
     db.exec(`
       CREATE TABLE IF NOT EXISTS c2c_continuations (
         continuation_id TEXT PRIMARY KEY,
+        approval_id TEXT,
         idempotency_key TEXT NOT NULL UNIQUE,
         request_hash TEXT NOT NULL,
         correlation_id TEXT NOT NULL,
@@ -76,6 +79,7 @@ export class ContinuationStore {
     `);
     addColumn(db, "approved_canonical_folder", "TEXT");
     addColumn(db, "approved_access_preset", "TEXT");
+    addColumn(db, "approval_id", "TEXT");
   }
 
   create(input: CreateContinuationInput): ContinuationCheckpoint {
@@ -133,6 +137,27 @@ export class ContinuationStore {
        ORDER BY updated_at, continuation_id`,
     ).all() as unknown as ContinuationRow[];
     return rows.map(fromRow);
+  }
+
+  listAwaitingDecisions(): ContinuationCheckpoint[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM c2c_continuations
+       WHERE state = 'awaiting_approval' AND approval_id IS NOT NULL
+       ORDER BY updated_at, continuation_id`,
+    ).all() as unknown as ContinuationRow[];
+    return rows.map(fromRow);
+  }
+
+  attachApproval(continuationId: string, approvalId: string): ContinuationCheckpoint {
+    if (!approvalId.trim() || approvalId.length > 512) throw new Error("invalid continuation approvalId");
+    const current = this.require(continuationId);
+    this.requireState(current, "awaiting_approval");
+    if (current.approvalId === approvalId) return current;
+    if (current.approvalId) throw new Error("continuation approval conflict");
+    this.db.prepare(
+      "UPDATE c2c_continuations SET approval_id = ?, updated_at = ? WHERE continuation_id = ?",
+    ).run(approvalId, new Date().toISOString(), continuationId);
+    return this.require(continuationId);
   }
 
   findResuming(input: {
@@ -309,6 +334,7 @@ export class ContinuationStore {
 
 interface ContinuationRow {
   continuation_id: string;
+  approval_id: string | null;
   idempotency_key: string;
   request_hash: string;
   correlation_id: string;
@@ -331,6 +357,7 @@ interface ContinuationRow {
 function fromRow(row: ContinuationRow): ContinuationCheckpoint {
   return {
     continuationId: row.continuation_id,
+    ...(row.approval_id ? { approvalId: row.approval_id } : {}),
     idempotencyKey: row.idempotency_key,
     correlationId: row.correlation_id,
     communicationSessionId: row.communication_session_id,

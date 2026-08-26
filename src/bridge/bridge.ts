@@ -26,6 +26,7 @@ import type {
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
 import { ContinuationStore } from "../shared/continuation-store.js";
+import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import { ContinuationRecovery } from "./continuation-recovery.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
 import { BridgeSpool } from "./spool.js";
@@ -68,6 +69,10 @@ export class RuntimeBridge {
   #injector?: Injector;
   #pendingDefaultRoute?: string;
   #publishedDefaultRoute?: string;
+  readonly #pendingRelationshipMcpAcks = new Map<
+    string,
+    { policyIds: string[]; revision: number }
+  >();
   #beforeExitHandler?: (code: number) => void;
   readonly #bridgeInstanceId: string;
   readonly #continuationRecovery: ContinuationRecovery;
@@ -83,6 +88,7 @@ export class RuntimeBridge {
       options.adapter,
       options.log,
       this.#boundaryTelemetry,
+      isToolApprovalGateway(options.transport) ? options.transport : undefined,
     );
   }
 
@@ -406,7 +412,6 @@ export class RuntimeBridge {
         if (nativeHandle && commSessionId) {
           await this.options.adapter.prepareCommunicationSession?.(nativeHandle, commSessionId);
         }
-        this.rotateDefaultRouteAfterActivation(sessionHandle);
       }
       if (commSessionId) await this.retryPendingDelegations(commSessionId);
     } else if (
@@ -477,10 +482,25 @@ export class RuntimeBridge {
         ...(createdAtValue ? { createdAt: new Date(createdAtValue) } : {}),
         serverRevision: revision,
       });
+      const expansion = recordField(data, "boundaryExpansion");
+      const continuationId = expansion ? stringField(expansion, "continuationId") : undefined;
+      const boundaryManifestHash = continuationId
+        ? await this.options.adapter.attestBoundaryActivation?.({
+            continuationId,
+            grantId: policyId,
+            grantRevision: revision,
+            canonicalFolder: policy.canonicalFolder,
+            accessPreset,
+          })
+        : undefined;
+      if (continuationId && !boundaryManifestHash) {
+        throw new Error("approved boundary could not be attested for its paused continuation");
+      }
       await this.options.transport.acknowledgeTrustedToolPolicy({
         policyId,
         revision,
         canonicalFolder: policy.canonicalFolder,
+        ...(boundaryManifestHash ? { boundaryManifestHash } : {}),
       });
       this.options.log?.(`trusted tool policy applied: ${accessPreset} for ${requesterPrincipalId}`);
       await this.#continuationRecovery.recover();
@@ -519,6 +539,13 @@ export class RuntimeBridge {
     }
     const hasExplicitTools = Object.prototype.hasOwnProperty.call(data, "tools");
     const hasMcpServers = Object.prototype.hasOwnProperty.call(data, "mcpServers");
+    const hasMcpPolicyIds = Object.prototype.hasOwnProperty.call(data, "mcpPolicyIds");
+    const mcpPolicyIds = Array.isArray(data.mcpPolicyIds)
+      && data.mcpPolicyIds.length <= 16
+      && data.mcpPolicyIds.every((policyId) => typeof policyId === "string" && policyId.trim())
+      ? data.mcpPolicyIds.map((policyId) => String(policyId).trim())
+      : undefined;
+    const revision = numberField(data, "revision");
     const explicitTools = Array.isArray(data.tools)
       && data.tools.every((tool) => typeof tool === "string" && tool.trim())
       ? data.tools.map((tool) => String(tool).trim())
@@ -526,6 +553,8 @@ export class RuntimeBridge {
     if (
       !principalId
       || !deviceId
+      || (hasMcpPolicyIds && mcpPolicyIds === undefined)
+      || (hasMcpPolicyIds && revision === undefined)
       || (hasExplicitTools && explicitTools === undefined)
       || (preset !== undefined && !isRelationshipAccessPreset(preset))
       || (!hasExplicitTools && !hasMcpServers && !isRelationshipAccessPreset(preset))
@@ -571,8 +600,30 @@ export class RuntimeBridge {
       if (before !== relationshipPolicyContents(this.options.relationshipPolicyFile)) {
         await this.options.adapter.invalidateRelationshipSessions?.(principalId, deviceId);
       }
+      if (hasMcpServers && mcpPolicyIds && mcpPolicyIds.length > 0 && revision !== undefined) {
+        const acknowledgement = {
+          policyIds: mcpPolicyIds,
+          revision,
+        };
+        this.#pendingRelationshipMcpAcks.set(
+          `${revision}:${mcpPolicyIds.join(",")}`,
+          acknowledgement,
+        );
+        await this.flushRelationshipMcpAcknowledgements();
+      }
     } catch (error) {
       this.options.log?.(`relationship policy update failed: ${String(error)}`);
+    }
+  }
+
+  private async flushRelationshipMcpAcknowledgements(): Promise<void> {
+    for (const [key, acknowledgement] of this.#pendingRelationshipMcpAcks) {
+      try {
+        await this.options.transport.acknowledgeRelationshipMcpPolicies(acknowledgement);
+        this.#pendingRelationshipMcpAcks.delete(key);
+      } catch (error) {
+        this.options.log?.(`relationship MCP acknowledgement deferred: ${String(error)}`);
+      }
     }
   }
 
@@ -594,6 +645,7 @@ export class RuntimeBridge {
         }
         this.options.log?.(`heartbeat failed: ${String(error)}`);
       }
+      await this.flushRelationshipMcpAcknowledgements();
       // Publish the default route from here, not start(): by the first heartbeat the
       // session-creation congestion that starves the event loop has cleared, so the request
       // no longer aborts spuriously. Attempt once per beat until it lands, then stop.
@@ -774,14 +826,6 @@ export class RuntimeBridge {
     return this.#endpointId;
   }
 
-  private rotateDefaultRouteAfterActivation(activatedServerHandle: string): void {
-    const currentDefault = this.#pendingDefaultRoute ?? this.#publishedDefaultRoute;
-    if (currentDefault && currentDefault !== activatedServerHandle) return;
-    const replacement = this.options.spool.listSessionMappings()
-      .map((mapping) => mapping.serverHandle)
-      .find((serverHandle) => serverHandle !== activatedServerHandle);
-    if (replacement) this.#pendingDefaultRoute = replacement;
-  }
 }
 
 function relationshipPolicyContents(file: string): string | undefined {
@@ -953,6 +997,20 @@ function numberField(data: Record<string, unknown>, key: string): number | undef
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
+function recordField(data: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = data[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
 function isRelationshipAccessPreset(value: string | undefined): value is RelationshipAccessPreset {
   return value === "chat-only" || value === "read-project" || value === "edit-project";
+}
+
+function isToolApprovalGateway(value: unknown): value is ToolApprovalGateway {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<ToolApprovalGateway>;
+  return typeof candidate.requestToolApproval === "function"
+    && typeof candidate.getToolApproval === "function";
 }

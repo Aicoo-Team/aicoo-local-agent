@@ -48,6 +48,39 @@ describe("Injector retry classification", () => {
     }));
   });
 
+  it("reports a validation rejection so the requester does not wait forever", async () => {
+    const spool = new BridgeSpool(":memory:");
+    cleanups.push(() => spool.close());
+    spool.storeDispatch(dispatchEvent());
+    spool.markDeviceAcked("msg_permission");
+
+    const transport = {
+      validateInjection: vi.fn(async () => ({ valid: false as const, reason: "wrong_target" })),
+      acknowledgeDelivery: vi.fn(async () => undefined),
+    } as unknown as HttpMessageTransport;
+    const adapter = { deliverToSession: vi.fn() } as unknown as RuntimeAdapter;
+    const injector = new Injector(
+      transport,
+      spool,
+      adapter,
+      "ep_b",
+      new Map([["server-session", "native-session"]]),
+    );
+
+    await injector.runOnce();
+
+    expect(spool.getMessage("msg_permission")).toMatchObject({
+      status: "failed",
+      lastResultCode: "wrong_target",
+    });
+    expect(transport.acknowledgeDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      phase: "runtime_failed",
+      resultCode: "wrong_target",
+      retryable: false,
+    }));
+    expect(adapter.deliverToSession).not.toHaveBeenCalled();
+  });
+
   it("dead-letters retryable runtime failures after the max injection attempts", async () => {
     const spool = new BridgeSpool(":memory:");
     cleanups.push(() => spool.close());

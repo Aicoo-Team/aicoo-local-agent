@@ -277,11 +277,22 @@ export class HttpMessageTransport implements MessageTransport {
     policyId: string;
     revision: number;
     canonicalFolder: string;
+    boundaryManifestHash?: string;
   }): Promise<void> {
     const { policyId, ...body } = input;
     await this.requestJson(`/api/v1/trusted-tool-policies/${encodeURIComponent(policyId)}/ack`, {
       method: "POST",
       body,
+    });
+  }
+
+  async acknowledgeRelationshipMcpPolicies(input: {
+    policyIds: string[];
+    revision: number;
+  }): Promise<void> {
+    await this.requestJson("/api/v1/relationship-mcp-policies/ack", {
+      method: "POST",
+      body: input,
     });
   }
 

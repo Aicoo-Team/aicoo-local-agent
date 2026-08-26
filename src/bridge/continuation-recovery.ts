@@ -1,7 +1,10 @@
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
 import { ContinuationStore } from "../shared/continuation-store.js";
 import { SessionRebuildCoordinator } from "../shared/session-rebuild.js";
+import type { BoundaryActivation } from "../shared/aicoo-transport.js";
+import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 
 interface ContinuationRuntimeEvent {
   type: "turn_started" | "reply" | "turn_failed" | "session_closed";
@@ -21,11 +24,13 @@ export class ContinuationRecovery {
     private readonly adapter: RuntimeAdapter,
     private readonly log?: (line: string) => void,
     private readonly boundaryTelemetry?: BoundaryTelemetry,
+    private readonly approvalGateway?: ToolApprovalGateway,
   ) {
     this.#coordinator = new SessionRebuildCoordinator(store);
   }
 
   async recover(): Promise<void> {
+    await this.recoverAwaitingDecisions();
     const { quiesceContinuation, rebuildContinuation, resumeContinuation } = this.adapter;
     if (!quiesceContinuation || !rebuildContinuation || !resumeContinuation) return;
 
@@ -79,6 +84,38 @@ export class ContinuationRecovery {
     }));
   }
 
+  private async recoverAwaitingDecisions(): Promise<void> {
+    if (!this.approvalGateway) return;
+    await Promise.all(this.store.listAwaitingDecisions().map(async (checkpoint) => {
+      try {
+        const current = await this.approvalGateway!.getToolApproval(checkpoint.approvalId!);
+        if (current.status === "pending" && current.decision === null) return;
+        if (current.decision === "deny") {
+          this.store.markDenied(checkpoint.continuationId);
+          return;
+        }
+        if (current.decision === "allow") {
+          if (!validActivation(current.activation)
+            || !contains(current.activation.canonicalFolder, checkpoint.requestedCapability.canonicalResource)) {
+            this.store.markApprovalDeliveryFailed(checkpoint.continuationId);
+            return;
+          }
+          this.store.markApproved(checkpoint.continuationId, {
+            grantId: current.activation.grantId,
+            grantRevision: current.activation.grantRevision,
+            approvedCanonicalFolder: current.activation.canonicalFolder,
+            approvedAccessPreset: current.activation.accessPreset,
+            expectedBoundaryManifestHash: current.activation.expectedBoundaryManifestHash,
+          });
+          return;
+        }
+        if (current.status !== "pending") this.store.markApprovalExpired(checkpoint.continuationId);
+      } catch (error) {
+        this.log?.(`[bridge] continuation approval recovery deferred: ${String(error)}`);
+      }
+    }));
+  }
+
   handleRuntimeEvent(sessionHandle: string, event: ContinuationRuntimeEvent): void {
     if ((event.type !== "reply" && event.type !== "turn_failed") || !event.inReplyTo) return;
     const checkpoint = this.store.findResuming({
@@ -95,4 +132,21 @@ export class ContinuationRecovery {
     }
     this.store.markResumeFailed(checkpoint.continuationId, "runtime_turn_failed");
   }
+}
+
+function validActivation(value: BoundaryActivation | null | undefined): value is BoundaryActivation {
+  return Boolean(
+    value
+    && typeof value.grantId === "string" && value.grantId.trim()
+    && Number.isSafeInteger(value.grantRevision) && value.grantRevision >= 0
+    && typeof value.canonicalFolder === "string" && value.canonicalFolder.trim()
+    && (value.accessPreset === "read-project" || value.accessPreset === "edit-project")
+    && typeof value.expectedBoundaryManifestHash === "string"
+    && value.expectedBoundaryManifestHash.trim(),
+  );
+}
+
+function contains(folder: string, resource: string): boolean {
+  const path = relative(resolve(folder), resolve(resource));
+  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }

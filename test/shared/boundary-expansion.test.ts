@@ -99,6 +99,39 @@ describe("boundary expansion coordinator", () => {
     });
   });
 
+  it("still accepts a human boundary decision after the old five-minute window", async () => {
+    // Regression: slow approvals became stale even though the continuation was durable.
+    const store = new ContinuationStore(new DatabaseSync(":memory:"));
+    let clock = 0;
+    const coordinator = new BoundaryExpansionCoordinator(store, {
+      async requestToolApproval() {
+        return { approvalId: "appr_slow", status: "pending", decision: null };
+      },
+      async getToolApproval() {
+        if (clock < 7 * 60_000) return { status: "pending", decision: null };
+        return {
+          status: "allow",
+          decision: "allow",
+          activation: {
+            grantId: "grant_slow",
+            grantRevision: 9,
+            canonicalFolder: "/srv/project-b",
+            accessPreset: "read-project",
+            expectedBoundaryManifestHash: "manifest_slow",
+          },
+        };
+      },
+    });
+
+    await expect(coordinator.request(base, {
+      now: () => clock,
+      sleep: async () => { clock += 60_000; },
+    })).resolves.toMatchObject({
+      state: "approved_pending_activation",
+      grantId: "grant_slow",
+    });
+  });
+
   it("never offers a boundary expansion for credential files", async () => {
     const store = new ContinuationStore(new DatabaseSync(":memory:"));
     let asked = false;

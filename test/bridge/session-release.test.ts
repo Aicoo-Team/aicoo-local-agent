@@ -64,6 +64,48 @@ describe("RuntimeBridge communication session release", () => {
     expect(adapter.prepareCommunicationSession).toHaveBeenCalledWith("native-session", "comm_new");
   });
 
+  it("keeps the default route pinned while its collaboration awaits folder approval", async () => {
+    vi.useFakeTimers();
+    const setDefaultRoute = vi.fn(async (endpointId: string, sessionHandle: string) => ({
+      endpointId,
+      sessionHandle,
+      updatedAt: new Date().toISOString(),
+    }));
+    let registered = 0;
+    const registerRuntimeSession = vi.fn(async (
+      endpointId: string,
+      input: RegisterRuntimeSessionInput,
+    ): Promise<RuntimeSessionBinding> => ({
+      sessionHandle: registered++ === 0 ? "server-primary" : "server-secondary",
+      endpointId,
+      principalId: "prn_b",
+      label: input.label,
+      state: input.state,
+      deliveryMode: input.deliveryMode,
+      capabilities: input.capabilities,
+      allowInbound: input.allowInbound,
+      allowMidTurnSteer: input.allowMidTurnSteer,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    }));
+    const { bridge } = setup({
+      sessions: [
+        { sessionHandle: "native-primary", label: "Primary", state: "idle", allowInbound: true },
+        { sessionHandle: "native-secondary", label: "Secondary", state: "idle", allowInbound: true },
+      ],
+      transport: transport({ registerRuntimeSession, setDefaultRoute }),
+    });
+    cleanups.push(() => void bridge.stop());
+
+    const started = await bridge.start();
+    expect(started.defaultRoute).toBe("server-primary");
+    await callHandleEvent(bridge, event("comm.activated", "comm-folder", "server-primary"));
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(setDefaultRoute).toHaveBeenCalledWith("ep_b", "server-primary");
+    expect(setDefaultRoute).not.toHaveBeenCalledWith("ep_b", "server-secondary");
+  });
+
   it("publishes the enforced workspace boundary with each managed session", async () => {
     const registerRuntimeSession = vi.fn(async (
       _endpointId: string,
@@ -408,7 +450,11 @@ describe("RuntimeBridge communication session release", () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-policy-mcp-update-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const policyFile = join(directory, "relationships.json");
-    const { bridge, adapter } = setup({ relationshipPolicyFile: policyFile });
+    const acknowledgeRelationshipMcpPolicies = vi.fn(async () => undefined);
+    const { bridge, adapter } = setup({
+      relationshipPolicyFile: policyFile,
+      transport: transport({ acknowledgeRelationshipMcpPolicies }),
+    });
 
     await callHandleEvent(bridge, {
       cursor: "policy-mcp-1",
@@ -418,6 +464,8 @@ describe("RuntimeBridge communication session release", () => {
       data: {
         requesterPrincipalId: "prn_a",
         requesterDeviceId: "device-a1",
+        mcpPolicyIds: ["rmp_server_1"],
+        revision: 7,
         mcpServers: [{
           name: "github",
           url: "https://mcp.example.com/github",
@@ -443,6 +491,10 @@ describe("RuntimeBridge communication session release", () => {
       }],
     });
     expect(adapter.invalidateRelationshipSessions).toHaveBeenCalledWith("prn_a", "device-a1");
+    expect(acknowledgeRelationshipMcpPolicies).toHaveBeenCalledWith({
+      policyIds: ["rmp_server_1"],
+      revision: 7,
+    });
 
     await callHandleEvent(bridge, {
       cursor: "policy-mcp-2",
@@ -496,6 +548,42 @@ describe("RuntimeBridge communication session release", () => {
 
     expect(() => readFileSync(policyFile, "utf8")).toThrow();
     expect(adapter.invalidateRelationshipSessions).not.toHaveBeenCalled();
+  });
+
+  it("retries an MCP acknowledgement after the grant was applied locally", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-policy-mcp-ack-retry-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const acknowledgeRelationshipMcpPolicies = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("temporary network failure"))
+      .mockResolvedValue(undefined);
+    const { bridge } = setup({
+      relationshipPolicyFile: join(directory, "relationships.json"),
+      transport: transport({ acknowledgeRelationshipMcpPolicies }),
+    });
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-mcp-ack-retry",
+      type: "relationship.policy_update",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        mcpPolicyIds: ["rmp_server_1"],
+        revision: 7,
+        mcpServers: [{
+          name: "github",
+          url: "https://mcp.example.com/github",
+          enabledTools: ["list_pull_requests"],
+        }],
+      },
+    });
+    await (
+      bridge as unknown as { flushRelationshipMcpAcknowledgements(): Promise<void> }
+    ).flushRelationshipMcpAcknowledgements();
+
+    expect(acknowledgeRelationshipMcpPolicies).toHaveBeenCalledTimes(2);
   });
 
   it("ignores a folder policy event from an earlier bridge run", async () => {
@@ -571,6 +659,59 @@ describe("RuntimeBridge communication session release", () => {
       policyId: "ttp_server_1",
       revision: 7,
       canonicalFolder: realpathSync.native(folder),
+    });
+  });
+
+  it("attests a boundary grant before acknowledging the paused continuation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-boundary-policy-ack-"));
+    const trustedToolPolicyFile = join(directory, "trusted-tools.json");
+    const folder = join(directory, "shared");
+    mkdirSync(folder);
+    const acknowledgeTrustedToolPolicy = vi.fn(async () => undefined);
+    const { bridge, adapter } = setup({
+      trustedToolPolicyFile,
+      bridgeInstanceId: "bridge-run-new",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      transport: transport({ acknowledgeTrustedToolPolicy }),
+    });
+    adapter.attestBoundaryActivation = vi.fn(async () => "manifest-attested");
+
+    await callHandleEvent(bridge, {
+      cursor: "policy-boundary-1",
+      type: "trusted_tool_policy.upserted",
+      endpointId: "ep_b",
+      createdAt: new Date().toISOString(),
+      data: {
+        policyId: "ttp_boundary_1",
+        ownerPrincipalId: "prn_b",
+        ownerDeviceId: "device_b",
+        requesterPrincipalId: "prn_a",
+        requesterDeviceId: "device-a1",
+        canonicalFolder: folder,
+        accessPreset: "read-project",
+        scope: "bridge_run",
+        bridgeInstanceId: "bridge-run-new",
+        revision: 8,
+        createdFrom: "approval_prompt",
+        createdBy: "prn_b",
+        createdAt: new Date().toISOString(),
+        boundaryExpansion: { continuationId: "cont-1" },
+      },
+    });
+
+    expect(adapter.attestBoundaryActivation).toHaveBeenCalledWith({
+      continuationId: "cont-1",
+      grantId: "ttp_boundary_1",
+      grantRevision: 8,
+      canonicalFolder: realpathSync.native(folder),
+      accessPreset: "read-project",
+    });
+    expect(acknowledgeTrustedToolPolicy).toHaveBeenCalledWith({
+      policyId: "ttp_boundary_1",
+      revision: 8,
+      canonicalFolder: realpathSync.native(folder),
+      boundaryManifestHash: "manifest-attested",
     });
   });
 

@@ -10,6 +10,8 @@ export interface BoundaryExpansionInput extends CreateContinuationInput {
   approval: Omit<ToolApprovalRequest, "boundaryExpansion">;
 }
 
+const BOUNDARY_APPROVAL_TIMEOUT_MS = 30 * 60_000;
+
 /** Couples one owner decision to one durable continuation and one exact kernel-boundary proposal. */
 export class BoundaryExpansionCoordinator {
   constructor(
@@ -45,7 +47,14 @@ export class BoundaryExpansionCoordinator {
           : {}),
         requiresSessionRebuild: true,
       },
-    }, options);
+    }, {
+      ...options,
+      timeoutMs: options.timeoutMs ?? BOUNDARY_APPROVAL_TIMEOUT_MS,
+      onApprovalCreated: async (approvalId) => {
+        this.store.attachApproval(checkpoint.continuationId, approvalId);
+        await options.onApprovalCreated?.(approvalId);
+      },
+    });
     if (outcome.behavior === "deny") {
       if (/declined/i.test(outcome.message)) return this.store.markDenied(checkpoint.continuationId);
       if (/expired|not approved in time/i.test(outcome.message)) {
