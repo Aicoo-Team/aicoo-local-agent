@@ -154,15 +154,21 @@ The protocol treats an inbound message as **intent and context, never authority*
   text-only**: `tools`, `allowedTools` empty, everything disallowed, `permissionMode: "dontAsk"`.
   It can read the message and reply in plain text; it cannot run commands, touch files, browse, or
   exfiltrate.
-- **Permissioned mode (per-tool owner approval).** When the owner supplies a `resolveToolPermission`
-  resolver, the configured `enabledTools` are turned on and **every tool call is routed through the
-  runtime's `canUseTool` gate**. The gate calls the owner's resolver, which returns
-  `{ behavior: "allow" | "deny", message? }`. It is **fail-closed**: any throw or timeout while
-  resolving denies the tool. One approval never implies the next.
+- **Permissioned mode (per-tool owner approval).** The explicit full-agent surface is constructed
+  only after the runtime safety and rebuild-health gates pass. Supported tool calls are routed
+  through the owner's approval gateway and fail closed on missing, rejected, or timed-out
+  decisions. Codex uses its interruptible app-server approval path; Claude Code uses `canUseTool`.
 - **Relationship policy.** The reference bridge can load an explicit allowlist keyed by the
   authenticated sender's principal and device IDs. Tools must be listed, and structured file-tool
   paths must remain inside listed folders after canonicalization. Missing identity or policy denies
-  access. Tools that cannot be safely path-scoped remain disabled.
+  access. A policy can grant several folders at once and exact remote HTTP MCP server/tool pairs.
+  Policy changes invalidate only sessions for the affected verified peer device; identical replayed
+  events are no-ops. Whole Codex plugin bundles remain isolated because their skills, hooks, and
+  other components do not fit the MCP-only grant contract.
+- **Immutable runtime boundary.** Filesystem roots are fixed when a runtime session starts. An
+  approved out-of-boundary request therefore quiesces the original turn, creates a wider
+  kernel-scoped session, and resumes the same durable correlation. Approval is an intermediate
+  state, never task completion.
 - **Egress discipline.** The reply is an outbound channel back to the sender; the receiver is
   instructed to share only what is appropriate within the current grant and never to reveal
   secrets, credentials, out-of-scope file contents, or third parties' data.

@@ -3,7 +3,7 @@ import { HttpMessageTransport } from "../../src/shared/http-client.js";
 import { AicooTransport } from "../../src/shared/aicoo-transport.js";
 
 describe("C2C Onboarding Client Integration", () => {
-  it("fetches the private team-agent directory", async () => {
+  it("fetches the private Team and friend agent directory", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -18,15 +18,41 @@ describe("C2C Onboarding Client Integration", () => {
       fetchImpl: mockFetch as unknown as typeof fetch,
     });
 
-    await expect(client.listTeamAgents()).resolves.toMatchObject({
+    await expect(client.listAgentDirectory()).resolves.toMatchObject({
       team: { id: "team-1" },
       agents: [{ principalId: "peer-1", connectionState: "contact" }],
     });
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://www.aicoo.io/api/v1/local-agent/team-agents",
+      "https://www.aicoo.io/api/v1/local-agent/agent-directory",
       expect.objectContaining({
         headers: expect.objectContaining({ authorization: "Bearer test-token" }),
       }),
+    );
+  });
+
+  it("falls back to the legacy Team endpoint when the canonical directory is not deployed", async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        json: async () => ({ error: "not_found" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ team: null, agents: [] }),
+      });
+    const client = new AicooTransport({
+      baseUrl: "https://www.aicoo.io",
+      token: "test-token",
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    await expect(client.listAgentDirectory()).resolves.toEqual({ team: null, agents: [] });
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      "https://www.aicoo.io/api/v1/local-agent/team-agents",
+      expect.any(Object),
     );
   });
 

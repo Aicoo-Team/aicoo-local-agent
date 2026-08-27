@@ -24,6 +24,7 @@ export interface CodexApprovalRequest {
   command?: string;
   cwd?: string;
   reason?: string;
+  paths?: string[];
 }
 
 export type CodexApprovalDecision = "accept" | "acceptForSession" | "decline";
@@ -43,6 +44,7 @@ export function classifyApproval(method: string, params: unknown): CodexApproval
   const command = typeof p.command === "string" ? p.command : undefined;
   const cwd = typeof p.cwd === "string" ? p.cwd : undefined;
   const reason = typeof p.reason === "string" ? p.reason : undefined;
+  const paths = kind === "fileChange" ? fileChangePaths(p) : [];
 
   return {
     kind,
@@ -50,6 +52,7 @@ export function classifyApproval(method: string, params: unknown): CodexApproval
     ...(command ? { command } : {}),
     ...(cwd ? { cwd } : {}),
     ...(reason ? { reason } : {}),
+    ...(paths.length > 0 ? { paths } : {}),
   };
 }
 

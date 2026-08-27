@@ -3,14 +3,26 @@ import { chmodSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
-import { RelationshipPolicy } from "../../security/relationship-policy.js";
+import {
+  projectAccessAllowsAction,
+  RelationshipPolicy,
+  taskRequiresProjectAccess,
+  type ProjectAccess,
+} from "../../security/relationship-policy.js";
 import { parseSafeGitCommand } from "../../security/safe-git.js";
 import type { MessageEnvelope } from "../../shared/contracts.js";
 import { nowIso } from "../../shared/time.js";
+import { stableHash } from "../../shared/ids.js";
 import type { InboundMessage, RuntimeAdapter, RuntimeSessionDescriptor } from "../runtime-adapter.js";
 import { CodexExecDriver, type CodexDriver, type CodexThreadEvent, type CodexTurn, type CodexTurnStartInput } from "./driver.js";
 import { awaitToolApproval, type ToolApprovalGateway } from "../../shared/tool-approval.js";
 import { writeCodexPermissionProfile } from "./permission-profile.js";
+import { createBoundaryManifest } from "../../shared/boundary-manifest.js";
+import type { ContinuationCheckpoint, ContinuationStore } from "../../shared/continuation-store.js";
+import { continuationInboundMessage } from "../../shared/continuation-message.js";
+import { requestBoundaryExpansionForTool } from "../../shared/boundary-expansion-request.js";
+import type { CapabilitySurface } from "../../shared/capability-rollout.js";
+import { hardenBashInput, redactToolOutput } from "../../security/full-capability-security.js";
 
 export interface CodexAdapterConfig {
   stateFile: string;
@@ -25,6 +37,7 @@ export interface CodexAdapterConfig {
   permissionProfileRoot?: string;
   model?: string;
   turnAckTimeoutMs?: number;
+  capabilitySurface?: CapabilitySurface;
   driver?: CodexDriver;
   /**
    * When set, app-server approvals and brokered exec file operations are routed to the owner.
@@ -46,6 +59,8 @@ interface ManagedSession {
   localHandle: string;
   providerThreadId?: string;
   boundCommunicationSessionId?: string;
+  relationshipPrincipalId?: string;
+  relationshipDeviceId?: string;
   label: string;
   state: "idle" | "busy" | "closed";
   activeTurn?: ActiveTurn;
@@ -58,6 +73,7 @@ interface ActiveTurn {
   turn: CodexTurn;
   done: Promise<void>;
   pendingAck?: PendingAck;
+  suppressed?: boolean;
 }
 
 interface PendingAck {
@@ -80,6 +96,7 @@ export class CodexAdapter implements RuntimeAdapter {
   readonly #sessions = new Map<string, ManagedSession>();
   readonly #events = new EventEmitter();
   readonly #config: CodexAdapterConfig;
+  #continuationStore?: ContinuationStore;
   #closing = false;
   #closed = false;
 
@@ -90,17 +107,96 @@ export class CodexAdapter implements RuntimeAdapter {
    * Returns nothing when there is no gateway or no live session to attribute the answer to; the
    * driver then refuses on its own, which is the pre-existing behaviour rather than a new bypass.
    */
-  #approvalRoute(message: InboundMessage, sessionHandle: string): { onApproval?: CodexTurnStartInput["onApproval"] } {
+  #approvalRoute(
+    message: InboundMessage,
+    sessionHandle: string,
+    runtimeTurnId: string,
+    turnCwd: string,
+    sessionAccess: ProjectAccess | undefined,
+  ): { onApproval?: CodexTurnStartInput["onApproval"] } {
     const gateway = this.#config.approvalGateway;
     const communicationSessionId = message.communicationSessionId;
     if (!gateway || !communicationSessionId) return {};
     return {
       onApproval: async (request) => {
+        const fullCapability = this.#config.capabilitySurface === "full-agent";
+        if (request.kind === "permissions") {
+          this.#config.log?.("codex permission widening denied: the active kernel profile is immutable");
+          return "decline";
+        }
         const gitOperation = request.kind === "commandExecution"
-          ? parseSafeGitCommand(request.summary.replace(/^Run:\s*/u, ""), this.#config.cwd)
+          ? parseSafeGitCommand(request.command ?? request.summary.replace(/^Run:\s*/u, ""), this.#config.cwd)
           : undefined;
-        if (request.kind === "commandExecution" && !gitOperation) {
+        if (request.kind === "commandExecution" && !gitOperation && !fullCapability) {
           this.#config.log?.("codex command denied: raw shell and unsupported Git commands are disabled");
+          return "decline";
+        }
+        const rawShell = request.kind === "commandExecution" && !gitOperation;
+        if (rawShell) {
+          const hardened = hardenBashInput({ command: request.command ?? request.summary.replace(/^Run:\s*/u, "") });
+          if (hardened.behavior === "deny") {
+            this.#config.log?.(`codex command denied: ${hardened.message}`);
+            return "decline";
+          }
+        }
+        let boundaryAllowed = false;
+        let outsideAction: { toolName: string; input: Record<string, unknown> } | undefined;
+        try {
+          const policy = this.relationshipPolicy();
+          const actions = gitOperation
+            ? [{ toolName: gitOperation.toolName, input: { repository: gitOperation.repository } }]
+            : rawShell
+              ? [{ toolName: "Edit", input: { file_path: request.cwd ?? turnCwd } }]
+            : request.kind === "fileChange" && request.paths?.length
+              ? request.paths.map((path) => ({ toolName: "Edit", input: { file_path: path } }))
+              : [];
+          boundaryAllowed = actions.length > 0;
+          for (const action of actions) {
+            const boundary = policy.authorizeBoundary(action, message);
+            if (boundary.behavior !== "allow") {
+              boundaryAllowed = false;
+              if (!rawShell) outsideAction = action;
+              break;
+            }
+            const boundaryInput = boundary.updatedInput ?? action.input;
+            if (!projectAccessAllowsAction(sessionAccess, {
+              toolName: action.toolName,
+              input: boundaryInput,
+            })) {
+              boundaryAllowed = false;
+              if (!rawShell) outsideAction = { toolName: action.toolName, input: boundaryInput };
+              break;
+            }
+            const canonicalRepository = "repository" in boundaryInput
+              ? boundaryInput.repository
+              : undefined;
+            if (gitOperation && typeof canonicalRepository === "string") {
+              gitOperation.repository = canonicalRepository;
+            }
+          }
+        } catch {
+          boundaryAllowed = false;
+        }
+        if (!boundaryAllowed) {
+          if (outsideAction && this.#continuationStore) {
+            const expansion = await requestBoundaryExpansionForTool({
+              store: this.#continuationStore,
+              gateway,
+              message,
+              sessionHandle,
+              runtimeTurnId,
+              attemptId: stableHash({ runtimeTurnId, request }),
+              toolName: outsideAction.toolName,
+              toolInput: outsideAction.input,
+              cwd: turnCwd,
+              summary: gitOperation?.summary ?? request.summary,
+              log: this.#config.log,
+            });
+            if (expansion?.state === "approved_pending_activation") {
+              this.#config.log?.("codex boundary expansion approved; rebuilding before task continuation");
+            }
+          }
+          this.#config.log?.("codex approval denied: request is outside the active session boundary");
           return "decline";
         }
         const outcome = await awaitToolApproval(
@@ -110,12 +206,14 @@ export class CodexAdapter implements RuntimeAdapter {
             sessionHandle,
             ...(message.id ? { messageId: message.id } : {}),
             // The owner reads one line, so it names the command, not the mechanism.
-            toolName: gitOperation?.toolName ?? (request.kind === "fileChange" ? "Edit" : "Permissions"),
+            toolName: gitOperation?.toolName ?? (rawShell ? "Bash" : request.kind === "fileChange" ? "Edit" : "Permissions"),
             toolInputSummary: gitOperation?.summary ?? request.summary,
           },
           { log: this.#config.log },
         );
-        return outcome.behavior === "allow" ? "accept" : "decline";
+        return outcome.behavior === "allow"
+          ? outcome.scope === "session" ? "acceptForSession" : "accept"
+          : "decline";
       },
     };
   }
@@ -157,7 +255,74 @@ export class CodexAdapter implements RuntimeAdapter {
       if (!/duplicate column/i.test(String(error))) throw error;
     }
     this.loadOrCreateSessions(config.sessionCount ?? 1);
+    if (config.capabilitySurface === "full-agent") {
+      // Codex fixes MCP and kernel capabilities when a provider thread is created. A bridge
+      // restart may load different relationship grants, so resuming a persisted full-agent
+      // thread could silently keep the old surface. Rebuild once per bridge run; in-run policy
+      // changes use invalidateRelationshipSessions and remain limited to the affected device.
+      this.#db.prepare("UPDATE managed_sessions SET provider_thread_id = NULL").run();
+      for (const session of this.#sessions.values()) session.providerThreadId = undefined;
+    }
     this.#events.setMaxListeners(100);
+  }
+
+  configureContinuationStore(store: ContinuationStore): void {
+    this.#continuationStore = store;
+  }
+
+  async canActivateContinuation(checkpoint: ContinuationCheckpoint): Promise<boolean> {
+    try {
+      this.continuationSession(checkpoint);
+      const message = continuationInboundMessage(checkpoint);
+      const access = this.relationshipPolicy().accessFor(message);
+      return Boolean(
+        access.status === "selected"
+        && checkpoint.approvedCanonicalFolder
+        && access.folders.includes(checkpoint.approvedCanonicalFolder)
+        && checkpoint.grantId
+        && access.selectedPolicyIds?.includes(checkpoint.grantId),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  async attestBoundaryActivation(input: {
+    continuationId: string;
+    grantId: string;
+    grantRevision: number;
+    canonicalFolder: string;
+    accessPreset: "read-project" | "edit-project";
+  }): Promise<string | undefined> {
+    const checkpoint = this.#continuationStore?.find(input.continuationId);
+    if (!checkpoint || !this.#config.bridgeInstanceId) return undefined;
+    const proposed: ContinuationCheckpoint = {
+      ...checkpoint,
+      grantId: input.grantId,
+      grantRevision: input.grantRevision,
+      approvedCanonicalFolder: input.canonicalFolder,
+      approvedAccessPreset: input.accessPreset,
+    };
+    const message = continuationInboundMessage(proposed);
+    const access = this.relationshipPolicy().accessFor(message);
+    if (
+      access.status !== "selected"
+      || !access.folders.includes(input.canonicalFolder)
+      || !access.selectedPolicyIds?.includes(input.grantId)
+      || !message.senderDeviceId
+    ) return undefined;
+    return createBoundaryManifest({
+      runtime: "codex",
+      adapterVersion: CodexAdapter.adapterVersion,
+      bridgeInstanceId: this.#config.bridgeInstanceId,
+      requesterPrincipalId: message.senderPrincipalId,
+      requesterDeviceId: message.senderDeviceId,
+      grantId: input.grantId,
+      grantRevision: input.grantRevision,
+      preset: input.accessPreset,
+      folders: access.folders,
+      writableFolders: access.writableFolders,
+    }).hash;
   }
 
   async initialize(): Promise<void> {
@@ -261,6 +426,8 @@ export class CodexAdapter implements RuntimeAdapter {
         "UPDATE managed_sessions SET bound_comm_session_id = ?, last_active_at = ? WHERE local_handle = ?",
       ).run(communicationSessionId, nowIso(), session.localHandle);
     }
+    session.relationshipPrincipalId = message.senderPrincipalId;
+    session.relationshipDeviceId = message.senderDeviceId;
 
     const contextOnly = Boolean(message.replyTo) && message.collaborationTurn?.expectsReply !== true;
     let permissionProfile: ReturnType<typeof writeCodexPermissionProfile>;
@@ -276,13 +443,17 @@ export class CodexAdapter implements RuntimeAdapter {
         accessPreset = access.preset;
         grantedFolders = access.folders;
         writableFolders = access.writableFolders;
-        if (accessPreset !== "chat-only" && grantedFolders.length > 0) {
+        const mcpServers = this.#config.capabilitySurface === "full-agent"
+          ? policy.mcpServersFor(message)
+          : [];
+        if ((accessPreset !== "chat-only" && grantedFolders.length > 0) || mcpServers.length > 0) {
           const profileRoot = this.#config.permissionProfileRoot
             ?? `${resolve(this.#config.relationshipPolicyFile)}.codex-profiles`;
           permissionProfile = writeCodexPermissionProfile(join(profileRoot, session.localHandle), {
             preset: accessPreset,
             folders: grantedFolders,
             writableFolders,
+            ...(mcpServers.length > 0 ? { mcpServers } : {}),
           });
         }
       } catch (error) {
@@ -299,20 +470,34 @@ export class CodexAdapter implements RuntimeAdapter {
       this.#config.log?.("codex project access denied: the requested project grant was not found");
       return { status: "project_access_not_found" } as const;
     }
+    if (!contextOnly && projectAccessStatus === "none" && taskRequiresProjectAccess(message)) {
+      this.#config.log?.("codex project access denied: the task requires a project but no grant is active");
+      return { status: "project_access_required" } as const;
+    }
 
     const runtimeTurnId = randomUUID();
     const projectAccessPreset = accessPreset === "chat-only" ? undefined : accessPreset;
     const hasProjectAccess = Boolean(permissionProfile && projectAccessPreset) && !contextOnly;
+    const turnCwd = hasProjectAccess ? grantedFolders[0]! : this.#config.cwd;
     const turn = this.#driver.startTurn({
       prompt: hasProjectAccess
         ? formatSandboxedRequest(message, projectAccessPreset!, grantedFolders)
         : formatInbound(message, contextOnly),
-      cwd: hasProjectAccess ? grantedFolders[0]! : this.#config.cwd,
-      ...(hasProjectAccess ? { permissionProfile } : {}),
+      cwd: turnCwd,
+      ...(permissionProfile ? { permissionProfile } : {}),
+      ...(hasProjectAccess && this.#config.capabilitySurface === "full-agent"
+        ? { writableRoots: writableFolders }
+        : {}),
+      ...(this.#config.capabilitySurface === "full-agent" ? { turnTimeoutMs: 7 * 60_000 } : {}),
       ...(session.providerThreadId ? { resumeThreadId: session.providerThreadId } : {}),
       ...(this.#config.codexPath ? { codexPath: this.#config.codexPath } : {}),
       ...(this.#config.model ? { model: this.#config.model } : {}),
-      ...this.#approvalRoute(message, session.localHandle),
+      ...this.#approvalRoute(message, session.localHandle, runtimeTurnId, turnCwd, hasProjectAccess ? {
+        status: "selected",
+        preset: projectAccessPreset!,
+        folders: grantedFolders,
+        writableFolders,
+      } : undefined),
       log: this.#config.log,
     });
     const active: ActiveTurn = { message, runtimeTurnId, contextOnly, turn, done: Promise.resolve() };
@@ -364,6 +549,19 @@ export class CodexAdapter implements RuntimeAdapter {
     await Promise.all(resets);
   }
 
+  async invalidateRelationshipSessions(principalId: string, deviceId: string): Promise<void> {
+    const resets: Promise<void>[] = [];
+    for (const session of this.#sessions.values()) {
+      if (
+        session.relationshipPrincipalId === principalId
+        && session.relationshipDeviceId === deviceId
+      ) {
+        resets.push(this.resetSession(session));
+      }
+    }
+    await Promise.all(resets);
+  }
+
   async prepareCommunicationSession(sessionHandle: string, communicationSessionId: string): Promise<void> {
     const session = this.#sessions.get(sessionHandle);
     if (
@@ -375,6 +573,81 @@ export class CodexAdapter implements RuntimeAdapter {
     ) {
       await this.resetSession(session);
     }
+  }
+
+  async quiesceContinuation(checkpoint: ContinuationCheckpoint): Promise<void> {
+    const session = this.continuationSession(checkpoint);
+    const active = session.activeTurn;
+    if (active) {
+      active.suppressed = true;
+      this.rejectPendingAck(active, new Error("session rebuilding after approved boundary expansion"));
+      active.turn.close();
+      await active.done.catch(() => undefined);
+      if (session.activeTurn === active) session.activeTurn = undefined;
+    }
+    this.markIdle(session);
+  }
+
+  async rebuildContinuation(checkpoint: ContinuationCheckpoint): Promise<{ boundaryManifestHash: string }> {
+    const session = this.continuationSession(checkpoint);
+    if (session.activeTurn) throw new Error("continuation session was not quiesced");
+    const message = continuationInboundMessage(checkpoint);
+    const access = this.relationshipPolicy().accessFor(message);
+    if (
+      access.status !== "selected"
+      || !checkpoint.approvedCanonicalFolder
+      || !access.folders.includes(checkpoint.approvedCanonicalFolder)
+      || !checkpoint.grantId
+      || !access.selectedPolicyIds?.includes(checkpoint.grantId)
+      || checkpoint.grantRevision === undefined
+      || !checkpoint.approvedAccessPreset
+      || !this.#config.bridgeInstanceId
+      || !message.senderDeviceId
+    ) throw new Error("approved boundary is not active in the local policy");
+    const profileRoot = this.#config.permissionProfileRoot
+      ?? `${resolve(this.#config.relationshipPolicyFile!)}.codex-profiles`;
+    if (!writeCodexPermissionProfile(join(profileRoot, session.localHandle), {
+      preset: access.preset,
+      folders: access.folders,
+      writableFolders: access.writableFolders,
+      ...(this.#config.capabilitySurface === "full-agent"
+        ? { mcpServers: this.relationshipPolicy().mcpServersFor(message) }
+        : {}),
+    })) throw new Error("approved boundary could not produce a Codex permission profile");
+    session.providerThreadId = undefined;
+    this.#db.prepare(
+      "UPDATE managed_sessions SET provider_thread_id = NULL, last_active_at = ? WHERE local_handle = ?",
+    ).run(nowIso(), session.localHandle);
+    const { hash } = createBoundaryManifest({
+      runtime: "codex",
+      adapterVersion: CodexAdapter.adapterVersion,
+      bridgeInstanceId: this.#config.bridgeInstanceId,
+      requesterPrincipalId: message.senderPrincipalId,
+      requesterDeviceId: message.senderDeviceId,
+      grantId: checkpoint.grantId,
+      grantRevision: checkpoint.grantRevision,
+      preset: checkpoint.approvedAccessPreset,
+      folders: access.folders,
+      writableFolders: access.writableFolders,
+    });
+    return { boundaryManifestHash: hash };
+  }
+
+  async resumeContinuation(checkpoint: ContinuationCheckpoint): Promise<{ status: string; runtimeAckId?: string }> {
+    return this.deliverToSession(
+      checkpoint.sessionHandle,
+      continuationInboundMessage(checkpoint),
+      "new_turn",
+    );
+  }
+
+  private continuationSession(checkpoint: ContinuationCheckpoint): ManagedSession {
+    const session = this.#sessions.get(checkpoint.sessionHandle);
+    if (!session || session.state === "closed") throw new Error("continuation session is unavailable");
+    if (session.boundCommunicationSessionId !== checkpoint.communicationSessionId) {
+      throw new Error("continuation communication session does not match the managed runtime");
+    }
+    return session;
   }
 
   private async consumeTurn(session: ManagedSession, active: ActiveTurn): Promise<void> {
@@ -392,6 +665,7 @@ export class CodexAdapter implements RuntimeAdapter {
         });
         if (turnCompleted) break;
       }
+      if (active.suppressed) return;
       if (!turnCompleted && !this.#closing) {
         this.failTurn(session, active, "codex stream ended before the turn completed");
         return;
@@ -400,7 +674,9 @@ export class CodexAdapter implements RuntimeAdapter {
         this.finishTurn(session, active, replyText);
       }
     } catch (error) {
-      if (!this.#closing) this.failTurn(session, active, error instanceof Error ? error.message : String(error));
+      if (!this.#closing && !active.suppressed) {
+        this.failTurn(session, active, error instanceof Error ? error.message : String(error));
+      }
     } finally {
       if (session.activeTurn === active) session.activeTurn = undefined;
     }
@@ -442,7 +718,10 @@ export class CodexAdapter implements RuntimeAdapter {
       return;
     }
     if (event.type === "item.completed" && event.item.type === "agent_message" && typeof event.item.text === "string") {
-      sink.onReplyText(event.item.text);
+      const reply = this.#config.capabilitySurface === "full-agent"
+        ? redactToolOutput(event.item.text)
+        : event.item.text;
+      sink.onReplyText(typeof reply === "string" ? reply : "[REDACTED]");
       return;
     }
     if (event.type === "turn.completed") {
@@ -530,6 +809,8 @@ export class CodexAdapter implements RuntimeAdapter {
     }
     session.providerThreadId = undefined;
     session.boundCommunicationSessionId = undefined;
+    session.relationshipPrincipalId = undefined;
+    session.relationshipDeviceId = undefined;
     session.state = "idle";
     this.#db.prepare(
       `UPDATE managed_sessions

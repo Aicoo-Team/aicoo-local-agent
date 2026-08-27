@@ -97,10 +97,94 @@ describe("native local folder/file picker", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe("osascript");
   });
 
-  // Regression: unsupported operating systems must remain unavailable and must not launch a command.
-  it("keeps Linux picker_unavailable", async () => {
+  // Regression: Ubuntu previously fell through to picker_unavailable without trying its native dialog.
+  it("uses zenity for Linux folder and file selection", async () => {
+    const runCommand = vi.fn<CommandRunner>(async (_file, args) => ({
+      stdout: args.includes("--directory") ? "/home/alice/Project\n" : "/home/alice/Project/notes.md\n",
+    }));
+    const picker = linuxPicker(runCommand);
+
+    await expect(picker.chooseFolder()).resolves.toEqual({ ok: true, path: "/home/alice/Project" });
+    await expect(picker.chooseFile()).resolves.toEqual({ ok: true, path: "/home/alice/Project/notes.md" });
+    expect(runCommand.mock.calls[0]).toEqual([
+      "zenity",
+      ["--file-selection", "--directory", "--title=Choose a folder to share with the peer local agent"],
+    ]);
+    expect(runCommand.mock.calls[1]).toEqual([
+      "zenity",
+      ["--file-selection", "--title=Choose a file to share with the peer local agent"],
+    ]);
+  });
+
+  // Regression: KDE systems commonly have kdialog but not zenity.
+  it("falls back to kdialog when zenity is missing", async () => {
+    const runCommand = vi.fn<CommandRunner>(async (file) => {
+      if (file === "zenity") throw Object.assign(new Error("not found"), { code: "ENOENT" });
+      return { stdout: "/home/alice/KDE Project\n" };
+    });
+    const picker = linuxPicker(runCommand);
+
+    await expect(picker.chooseFolder()).resolves.toEqual({ ok: true, path: "/home/alice/KDE Project" });
+    expect(runCommand.mock.calls.map(([file]) => file)).toEqual(["zenity", "kdialog"]);
+    expect(runCommand.mock.calls[1]?.[1]).toEqual([
+      "--getexistingdirectory", ".", "--title", "Choose a folder to share with the peer local agent",
+    ]);
+  });
+
+  // Regression: zenity may be installed on a headless or KDE session but unable to open a display.
+  it("falls back to kdialog when zenity cannot open the display", async () => {
+    const runCommand = vi.fn<CommandRunner>(async (file) => {
+      if (file === "zenity") {
+        throw Object.assign(new Error("zenity failed"), {
+          code: 1,
+          stderr: "Gtk-WARNING **: cannot open display",
+        });
+      }
+      return { stdout: "/home/alice/KDE Project\n" };
+    });
+    const picker = linuxPicker(runCommand);
+
+    await expect(picker.chooseFolder()).resolves.toEqual({ ok: true, path: "/home/alice/KDE Project" });
+    expect(runCommand.mock.calls.map(([file]) => file)).toEqual(["zenity", "kdialog"]);
+  });
+
+  // Regression: closing a Linux dialog is a user cancellation, not a missing picker.
+  it("reports Linux dialog cancellation without trying another UI", async () => {
+    const runCommand = vi.fn<CommandRunner>(async () => {
+      throw Object.assign(new Error("cancelled"), { code: 1 });
+    });
+    const picker = linuxPicker(runCommand);
+
+    await expect(picker.chooseFolder()).resolves.toEqual({
+      ok: false,
+      error: "cancelled",
+      message: "Folder selection was cancelled.",
+    });
+    expect(runCommand).toHaveBeenCalledOnce();
+  });
+
+  // Regression: Linux paths may contain spaces, apostrophes, and non-ASCII characters.
+  it("preserves Linux Unicode paths exactly", async () => {
+    const selected = "/home/alice/团队/O'Brien's Project/résumé.md";
+    const picker = linuxPicker(async () => ({ stdout: `${selected}\n` }));
+
+    await expect(picker.chooseFile()).resolves.toEqual({ ok: true, path: selected });
+  });
+
+  // Regression: headless Linux and minimal servers must keep the manual-path fallback.
+  it("returns picker_unavailable when Linux GUI pickers are missing", async () => {
+    const runCommand = vi.fn<CommandRunner>(async () => {
+      throw Object.assign(new Error("not found"), { code: "ENOENT" });
+    });
+    const picker = linuxPicker(runCommand);
+
+    await expect(picker.chooseFolder()).resolves.toEqual(unavailableResult());
+    expect(runCommand.mock.calls.map(([file]) => file)).toEqual(["zenity", "kdialog"]);
+  });
+
+  it("keeps unsupported platforms on the manual-path fallback", async () => {
     const runCommand = vi.fn<CommandRunner>();
-    const picker = new DefaultNativePicker({ getPlatform: () => "linux", runCommand });
+    const picker = new DefaultNativePicker({ getPlatform: () => "freebsd", runCommand });
 
     await expect(picker.chooseFolder()).resolves.toEqual(unavailableResult());
     expect(runCommand).not.toHaveBeenCalled();
@@ -134,6 +218,10 @@ describe("local helper security boundaries", () => {
 
 function windowsPicker(runCommand: CommandRunner): DefaultNativePicker {
   return new DefaultNativePicker({ getPlatform: () => "win32", runCommand });
+}
+
+function linuxPicker(runCommand: CommandRunner): DefaultNativePicker {
+  return new DefaultNativePicker({ getPlatform: () => "linux", runCommand });
 }
 
 function encodedOutput(path: string): { stdout: string } {

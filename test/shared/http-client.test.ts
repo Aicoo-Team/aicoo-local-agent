@@ -40,6 +40,29 @@ describe("bearer token normalization", () => {
 });
 
 describe("hosted Aicoo transport", () => {
+  it("posts relationship MCP acknowledgements to the local-agent API", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      Response.json({ policies: [] }));
+    const transport = new AicooTransport({
+      baseUrl: "https://example.test",
+      token: "aicoo_dev_test",
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    await transport.acknowledgeRelationshipMcpPolicies({
+      policyIds: ["rmp-1"],
+      revision: 7,
+    });
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "https://example.test/api/v1/local-agent/relationship-mcp-policies/ack",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ policyIds: ["rmp-1"], revision: 7 }),
+    });
+  });
+
   it("maps a collaboration request without trying to load a grant that does not exist yet", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -186,6 +209,7 @@ describe("hosted Aicoo transport", () => {
       status: "folder_access_requested",
       approvalKind: "folder",
       approvalId: "facc-1",
+      messageId: "msg-parked",
       communicationSession: { id: grant.commSessionId, status: "active" },
     });
   });

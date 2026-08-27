@@ -56,6 +56,7 @@ class CodexAppServerTurn implements CodexTurn {
   #stderrTail = "";
   #sawTerminal = false;
   #closed = false;
+  #turnTimer?: ReturnType<typeof setTimeout>;
 
   constructor(input: CodexTurnStartInput, config: CodexAppServerDriverConfig) {
     this.#input = input;
@@ -67,7 +68,11 @@ class CodexAppServerTurn implements CodexTurn {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: input.permissionProfile
-        ? { ...process.env, CODEX_HOME: input.permissionProfile.codexHome }
+        ? {
+            ...process.env,
+            ...input.permissionProfile.environment,
+            CODEX_HOME: input.permissionProfile.codexHome,
+          }
         : process.env,
       windowsVerbatimArguments: false,
     });
@@ -83,6 +88,7 @@ class CodexAppServerTurn implements CodexTurn {
       this.#events.close();
     });
     this.#child.on("close", (code) => {
+      if (this.#turnTimer) clearTimeout(this.#turnTimer);
       if (!this.#closed && !this.#sawTerminal) {
         this.#push({
           type: "error",
@@ -102,6 +108,7 @@ class CodexAppServerTurn implements CodexTurn {
     try {
       await this.#request("initialize", {
         clientInfo: { name: "aicoo-local-agent", version: "0.3.1", title: "Aicoo Local Agent" },
+        capabilities: { experimentalApi: true },
       });
       this.#notify("initialized", {});
 
@@ -112,7 +119,12 @@ class CodexAppServerTurn implements CodexTurn {
           // Everything the sandbox cannot serve becomes a question for the owner rather than a
           // silent refusal. That is the entire point of using app-server over exec.
           approvalPolicy: "untrusted",
-          sandboxPolicy: sandboxPolicy(this.#input),
+          ...(this.#input.permissionProfile
+            ? {
+                permissions: this.#input.permissionProfile.profileName,
+                runtimeWorkspaceRoots: this.#input.permissionProfile.workspaceRoots ?? [this.#input.cwd],
+              }
+            : { sandboxPolicy: sandboxPolicy(this.#input) }),
         });
       const threadId = readThreadId(thread);
       if (!threadId) throw new Error("codex app-server did not return a thread id");
@@ -122,6 +134,19 @@ class CodexAppServerTurn implements CodexTurn {
         threadId,
         input: [{ type: "text", text: this.#input.prompt }],
       });
+      if (this.#input.turnTimeoutMs !== undefined) {
+        this.#turnTimer = setTimeout(() => {
+          if (this.#closed || this.#sawTerminal) return;
+          this.#sawTerminal = true;
+          this.#push({
+            type: "error",
+            message: `codex app-server execution timeout after ${this.#input.turnTimeoutMs}ms`,
+            fatal: true,
+          });
+          this.#events.close();
+          this.#child.kill("SIGTERM");
+        }, this.#input.turnTimeoutMs);
+      }
       // turn/start only acknowledges; the work arrives as notifications and ends at
       // turn/completed or turn/failed. Nothing more to await here.
     } catch (error) {
@@ -170,6 +195,7 @@ class CodexAppServerTurn implements CodexTurn {
     // The terminal event has to be delivered before the queue closes, or the consumer sees the
     // stream end with no turn.completed and reads a healthy turn as a dropped one.
     this.#sawTerminal = true;
+    if (this.#turnTimer) clearTimeout(this.#turnTimer);
     const delivered = event ? this.#events.push(event).catch(() => {}) : Promise.resolve();
     void delivered.then(() => {
       this.#events.close();
@@ -236,6 +262,7 @@ class CodexAppServerTurn implements CodexTurn {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#turnTimer) clearTimeout(this.#turnTimer);
     this.#child.kill("SIGTERM");
     this.#events.close();
   }

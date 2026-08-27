@@ -415,9 +415,15 @@ export class AicooTransport extends HttpMessageTransport {
     };
     if (row.status === "grant_requested" || row.status === "folder_access_requested") {
       const approvalId = stringValue(row.approvalId);
+      const parkedMessageId = stringValue(row.messageId);
       if (row.status === "folder_access_requested" && !approvalId) {
         throw new ApiError(500, "invalid_response", {
           message: "Folder-access response is missing approvalId",
+        });
+      }
+      if (row.status === "folder_access_requested" && !parkedMessageId) {
+        throw new ApiError(500, "invalid_response", {
+          message: "Folder-access response is missing messageId",
         });
       }
       return {
@@ -425,6 +431,7 @@ export class AicooTransport extends HttpMessageTransport {
         ...common,
         approvalKind: row.status === "folder_access_requested" || approvalId ? "folder" : "collaboration",
         ...(approvalId ? { approvalId } : {}),
+        ...(parkedMessageId ? { messageId: parkedMessageId } : {}),
       } as LocalAgentDelegationResponse;
     }
 
@@ -461,11 +468,22 @@ export class AicooTransport extends HttpMessageTransport {
     policyId: string;
     revision: number;
     canonicalFolder: string;
+    boundaryManifestHash?: string;
   }): Promise<void> {
     const { policyId, ...body } = input;
     await this.requestJson(`${LA}/trusted-tool-policies/${encodeURIComponent(policyId)}/ack`, {
       method: "POST",
       body,
+    });
+  }
+
+  override async acknowledgeRelationshipMcpPolicies(input: {
+    policyIds: string[];
+    revision: number;
+  }): Promise<void> {
+    await this.requestJson(`${LA}/relationship-mcp-policies/ack`, {
+      method: "POST",
+      body: input,
     });
   }
 
@@ -784,4 +802,23 @@ export interface ToolApprovalRequest {
   messageId?: string;
   toolName: string;
   toolInputSummary: string;
+  boundaryExpansion?: BoundaryExpansionRequest;
+}
+
+export interface BoundaryExpansionRequest {
+  continuationId: string;
+  attemptId: string;
+  resourceKind: "filesystem";
+  canonicalResource: string;
+  requestedAccessPreset: "read-project" | "edit-project";
+  currentBoundaryManifestHash?: string;
+  requiresSessionRebuild: true;
+}
+
+export interface BoundaryActivation {
+  grantId: string;
+  grantRevision: number;
+  canonicalFolder: string;
+  accessPreset: "read-project" | "edit-project";
+  expectedBoundaryManifestHash: string;
 }

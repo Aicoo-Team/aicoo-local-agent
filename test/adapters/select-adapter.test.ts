@@ -83,6 +83,30 @@ describe("selectRuntimeAdapter relationship policy handling", () => {
     selected.adapter.close?.();
   });
 
+  it("fails closed when full-agent mode has no owner approval route", async () => {
+    const directory = makeDirectory();
+
+    await expect(selectRuntimeAdapter({
+      kind: "claude-code",
+      sessions: 1,
+      spoolFile: join(directory, "bridge.spool"),
+      workspace: directory,
+      capabilitySurface: "full-agent",
+    })).rejects.toThrow("requires an owner approval gateway");
+  });
+
+  it("requires Codex app-server before enabling the full capability surface", async () => {
+    const directory = makeDirectory();
+
+    await expect(selectRuntimeAdapter({
+      kind: "codex",
+      sessions: 1,
+      spoolFile: join(directory, "bridge.spool"),
+      workspace: directory,
+      capabilitySurface: "full-agent",
+    })).rejects.toThrow("requires --codex-app-server");
+  });
+
   function makeDirectory(): string {
     const directory = mkdtempSync(join(tmpdir(), "ccd-select-"));
     directories.push(directory);

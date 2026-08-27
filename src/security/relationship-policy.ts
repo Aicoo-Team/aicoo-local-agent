@@ -26,6 +26,11 @@ import {
   type TrustedToolPolicy,
   type TrustedToolPolicyIdentity,
 } from "./trusted-tool-policy.js";
+import {
+  parseRemoteMcpGrants,
+  remoteMcpGrantsSchema,
+  type RemoteMcpGrant,
+} from "./mcp-capability-grant.js";
 
 const policySchema = z.object({
   version: z.literal(1),
@@ -34,6 +39,7 @@ const policySchema = z.object({
     deviceId: z.string().trim().min(1),
     tools: z.array(z.string().trim().min(1)).default([]),
     folders: z.array(z.string().trim().min(1)).default([]),
+    mcpServers: remoteMcpGrantsSchema.optional(),
   }).strict()),
 }).strict();
 
@@ -53,7 +59,11 @@ export interface ProjectAccess {
   preset: RelationshipAccessPreset;
   folders: string[];
   writableFolders: string[];
+  selectionSource?: "single_active_grant" | "explicit" | "objective_preflight";
   requestedProject?: string;
+  requestedProjects?: string[];
+  selectedPolicyIds?: string[];
+  selectedFolderPaths?: string[];
 }
 
 interface CompiledRelationship {
@@ -61,6 +71,7 @@ interface CompiledRelationship {
   deviceId: string;
   tools: ReadonlySet<string>;
   folders: readonly string[];
+  mcpServers: readonly RemoteMcpGrant[];
 }
 
 interface RelationshipPolicyOptions extends Partial<TrustedToolPolicyIdentity> {
@@ -69,14 +80,18 @@ interface RelationshipPolicyOptions extends Partial<TrustedToolPolicyIdentity> {
 
 const PATH_INPUTS = {
   Read: ["file_path"],
+  Glob: ["path"],
+  Grep: ["path"],
   Write: ["file_path"],
   Edit: ["file_path"],
+  NotebookEdit: ["notebook_path"],
   GitStatus: ["repository"],
   GitDiff: ["repository"],
   GitLog: ["repository"],
   GitAdd: ["repository"],
   GitCommit: ["repository"],
 } as const;
+const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "GitAdd", "GitCommit"]);
 
 const POLICY_SUPPORTED_TOOLS = Object.keys(PATH_INPUTS).sort();
 const POLICY_SUPPORTED_TOOL_SET = new Set<string>(POLICY_SUPPORTED_TOOLS);
@@ -142,6 +157,7 @@ export class RelationshipPolicy {
       tools: new Set(relationship.tools),
       folders: relationship.folders.map((folder) =>
         canonicalPath(toLiteralAbsolute(cwd, folder))),
+      mcpServers: parseRemoteMcpGrants(relationship.mcpServers ?? []),
     }));
     for (const relationship of this.#relationships) {
       for (const folder of relationship.folders) {
@@ -200,6 +216,13 @@ export class RelationshipPolicy {
       .sort();
   }
 
+  /** Exact remote MCP grants for this verified peer device; project access is governed separately. */
+  mcpServersFor(message: InboundMessage | undefined): RemoteMcpGrant[] {
+    if (!message?.senderDeviceId) return [];
+    return parseRemoteMcpGrants(this.relationshipsFor(message).flatMap((relationship) =>
+      relationship.mcpServers));
+  }
+
   sandboxDenyReadPaths(): string[] {
     return dangerousSandboxPaths(this.grantedFolders(), "read");
   }
@@ -227,29 +250,67 @@ export class RelationshipPolicy {
     }
     const relationships = this.relationshipsFor(message);
     const trustedPolicies = this.trustedPoliciesFor(message);
-    const requestedProject = projectAccessSelector(message);
-    const requestedFolder = requestedProject && isAbsolute(requestedProject)
-      ? canonicalPath(requestedProject)
-      : undefined;
     const availableFolders = [...new Set([
       ...relationships.flatMap((relationship) => relationship.folders),
       ...trustedPolicies.map((policy) => policy.canonicalFolder),
     ])].sort();
+    const explicitProjects = projectAccessSelectors(message);
+    const preflightProjects = explicitProjects.length === 0
+      ? objectivePreflightProjects(message, availableFolders)
+      : [];
+    const requestedProjects = explicitProjects.length > 0 ? explicitProjects : preflightProjects;
+    const selectionSource = explicitProjects.length > 0
+      ? "explicit" as const
+      : preflightProjects.length > 0
+        ? "objective_preflight" as const
+        : "single_active_grant" as const;
 
     let selectedFolders: string[];
-    if (requestedProject) {
-      selectedFolders = availableFolders.filter((folder) => folder === requestedFolder)
-        .concat(trustedPolicies
-          .filter((policy) => policy.policyId === requestedProject)
-          .map((policy) => policy.canonicalFolder));
-      selectedFolders = [...new Set(selectedFolders)].sort();
-      if (selectedFolders.length !== 1) {
+    const selectedPolicyIds = new Set<string>();
+    const selectedFolderPaths = new Set<string>();
+    if (requestedProjects.length > 0) {
+      const requestedFolders = new Set<string>();
+      for (const requestedProject of requestedProjects) {
+        let matched = false;
+        for (const policy of trustedPolicies) {
+          if (policy.policyId !== requestedProject) continue;
+          selectedPolicyIds.add(policy.policyId);
+          requestedFolders.add(policy.canonicalFolder);
+          matched = true;
+        }
+        if (isAbsolute(requestedProject)) {
+          let requestedFolder: string;
+          try {
+            requestedFolder = canonicalPath(requestedProject);
+          } catch {
+            requestedFolder = requestedProject;
+          }
+          if (availableFolders.includes(requestedFolder)) {
+            selectedFolderPaths.add(requestedFolder);
+            requestedFolders.add(requestedFolder);
+            matched = true;
+          }
+        }
+        if (!matched) {
+          return {
+            status: "not_found",
+            preset: "chat-only",
+            folders: [],
+            writableFolders: [],
+            requestedProjects,
+            ...(requestedProjects.length === 1 ? { requestedProject: requestedProjects[0] } : {}),
+          };
+        }
+      }
+      selectedFolders = [...requestedFolders].sort();
+      if (selectedFolders.length === 0) {
         return {
           status: "not_found",
           preset: "chat-only",
           folders: [],
           writableFolders: [],
-          requestedProject,
+          requestedProjects,
+          ...(requestedProjects.length === 1 ? { requestedProject: requestedProjects[0] } : {}),
         };
       }
     } else {
@@ -270,21 +331,21 @@ export class RelationshipPolicy {
         preset: "chat-only",
         folders: [],
         writableFolders: [],
-        ...(requestedProject ? { requestedProject } : {}),
+        ...(requestedProjects.length > 0 ? { requestedProjects } : {}),
+        ...(requestedProjects.length === 1 ? { requestedProject: requestedProjects[0] } : {}),
       };
     }
 
-    const selectedFolder = selectedFolders[0]!;
-    const selectedPolicyId = requestedProject
-      ? trustedPolicies.find((policy) => policy.policyId === requestedProject)?.policyId
-      : undefined;
-    const selectedRelationships = selectedPolicyId
-      ? []
-      : relationships.filter((relationship) => relationship.folders.includes(selectedFolder));
+    const hasExplicitSelection = requestedProjects.length > 0;
+    const selectedRelationships = relationships.filter((relationship) =>
+      relationship.folders.some((folder) =>
+        selectedFolders.includes(folder)
+        && (!hasExplicitSelection || selectedFolderPaths.has(folder))));
     const selectedTrustedPolicies = trustedPolicies.filter((policy) =>
-      policy.canonicalFolder === selectedFolder
-      && (!requestedProject
-        || (selectedPolicyId ? policy.policyId === selectedPolicyId : requestedFolder === selectedFolder)));
+      selectedFolders.includes(policy.canonicalFolder)
+      && (!hasExplicitSelection
+        || selectedPolicyIds.has(policy.policyId)
+        || selectedFolderPaths.has(policy.canonicalFolder)));
     const presets: RelationshipAccessPreset[] = [
       ...selectedRelationships.map((relationship) => presetForTools(relationship.tools)),
       ...selectedTrustedPolicies.map((policy) => policy.accessPreset),
@@ -297,7 +358,7 @@ export class RelationshipPolicy {
     return {
       status: "selected",
       preset: strongestAccessPreset(presets),
-      folders: [selectedFolder],
+      folders: selectedFolders,
       writableFolders: [...new Set([
         ...selectedRelationships
           .filter((relationship) => relationship.tools.has("Write") || relationship.tools.has("Edit"))
@@ -305,8 +366,12 @@ export class RelationshipPolicy {
         ...selectedTrustedPolicies
           .filter((policy) => policy.accessPreset === "edit-project")
           .map((policy) => policy.canonicalFolder),
-      ])].filter((folder) => folder === selectedFolder),
-      ...(requestedProject ? { requestedProject } : {}),
+      ])].filter((folder) => selectedFolders.includes(folder)).sort(),
+      selectionSource,
+      ...(requestedProjects.length > 0 ? { requestedProjects } : {}),
+      ...(requestedProjects.length === 1 ? { requestedProject: requestedProjects[0] } : {}),
+      ...(selectedPolicyIds.size > 0 ? { selectedPolicyIds: [...selectedPolicyIds].sort() } : {}),
+      ...(selectedFolderPaths.size > 0 ? { selectedFolderPaths: [...selectedFolderPaths].sort() } : {}),
     };
   }
 
@@ -342,18 +407,20 @@ export class RelationshipPolicy {
     }
 
     const matchingTrustedPolicies = this.trustedPoliciesFor(message);
-    const selectedPolicyId = projectAccess.requestedProject
-      ? matchingTrustedPolicies.find((policy) => policy.policyId === projectAccess.requestedProject)?.policyId
-      : undefined;
-    const relationships = selectedPolicyId
-      ? []
-      : this.#relationships.filter((candidate) =>
-        candidate.principalId === message.senderPrincipalId
-        && candidate.deviceId === message.senderDeviceId
-        && candidate.folders.some((folder) => projectAccess.folders.includes(folder)));
+    const selectedPolicyIds = new Set(projectAccess.selectedPolicyIds ?? []);
+    const selectedFolderPaths = new Set(projectAccess.selectedFolderPaths ?? []);
+    const hasExplicitSelection = (projectAccess.requestedProjects?.length ?? 0) > 0;
+    const relationships = this.#relationships.filter((candidate) =>
+      candidate.principalId === message.senderPrincipalId
+      && candidate.deviceId === message.senderDeviceId
+      && candidate.folders.some((folder) =>
+        projectAccess.folders.includes(folder)
+        && (!hasExplicitSelection || selectedFolderPaths.has(folder))));
     const trustedPolicies = matchingTrustedPolicies.filter((policy) =>
       projectAccess.folders.includes(policy.canonicalFolder)
-      && (!selectedPolicyId || policy.policyId === selectedPolicyId));
+      && (!hasExplicitSelection
+        || selectedPolicyIds.has(policy.policyId)
+        || selectedFolderPaths.has(policy.canonicalFolder)));
     if (relationships.length === 0 && trustedPolicies.length === 0) {
       return deny("No policy for this user and device");
     }
@@ -379,6 +446,10 @@ export class RelationshipPolicy {
       .map((policy) => policy.canonicalFolder);
     const allowedFolders = [...new Set([...relationshipFolders, ...trustedFolders])];
     if (allowedFolders.length === 0) return deny(`Tool ${action.toolName} requires an allowed folder`);
+
+    if (searchPatternEscapesBoundary(action.toolName, action.input)) {
+      return deny("Search patterns cannot traverse outside the selected project boundary");
+    }
 
     const paths = pathKeys.flatMap((key) => {
       const value = action.input[key];
@@ -430,15 +501,151 @@ export class RelationshipPolicy {
   }
 }
 
+function searchPatternEscapesBoundary(toolName: string, input: Record<string, unknown>): boolean {
+  const values = toolName === "Glob"
+    ? [input.pattern]
+    : toolName === "Grep"
+      ? [input.glob]
+      : [];
+  return values.some((value) => {
+    if (typeof value !== "string") return false;
+    const portable = value.replaceAll("\\", "/");
+    return portable.startsWith("/")
+      || /^[a-z]:\//iu.test(portable)
+      || portable.split("/").includes("..");
+  });
+}
+
 /**
  * Project selection travels inside the structured delegation task so both the
  * reference server and older hosted relays can forward it without a new route.
  */
 export function projectAccessSelector(message: InboundMessage | undefined): string | undefined {
+  const selectors = projectAccessSelectors(message);
+  return selectors.length === 1 ? selectors[0] : undefined;
+}
+
+/**
+ * An objective may select several exact grants so the runtime can build one immutable boundary
+ * before work starts. The plural field is additive protocol evolution; the singular field stays
+ * readable for older senders and relays.
+ */
+export function projectAccessSelectors(message: InboundMessage | undefined): string[] {
   const task = message?.payload.task;
-  if (!task || typeof task !== "object" || Array.isArray(task)) return undefined;
-  const selector = (task as Record<string, unknown>).projectAccessId;
-  return typeof selector === "string" && selector.trim() ? selector.trim() : undefined;
+  if (!task || typeof task !== "object" || Array.isArray(task)) return [];
+  const record = task as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(record, "projectAccessIds")) {
+    const selectors = record.projectAccessIds;
+    if (
+      !Array.isArray(selectors)
+      || selectors.length === 0
+      || selectors.length > 16
+      || selectors.some((selector) => typeof selector !== "string" || !selector.trim() || selector.length > 1_024)
+    ) {
+      return ["\u0000invalid-project-selection"];
+    }
+    return [...new Set(selectors.map((selector) => String(selector).trim()))].sort();
+  }
+  if (!Object.prototype.hasOwnProperty.call(record, "projectAccessId")) return [];
+  const selector = record.projectAccessId;
+  return typeof selector === "string" && selector.trim() && selector.length <= 1_024
+    ? [selector.trim()]
+    : ["\u0000invalid-project-selection"];
+}
+
+/**
+ * Detect objectives that cannot be answered honestly from chat-only context. This intentionally
+ * requires both an inspection-style action and a local-resource noun so general engineering
+ * questions remain available without a folder grant.
+ */
+export function taskRequiresProjectAccess(message: InboundMessage | undefined): boolean {
+  if (message?.kind !== "task_invite") return false;
+  if (projectAccessSelectors(message).length > 0) return true;
+  const task = message.payload.task;
+  const text = typeof task === "string"
+    ? task
+    : task && typeof task === "object" && !Array.isArray(task)
+      ? (task as Record<string, unknown>).text
+      : undefined;
+  if (typeof text !== "string" || !text.trim()) return false;
+  const normalized = text.toLowerCase();
+  const action = /\b(summar(?:ize|ise)|inspect|review|analy[sz]e|explain|describe|read|check|compare|modify|edit|fix|test|build|run)\b/u;
+  const resource = /\b(project|repository|repo|codebase|source|files?|folders?|readme|implementation|git|branch|diff)\b/u;
+  return action.test(normalized) && resource.test(normalized);
+}
+
+/**
+ * Select already-active project grants named by a task objective before the runtime starts.
+ * A basename is accepted only when it identifies exactly one available folder; otherwise the
+ * caller receives selection_required and must provide an exact grant ID or absolute folder.
+ */
+function objectivePreflightProjects(
+  message: InboundMessage | undefined,
+  availableFolders: readonly string[],
+): string[] {
+  if (message?.kind !== "task_invite" || availableFolders.length < 2) return [];
+  const task = message.payload.task;
+  if (!task || typeof task !== "object" || Array.isArray(task)) return [];
+  const text = (task as Record<string, unknown>).text;
+  if (typeof text !== "string" || !text.trim()) return [];
+
+  const normalizedObjective = text.toLowerCase();
+  const foldersByName = new Map<string, string[]>();
+  for (const folder of availableFolders) {
+    const name = basename(folder).toLowerCase();
+    foldersByName.set(name, [...(foldersByName.get(name) ?? []), folder]);
+  }
+
+  const selected = new Set<string>();
+  for (const folder of availableFolders) {
+    if (objectiveNamesProject(normalizedObjective, folder.toLowerCase())) selected.add(folder);
+  }
+  for (const [name, folders] of foldersByName) {
+    if (name.length < 3 || folders.length !== 1 || !objectiveNamesProject(normalizedObjective, name)) continue;
+    selected.add(folders[0]!);
+  }
+  return [...selected].sort();
+}
+
+function objectiveNamesProject(objective: string, projectName: string): boolean {
+  const escaped = projectName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`(^|[^a-z0-9_])${escaped}($|[^a-z0-9_])`, "u").test(objective);
+}
+
+/** Check a canonicalized tool action against the immutable access snapshot used to launch a session. */
+export function projectAccessAllowsAction(
+  access: ProjectAccess | undefined,
+  action: { toolName: string; input: Record<string, unknown> },
+): boolean {
+  if (!access || access.status !== "selected") return false;
+  const pathKeys = PATH_INPUTS[action.toolName as keyof typeof PATH_INPUTS];
+  if (!pathKeys) return false;
+  const paths = pathKeys.flatMap((key) => {
+    const value = action.input[key];
+    return typeof value === "string" && value.trim() ? [value] : [];
+  });
+  if (paths.length === 0) return false;
+  const allowedFolders = WRITE_TOOLS.has(action.toolName) ? access.writableFolders : access.folders;
+  return paths.every((candidate) => allowedFolders.some((folder) => isWithin(folder, candidate)));
+}
+
+/** Resolve one safe filesystem target for an owner-facing boundary expansion request. */
+export function canonicalToolResourceForApproval(
+  action: { toolName: string; input: Record<string, unknown> },
+  cwd: string,
+): string | undefined {
+  const pathKeys = PATH_INPUTS[action.toolName as keyof typeof PATH_INPUTS];
+  if (!pathKeys) return undefined;
+  const value = pathKeys
+    .map((key) => action.input[key])
+    .find((candidate): candidate is string => typeof candidate === "string" && Boolean(candidate.trim()));
+  if (!value) return undefined;
+  try {
+    const candidate = canonicalPath(toLiteralAbsolute(cwd, value));
+    return dangerousPathDecision(action.toolName, candidate) ? undefined : candidate;
+  } catch {
+    return undefined;
+  }
 }
 
 function presetForTools(tools: ReadonlySet<string>): RelationshipAccessPreset {
@@ -490,6 +697,7 @@ export function upsertRelationshipPolicy(input: {
   deviceId: string;
   tools: readonly string[];
   folders: readonly string[];
+  mcpServers?: readonly RemoteMcpGrant[];
 }): RelationshipPolicyDocument {
   const unsupported = input.tools.find((tool) => !POLICY_SUPPORTED_TOOL_SET.has(tool));
   if (unsupported) throw new Error(`Unsupported relationship tool ${unsupported}`);
@@ -507,11 +715,15 @@ export function upsertRelationshipPolicy(input: {
       throw new Error("Relationship policy must be stored outside the granted folder");
     }
   }
+  const previous = existing.relationships.find((relationship) =>
+    relationship.principalId === input.principalId && relationship.deviceId === input.deviceId);
+  const mcpServers = parseRemoteMcpGrants(input.mcpServers ?? previous?.mcpServers ?? []);
   const nextRelationship: RelationshipPolicyDocument["relationships"][number] = {
     principalId: input.principalId,
     deviceId: input.deviceId,
     tools: [...new Set(input.tools)].sort(),
     folders: canonicalFolders.sort(),
+    ...(mcpServers.length > 0 ? { mcpServers } : {}),
   };
   const relationships = existing.relationships.filter((relationship) =>
     relationship.principalId !== input.principalId || relationship.deviceId !== input.deviceId);
@@ -522,6 +734,26 @@ export function upsertRelationshipPolicy(input: {
   const document: RelationshipPolicyDocument = { version: 1, relationships };
   writePolicyDocument(input.file, document);
   return document;
+}
+
+/** Replace one verified peer device's MCP grants without changing its project access preset. */
+export function setRelationshipMcpGrants(input: {
+  file: string;
+  principalId: string;
+  deviceId: string;
+  grants: unknown;
+}): RelationshipPolicyDocument {
+  const existing = readPolicyDocument(input.file);
+  const relationship = existing.relationships.find((candidate) =>
+    candidate.principalId === input.principalId && candidate.deviceId === input.deviceId);
+  return upsertRelationshipPolicy({
+    file: input.file,
+    principalId: input.principalId,
+    deviceId: input.deviceId,
+    tools: relationship?.tools ?? [],
+    folders: relationship?.folders ?? [],
+    mcpServers: parseRemoteMcpGrants(input.grants),
+  });
 }
 
 function readPolicyDocument(file: string): RelationshipPolicyDocument {
@@ -621,7 +853,8 @@ function dangerousPathDecision(toolName: string, candidate: string): string | un
   if (CREDENTIAL_FILE_NAMES.has(fileName) || fileName.startsWith(".env.")) {
     return "Credential files cannot be accessed by a remote relationship";
   }
-  if ((toolName === "Write" || toolName === "Edit") && isExecutionOnNextUsePath(normalized)) {
+  if ((toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit")
+    && isExecutionOnNextUsePath(normalized)) {
     return "Execution-on-next-use files cannot be modified by a remote relationship";
   }
   return undefined;

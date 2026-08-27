@@ -19,6 +19,8 @@ async function run(options: {
   withoutApprovalRoute?: boolean;
   env?: Record<string, string>;
   writableRoots?: string[];
+  permissionProfile?: { codexHome: string; profileName: string };
+  turnTimeoutMs?: number;
 } = {}): Promise<RunResult> {
   const asked: CodexApprovalRequest[] = [];
   const previous: Record<string, string | undefined> = {};
@@ -42,6 +44,8 @@ async function run(options: {
     codexPath: FAKE_SERVER,
     ...(onApproval ? { onApproval } : {}),
     ...(options.writableRoots ? { writableRoots: options.writableRoots } : {}),
+    ...(options.permissionProfile ? { permissionProfile: options.permissionProfile } : {}),
+    ...(options.turnTimeoutMs ? { turnTimeoutMs: options.turnTimeoutMs } : {}),
   });
 
   const events: CodexThreadEvent[] = [];
@@ -166,5 +170,40 @@ describe("CodexAppServerDriver", () => {
     const fatal = result.events.find((event) => event.type === "error");
     expect(fatal).toMatchObject({ type: "error", fatal: true });
     expect((fatal as { message: string }).message).toContain("exited with code 1");
+  });
+
+  it("selects the generated kernel permission profile when starting a thread", async () => {
+    const result = await run({
+      permissionProfile: { codexHome: "/tmp/aicoo-profile", profileName: "aicoo-c2c" },
+      env: { FAKE_SKIP_APPROVAL: "1", FAKE_REPORT_THREAD_START: "1" },
+    });
+    expect(JSON.parse(result.replyText ?? "{}")).toMatchObject({
+      permissions: "aicoo-c2c",
+      runtimeWorkspaceRoots: [process.cwd()],
+    });
+    expect(JSON.parse(result.replyText ?? "{}")).not.toHaveProperty("sandboxPolicy");
+  });
+
+  it("negotiates the experimental API before sending runtime workspace roots", async () => {
+    // Regression: Codex rejected every injected turn until the bridge exhausted its retries.
+    const result = await run({
+      permissionProfile: { codexHome: "/tmp/aicoo-profile", profileName: "aicoo-c2c" },
+      env: { FAKE_SKIP_APPROVAL: "1", FAKE_REQUIRE_EXPERIMENTAL_API: "1" },
+    });
+
+    expect(result.events).toContainEqual(expect.objectContaining({ type: "turn.completed" }));
+    expect(result.events).not.toContainEqual(expect.objectContaining({ type: "error", fatal: true }));
+  });
+
+  it("terminates a full-capability turn that exceeds its execution budget", async () => {
+    const result = await run({
+      turnTimeoutMs: 25,
+      env: { FAKE_HANG_AFTER_TURN_START: "1" },
+    });
+    expect(result.events).toContainEqual(expect.objectContaining({
+      type: "error",
+      fatal: true,
+      message: expect.stringContaining("execution timeout"),
+    }));
   });
 });

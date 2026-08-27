@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -41,6 +41,35 @@ describe("codex permission profile", () => {
     expect(profile).toContain('"." = "read"');
   });
 
+  it("lets macOS developer-tool shims read the selected toolchain", () => {
+    const profile = renderCodexPermissionProfile({
+      preset: "read-project",
+      folders: ["/srv/project"],
+      platform: "darwin",
+      developerDirectory: "/Library/Developer/CommandLineTools",
+    })!;
+
+    expect(profile).toContain('"/Library/Developer/CommandLineTools" = "read"');
+  });
+
+  it("uses the native null device for Git in Windows project sessions", () => {
+    const dir = tempDir("codex-windows-profile-");
+    const prepared = writeCodexPermissionProfile(join(dir, "home"), {
+      preset: "read-project",
+      folders: ["C:\\work\\project"],
+      platform: "win32",
+      authFile: join(dir, "missing-auth.json"),
+    })!;
+    const profile = readFileSync(join(prepared.codexHome, "config.toml"), "utf8");
+
+    expect(prepared.environment).toMatchObject({
+      GIT_CONFIG_GLOBAL: "NUL",
+      GIT_CONFIG_NOSYSTEM: "1",
+    });
+    expect(profile).toContain('GIT_CONFIG_GLOBAL = "NUL"');
+    expect(profile).not.toContain("/Library/Developer/CommandLineTools");
+  });
+
   it("grants write only for edit-project", () => {
     const read = renderCodexPermissionProfile({ preset: "read-project", folders: ["/srv/p"] })!;
     const edit = renderCodexPermissionProfile({ preset: "edit-project", folders: ["/srv/p"] })!;
@@ -68,9 +97,57 @@ describe("codex permission profile", () => {
     }
   });
 
+  it("keeps credentials out of the command environment", () => {
+    const profile = renderCodexPermissionProfile({ preset: "edit-project", folders: ["/srv/p"] })!;
+    expect(profile).toContain("[shell_environment_policy]");
+    expect(profile).toContain('inherit = "core"');
+    expect(profile).toContain('"*TOKEN*"');
+    expect(profile).toContain('"*SECRET*"');
+  });
+
+  it("adds only explicitly granted remote MCP tools to the private Codex home", () => {
+    const profile = renderCodexPermissionProfile({
+      preset: "read-project",
+      folders: ["/srv/p"],
+      mcpServers: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["search", "read"],
+        bearerTokenEnvVar: "DOCS_AUTH",
+      }],
+    })!;
+    expect(profile).toContain('mcp_oauth_credentials_store = "file"');
+    expect(profile).toContain('[history]\npersistence = "none"');
+    expect(profile).toContain('[memories]\ndisable_on_external_context = true');
+    expect(profile).toContain('[mcp_servers."docs"]');
+    expect(profile).toContain('enabled_tools = ["read", "search"]');
+    expect(profile).toContain('[mcp_servers."docs".tools."read"]\napproval_mode = "approve"');
+    expect(profile).toContain('"DOCS_AUTH"');
+    expect(profile).not.toContain("command =");
+    expect(profile).not.toContain("http_headers");
+  });
+
+  it("does not expose the macOS toolchain or scratch directory to MCP-only sessions", () => {
+    const profile = renderCodexPermissionProfile({
+      preset: "chat-only",
+      folders: [],
+      platform: "darwin",
+      developerDirectory: "/Library/Developer/CommandLineTools",
+      runtimeTempDirectory: "/private/aicoo/session-tmp",
+      mcpServers: [{ name: "docs", url: "https://mcp.example.com/v1", enabledTools: ["search"] }],
+    })!;
+
+    expect(profile).not.toContain("/Library/Developer/CommandLineTools");
+    expect(profile).not.toContain("/private/aicoo/session-tmp");
+  });
+
   it("writes a private CODEX_HOME so the owner's own config cannot leak in", () => {
     const dir = tempDir("codex-profile-");
-    const authFile = join(dir, "source-auth.json");
+    const ownerHome = join(dir, "owner-home");
+    const ownerPlugin = join(ownerHome, "plugins", "owner-private-plugin");
+    mkdirSync(ownerPlugin, { recursive: true });
+    writeFileSync(join(ownerPlugin, "plugin.json"), '{"name":"owner-private-plugin"}');
+    const authFile = join(ownerHome, "auth.json");
     writeFileSync(authFile, '{"token":"test-only"}', { mode: 0o600 });
     const prepared = writeCodexPermissionProfile(join(dir, "home"), {
       preset: "read-project",
@@ -78,7 +155,18 @@ describe("codex permission profile", () => {
       authFile,
     })!;
     expect(prepared.profileName).toBe(CODEX_PROFILE_NAME);
+    expect(prepared.environment).toMatchObject({
+      TMPDIR: join(prepared.codexHome, "tmp"),
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+    });
+    expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain(
+      `set = { TMPDIR = ${JSON.stringify(join(prepared.codexHome, "tmp"))}, GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }`,
+    );
     expect(readFileSync(join(prepared.codexHome, "auth.json"), "utf8")).toBe('{"token":"test-only"}');
+    // A plugin can bundle skills, MCP servers, and executable hooks. Copying the owner's
+    // plugin directory would grant all of those without a relationship-level capability record.
+    expect(existsSync(join(prepared.codexHome, "plugins"))).toBe(false);
     expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain('":root" = "deny"');
   });
 });
@@ -125,7 +213,7 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
     writeFileSync(join(granted, "readme.txt"), "IN-SCOPE-FILE\n");
     writeFileSync(join(outside, "secret.txt"), "CANARY-SHOULD-NOT-LEAK\n");
     const prepared = writeCodexPermissionProfile(join(root, "codexhome"), { preset, folders: [granted] })!;
-    return { granted, outside, codexHome: prepared.codexHome };
+    return { granted, outside, codexHome: prepared.codexHome, environment: prepared.environment };
   }
 
   it("read-project reads inside the grant and nothing outside it", () => {
@@ -144,6 +232,27 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
 
     const write = probe(codexHome, granted, ["sh", "-c", `echo x > ${join(granted, "w.txt")}`]);
     expect(write.ok, "read-project must not be able to write").toBe(false);
+  });
+
+  it.skipIf(process.platform !== "darwin")("lets Apple Git reach its selected developer toolchain", () => {
+    const { granted, codexHome, environment } = setup("read-project");
+
+    const git = (() => {
+      try {
+        const output = execFileSync("codex", ["sandbox", "-P", CODEX_PROFILE_NAME, "-C", granted, "--", "/usr/bin/git", "--version"], {
+          env: { ...process.env, ...environment, CODEX_HOME: codexHome },
+          encoding: "utf8",
+          stdio: "pipe",
+          timeout: 60_000,
+        });
+        return { ok: true, output };
+      } catch (error) {
+        const err = error as { stdout?: string; stderr?: string };
+        return { ok: false, output: `${err.stdout ?? ""}${err.stderr ?? ""}` };
+      }
+    })();
+    expect(git.ok, `Apple Git should work inside the scoped sandbox: ${git.output}`).toBe(true);
+    expect(git.output).toContain("git version");
   });
 
   it("edit-project writes inside the grant, but never outside it and never to the network", () => {
@@ -165,6 +274,25 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
 
     const network = probe(codexHome, granted, ["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", "https://example.com"]);
     expect(network.ok && /^[23]\d\d$/.test(network.output.trim()), "network egress must be refused").toBe(false);
+  });
+
+  it("accepts the generated remote MCP policy as valid Codex configuration", () => {
+    const root = mkdtempSync(join(homedir(), ".aicoo-mcp-config-test-"));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const granted = join(root, "granted");
+    mkdirSync(granted);
+    const prepared = writeCodexPermissionProfile(join(root, "codexhome"), {
+      preset: "read-project",
+      folders: [granted],
+      mcpServers: [{
+        name: "local_docs",
+        url: "http://127.0.0.1:43177/mcp",
+        enabledTools: ["read", "search"],
+      }],
+    })!;
+
+    const result = probe(prepared.codexHome, granted, ["true"]);
+    expect(result.ok, `Codex rejected the generated MCP profile: ${result.output}`).toBe(true);
   });
 });
 

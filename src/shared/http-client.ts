@@ -277,11 +277,22 @@ export class HttpMessageTransport implements MessageTransport {
     policyId: string;
     revision: number;
     canonicalFolder: string;
+    boundaryManifestHash?: string;
   }): Promise<void> {
     const { policyId, ...body } = input;
     await this.requestJson(`/api/v1/trusted-tool-policies/${encodeURIComponent(policyId)}/ack`, {
       method: "POST",
       body,
+    });
+  }
+
+  async acknowledgeRelationshipMcpPolicies(input: {
+    policyIds: string[];
+    revision: number;
+  }): Promise<void> {
+    await this.requestJson("/api/v1/relationship-mcp-policies/ack", {
+      method: "POST",
+      body: input,
     });
   }
 
@@ -305,7 +316,17 @@ export class HttpMessageTransport implements MessageTransport {
   }
 
   async listTeamAgents(): Promise<TeamAgentDirectory> {
-    return this.requestJson("/api/v1/local-agent/team-agents");
+    return this.listAgentDirectory();
+  }
+
+  async listAgentDirectory(): Promise<TeamAgentDirectory> {
+    try {
+      return await this.requestJson("/api/v1/local-agent/agent-directory");
+    } catch (error) {
+      // Rollout compatibility: older Aicoo servers expose the same shape at the Team-only path.
+      if (!(error instanceof ApiError) || error.status !== 404) throw error;
+      return this.requestJson("/api/v1/local-agent/team-agents");
+    }
   }
 
   async getDefaultRoute(): Promise<{ endpointId: string; sessionHandle: string; updatedAt: string }> {

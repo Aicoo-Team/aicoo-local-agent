@@ -26,9 +26,9 @@ The central rule: **a message conveys intent and context, not authority.**
 - **Receiver isolation.** By default the receiving session is a **tools-disabled, text-only**
   responder: it may read the message and answer in plain text, but it cannot run commands,
   touch the filesystem, browse, or exfiltrate data. Tool access is off unless the owner opts in.
-- **Tool access is currently disabled.** Relationship policies can record verified user/device
-  identity for future presets, but Claude Code and Codex adapters run text-only today. File/tool
-  access stays off until OS-level sandboxing, audit, and revocation semantics are in place.
+- **Tool access is explicit and gated.** Every relationship starts text-only. The owner may grant
+  read/edit project access, and the wider full-agent surface stays closed until OS-level
+  sandboxing, approval, redaction, and rebuild-health gates pass.
 - **Grant-scoped, revocable delivery.** A sender can only message a recipient through an active,
   time-boxed **communication grant** that the recipient (or an offer they published) authorized.
   Every injection is **re-validated against the control plane at delivery time**, so a revoked or
@@ -81,7 +81,12 @@ npm run bridge -- --server http://127.0.0.1:7790 --token <device-token> --adapte
 ```
 
 The bridge registers its endpoint/sessions, persists local state in the spool, and publishes a
-default route automatically from the heartbeat loop.
+default route automatically from the heartbeat loop. Claude standby slots remain cold until an
+inbound task arrives; they do not keep idle provider processes running. Sustained heartbeat
+failures are persisted as local bridge health and use bounded exponential backoff. An independent
+worker also monitors main-event-loop progress. If the bridge is completely stalled for two minutes,
+the worker records a `<spool>.watchdog.json` diagnostic and terminates the daemon rather than letting
+it consume CPU indefinitely.
 
 **3. Check readiness**:
 
@@ -89,6 +94,10 @@ default route automatically from the heartbeat loop.
 npm run ccd -- --server http://127.0.0.1:7790 --token <token> whoami
 npm run ccd -- --server http://127.0.0.1:7790 --token <token> doctor --spool me.spool
 ```
+
+`doctor` reports `localBridgeHealth` from the spool. A stale health timestamp is treated as a
+failure, so a blocked event loop cannot continue presenting an old healthy result. It also reports
+the watchdog diagnostic when the independent worker terminated a stalled bridge.
 
 **4. Drive the two-user flow** — request a grant, accept it, send a message, watch delivery:
 
@@ -173,9 +182,9 @@ high-level goal, and hand bounded subtasks to peer local runtimes.
 
 ### Collaborate with teammates
 
-Joining an Aicoo Team makes its members' agents discoverable as private contacts. Discovery does
-not grant task, file, tool, or decision authority. The first delegated task creates a connection
-request in Aicoo with **Deny**, **Allow once**, and **Always allow** choices.
+Joining an Aicoo Team makes its members' agents discoverable automatically. Agents outside the
+Team become discoverable after their owner accepts the individual agent connection. Discovery does
+not grant file, tool, or decision authority; those permissions remain separately scoped and revocable.
 
 Aicoo relays between both local runtimes:
 
@@ -200,7 +209,7 @@ For one high-level goal, the installed Codex skill first reads `ccd agents
 --json`, creates an immediate goal brief, splits missing information,
 capability, and authority into bounded subtasks, and delegates each one to the
 appropriate person's agent. It then returns one synthesized deliverable rather
-than a transcript of agent conversations. If the team directory is empty, it
+than a transcript of agent conversations. If the agent directory is empty, it
 still produces the goal brief and identifies the exact missing role instead of
 waiting on the network.
 
@@ -212,10 +221,17 @@ needs-owner, pending, or failed states for final synthesis.
 When the teammate has shared more than one project with the same local-agent
 device, select the exact project grant ID provided by the access flow, or its
 approved absolute folder. The owner can inspect local grants with `ccd
-trusted-access list`. The receiver fails closed instead of guessing:
+trusted-access list`. Repeat `--project` when one task needs several already
+granted projects; the receiver builds one initial multi-directory boundary
+instead of restarting once per project. If no selector is supplied, objective
+preflight may select only already-active grants whose exact path or unique
+project name appears in the task. Ambiguous names still fail closed and require
+`--project`:
 
 ```bash
 ccd delegate @teammate "Summarize the README" --project ttp_project_grant_id
+ccd delegate @teammate "Compare both projects" \
+  --project ttp_first_project --project ttp_second_project
 ```
 
 Successful handle resolutions are cached per bridge spool. If the hosted
@@ -242,9 +258,21 @@ reference server you can self-host**.
 
 Receivers are chat-only by default. The owner can approve a verified peer device
 for `chat-only`, `read-project`, or `edit-project` access. Claude Code enforces
-allowed file operations per tool call; Codex uses the local bridge broker for
-allowed `Read`, `Write`, and `Edit` operations. Shell, network, browser, Git,
-package-manager, MCP, and delegated tools remain unsupported.
+allowed file operations per tool call; Codex launches a kernel-scoped permission
+profile for the selected project folders.
+
+`--capability-surface full-agent` is an explicit, evidence-gated mode. It stays
+closed until local rebuild metrics are healthy and the selected runtime has a
+kernel boundary, a live owner-approval route, and an interruptible approval path.
+In that mode, arbitrary shell is available only inside the active project boundary
+and only after owner approval. Claude can expose its wider managed tool/MCP surface
+through the same gate. Codex owner MCP/plugin configuration remains isolated until
+an integration is represented by an explicit relationship grant. Codex currently
+projects remote HTTP MCP grants with exact server URLs and tool allowlists; it never
+copies ambient owner configuration, stdio launch commands, or static headers.
+Whole Codex plugins are not yet grantable: plugins may also contain skills, hooks, and
+other capabilities that the MCP-only relationship contract cannot scope honestly. Grant
+the plugin's remote MCP server and exact tools instead; plugin bundles remain isolated.
 See [Relationship-based tool and folder access](./docs/RELATIONSHIP-POLICY.md).
 
 ## Develop

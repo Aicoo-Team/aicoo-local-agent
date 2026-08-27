@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
 import type { RuntimeAdapter } from "../adapters/runtime-adapter.js";
+import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
 import { FakeRuntimeAdapter } from "../adapters/fake/fake-adapter.js";
 import {
+  setRelationshipMcpGrants,
   upsertRelationshipPolicy,
   upsertRelationshipPreset,
   type RelationshipAccessPreset,
@@ -13,6 +16,7 @@ import {
   upsertTrustedToolPolicy,
 } from "../security/trusted-tool-policy.js";
 import { isFileAccessPreset } from "../security/relationship-access.js";
+import { parseRemoteMcpGrants } from "../security/mcp-capability-grant.js";
 import type {
   CollaborationTurnInput,
   LocalAgentDelegationInput,
@@ -21,7 +25,11 @@ import type {
 } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
+import { ContinuationStore } from "../shared/continuation-store.js";
+import type { ToolApprovalGateway } from "../shared/tool-approval.js";
+import { ContinuationRecovery } from "./continuation-recovery.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
+import { HeartbeatWatchdog } from "./health.js";
 import { BridgeSpool } from "./spool.js";
 
 /**
@@ -33,6 +41,8 @@ import { BridgeSpool } from "./spool.js";
  * routing, which presents to the sender as "their local agent is not running".
  */
 const DEFAULT_HEARTBEAT_MS = 10_000;
+const DEFAULT_HEARTBEAT_FAILURE_THRESHOLD = 3;
+const DEFAULT_HEARTBEAT_MAX_BACKOFF_MS = 60_000;
 
 export interface BridgeOptions {
   transport: HttpMessageTransport;
@@ -43,6 +53,8 @@ export interface BridgeOptions {
   adapterVersion?: string;
   workspaceBoundary?: string;
   heartbeatMs?: number;
+  heartbeatFailureThreshold?: number;
+  heartbeatMaxBackoffMs?: number;
   injectorMs?: number;
   relationshipPolicyFile?: string;
   trustedToolPolicyFile?: string;
@@ -62,11 +74,35 @@ export class RuntimeBridge {
   #injector?: Injector;
   #pendingDefaultRoute?: string;
   #publishedDefaultRoute?: string;
+  readonly #pendingRelationshipMcpAcks = new Map<
+    string,
+    { policyIds: string[]; revision: number }
+  >();
   #beforeExitHandler?: (code: number) => void;
   readonly #bridgeInstanceId: string;
+  readonly #continuationRecovery: ContinuationRecovery;
+  readonly #boundaryTelemetry: BoundaryTelemetry;
+  readonly #heartbeatWatchdog: HeartbeatWatchdog;
 
   constructor(private readonly options: BridgeOptions) {
     this.#bridgeInstanceId = options.bridgeInstanceId ?? id("bridge");
+    const continuationStore = new ContinuationStore(options.spool.db);
+    this.#boundaryTelemetry = new BoundaryTelemetry(options.spool.db);
+    const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    this.#heartbeatWatchdog = new HeartbeatWatchdog({
+      heartbeatMs,
+      maxBackoffMs: options.heartbeatMaxBackoffMs ?? DEFAULT_HEARTBEAT_MAX_BACKOFF_MS,
+      failureThreshold: options.heartbeatFailureThreshold ?? DEFAULT_HEARTBEAT_FAILURE_THRESHOLD,
+      persist: (state) => options.spool.setIdentity("bridgeHealth", JSON.stringify(state)),
+    });
+    options.adapter.configureContinuationStore?.(continuationStore);
+    this.#continuationRecovery = new ContinuationRecovery(
+      continuationStore,
+      options.adapter,
+      options.log,
+      this.#boundaryTelemetry,
+      isToolApprovalGateway(options.transport) ? options.transport : undefined,
+    );
   }
 
   get endpointId(): string | undefined {
@@ -158,6 +194,7 @@ export class RuntimeBridge {
       this.#serverToNative,
       this.options.hooks ?? noOpInjectionHooks,
     );
+    await this.#continuationRecovery.recover();
     this.#beforeExitHandler = (code) => {
       if (!this.#controller.signal.aborted) {
         (this.options.log ?? console.error)(
@@ -173,6 +210,7 @@ export class RuntimeBridge {
       this.runPendingDelegations(),
       this.runOutboundReplies(),
       this.runTrustedToolUsageReports(),
+      this.runContinuationRecovery(),
       ...this.options.spool.listSessionMappings().map(({ nativeHandle, serverHandle }) =>
         this.runAdapterEvents(nativeHandle, serverHandle)),
     ];
@@ -197,6 +235,7 @@ export class RuntimeBridge {
 
   async stop(): Promise<void> {
     this.#controller.abort();
+    this.#heartbeatWatchdog.stop();
     if (this.#beforeExitHandler) {
       process.off("beforeExit", this.#beforeExitHandler);
       this.#beforeExitHandler = undefined;
@@ -283,6 +322,17 @@ export class RuntimeBridge {
     }
   }
 
+  private async runContinuationRecovery(): Promise<void> {
+    while (!this.#controller.signal.aborted) {
+      try {
+        await this.#continuationRecovery.recover();
+      } catch (error) {
+        this.options.log?.(`[bridge] continuation recovery deferred: ${String(error)}`);
+      }
+      await delay(250, this.#controller.signal);
+    }
+  }
+
   private async flushTrustedToolUsageReports(): Promise<void> {
     const file = this.options.trustedToolPolicyFile;
     const ownerPrincipalId = this.options.ownerPrincipalId;
@@ -319,6 +369,15 @@ export class RuntimeBridge {
         throw new Error("Received an event for a different endpoint");
       }
       const stored = this.options.spool.storeDispatch(event);
+      if (stored.inserted && stored.message.envelope.kind === "task_invite") {
+        const localHandle = this.#serverToNative.get(stored.message.sessionHandle)
+          ?? stored.message.sessionHandle;
+        this.#boundaryTelemetry.recordEligibleTask({
+          messageId: stored.message.messageId,
+          localHandle,
+          correlationId: stored.message.envelope.correlationId ?? stored.message.messageId,
+        });
+      }
       // Prompt best-effort device-ack — but NON-FATAL: on failure/timeout we leave the message
       // 'received' and the injector re-acks it (see Injector.ackReceived), so a slow ack can
       // never throw out of here and wedge the stream / stall the cursor. Skip expired messages
@@ -367,7 +426,6 @@ export class RuntimeBridge {
         if (nativeHandle && commSessionId) {
           await this.options.adapter.prepareCommunicationSession?.(nativeHandle, commSessionId);
         }
-        this.rotateDefaultRouteAfterActivation(sessionHandle);
       }
       if (commSessionId) await this.retryPendingDelegations(commSessionId);
     } else if (
@@ -386,7 +444,7 @@ export class RuntimeBridge {
         }
       }
     } else if (event.type === "relationship.policy_update") {
-      this.applyRelationshipPolicyUpdate(event.data);
+      await this.applyRelationshipPolicyUpdate(event.data);
     } else if (event.type === "trusted_tool_policy.upserted") {
       await this.applyTrustedToolPolicyUpdate(event.data);
     } else if (event.type === "trusted_tool_policy.revoked") {
@@ -438,12 +496,28 @@ export class RuntimeBridge {
         ...(createdAtValue ? { createdAt: new Date(createdAtValue) } : {}),
         serverRevision: revision,
       });
+      const expansion = recordField(data, "boundaryExpansion");
+      const continuationId = expansion ? stringField(expansion, "continuationId") : undefined;
+      const boundaryManifestHash = continuationId
+        ? await this.options.adapter.attestBoundaryActivation?.({
+            continuationId,
+            grantId: policyId,
+            grantRevision: revision,
+            canonicalFolder: policy.canonicalFolder,
+            accessPreset,
+          })
+        : undefined;
+      if (continuationId && !boundaryManifestHash) {
+        throw new Error("approved boundary could not be attested for its paused continuation");
+      }
       await this.options.transport.acknowledgeTrustedToolPolicy({
         policyId,
         revision,
         canonicalFolder: policy.canonicalFolder,
+        ...(boundaryManifestHash ? { boundaryManifestHash } : {}),
       });
       this.options.log?.(`trusted tool policy applied: ${accessPreset} for ${requesterPrincipalId}`);
+      await this.#continuationRecovery.recover();
     } catch (error) {
       this.options.log?.(`trusted tool policy update failed: ${String(error)}`);
     }
@@ -463,7 +537,7 @@ export class RuntimeBridge {
     }
   }
 
-  private applyRelationshipPolicyUpdate(data: Record<string, unknown>): void {
+  private async applyRelationshipPolicyUpdate(data: Record<string, unknown>): Promise<void> {
     if (!this.options.relationshipPolicyFile) {
       this.options.log?.("relationship policy update ignored: no relationship policy file configured");
       return;
@@ -478,6 +552,14 @@ export class RuntimeBridge {
       return;
     }
     const hasExplicitTools = Object.prototype.hasOwnProperty.call(data, "tools");
+    const hasMcpServers = Object.prototype.hasOwnProperty.call(data, "mcpServers");
+    const hasMcpPolicyIds = Object.prototype.hasOwnProperty.call(data, "mcpPolicyIds");
+    const mcpPolicyIds = Array.isArray(data.mcpPolicyIds)
+      && data.mcpPolicyIds.length <= 16
+      && data.mcpPolicyIds.every((policyId) => typeof policyId === "string" && policyId.trim())
+      ? data.mcpPolicyIds.map((policyId) => String(policyId).trim())
+      : undefined;
+    const revision = numberField(data, "revision");
     const explicitTools = Array.isArray(data.tools)
       && data.tools.every((tool) => typeof tool === "string" && tool.trim())
       ? data.tools.map((tool) => String(tool).trim())
@@ -485,13 +567,21 @@ export class RuntimeBridge {
     if (
       !principalId
       || !deviceId
-      || (hasExplicitTools ? explicitTools === undefined : !isRelationshipAccessPreset(preset))
+      || (hasMcpPolicyIds && mcpPolicyIds === undefined)
+      || (hasMcpPolicyIds && revision === undefined)
+      || (hasExplicitTools && explicitTools === undefined)
+      || (preset !== undefined && !isRelationshipAccessPreset(preset))
+      || (!hasExplicitTools && !hasMcpServers && !isRelationshipAccessPreset(preset))
     ) {
-      this.options.log?.("relationship policy update ignored: missing or invalid principal, device, tools, or preset");
+      this.options.log?.("relationship policy update ignored: missing or invalid principal, device, tools, MCP grants, or preset");
       return;
     }
     try {
-      if (explicitTools) {
+      // Validate every part before the first write so a malformed MCP grant cannot
+      // partially apply an otherwise valid folder/tool update.
+      const mcpServers = hasMcpServers ? parseRemoteMcpGrants(data.mcpServers) : undefined;
+      const before = relationshipPolicyContents(this.options.relationshipPolicyFile);
+      if (explicitTools !== undefined) {
         upsertRelationshipPolicy({
           file: this.options.relationshipPolicyFile,
           principalId,
@@ -502,7 +592,7 @@ export class RuntimeBridge {
         this.options.log?.(
           `relationship policy updated for ${principalId} (tools: ${explicitTools.join(", ") || "none"})`,
         );
-      } else {
+      } else if (isRelationshipAccessPreset(preset)) {
         upsertRelationshipPreset({
           file: this.options.relationshipPolicyFile,
           principalId,
@@ -512,29 +602,91 @@ export class RuntimeBridge {
         });
         this.options.log?.(`relationship policy updated for ${principalId} (${preset})`);
       }
+      if (hasMcpServers) {
+        setRelationshipMcpGrants({
+          file: this.options.relationshipPolicyFile,
+          principalId,
+          deviceId,
+          grants: mcpServers,
+        });
+        this.options.log?.(`relationship MCP grants updated for ${principalId}`);
+      }
+      if (before !== relationshipPolicyContents(this.options.relationshipPolicyFile)) {
+        await this.options.adapter.invalidateRelationshipSessions?.(principalId, deviceId);
+      }
+      if (hasMcpServers && mcpPolicyIds && mcpPolicyIds.length > 0 && revision !== undefined) {
+        const acknowledgement = {
+          policyIds: mcpPolicyIds,
+          revision,
+        };
+        this.#pendingRelationshipMcpAcks.set(
+          `${revision}:${mcpPolicyIds.join(",")}`,
+          acknowledgement,
+        );
+        await this.flushRelationshipMcpAcknowledgements();
+      }
     } catch (error) {
       this.options.log?.(`relationship policy update failed: ${String(error)}`);
     }
   }
 
+  private async flushRelationshipMcpAcknowledgements(): Promise<void> {
+    for (const [key, acknowledgement] of this.#pendingRelationshipMcpAcks) {
+      try {
+        await this.options.transport.acknowledgeRelationshipMcpPolicies(acknowledgement);
+        this.#pendingRelationshipMcpAcks.delete(key);
+      } catch (error) {
+        this.options.log?.(`relationship MCP acknowledgement deferred: ${String(error)}`);
+      }
+    }
+  }
+
   private async runHeartbeat(): Promise<void> {
+    let nextHeartbeatInMs = this.options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    let unhealthyReported = false;
     while (!this.#controller.signal.aborted) {
-      await delay(this.options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, this.#controller.signal);
+      const delayStartedAt = Date.now();
+      await delay(nextHeartbeatInMs, this.#controller.signal);
       if (this.#controller.signal.aborted) return;
+      const eventLoopLagMs = Math.max(0, Date.now() - delayStartedAt - nextHeartbeatInMs);
       try {
         await this.options.transport.heartbeatEndpoint(this.requireEndpoint());
+        const health = this.#heartbeatWatchdog.recordSuccess(eventLoopLagMs);
+        nextHeartbeatInMs = health.nextHeartbeatInMs;
+        if (health.status === "healthy" && unhealthyReported) {
+          this.options.log?.("[bridge] HEALTHY: heartbeat recovered; C2C presence is online again.");
+          unhealthyReported = false;
+        } else if (health.status === "degraded") {
+          this.options.log?.(
+            `[bridge] DEGRADED: heartbeat succeeded, but the event loop was delayed by ${eventLoopLagMs}ms.`,
+          );
+        }
       } catch (error) {
+        let authenticationFailure = false;
         if (error instanceof ApiError && error.status === 401) {
+          authenticationFailure = true;
           const recovered = await this.options.transport.recoverAuthentication();
           if (recovered.recovered) {
             this.options.log?.(`[bridge] Device token refreshed from ${recovered.source}; heartbeat will resume.`);
           } else {
             this.options.log?.(`[bridge] Device token rejected (401); recovery pending: ${recovered.reason}.`);
           }
-          continue;
         }
+        const health = this.#heartbeatWatchdog.recordFailure(error, eventLoopLagMs);
+        nextHeartbeatInMs = health.nextHeartbeatInMs;
         this.options.log?.(`heartbeat failed: ${String(error)}`);
+        if (health.status === "unhealthy" && !unhealthyReported) {
+          unhealthyReported = true;
+          this.options.log?.(
+            `[bridge] UNHEALTHY: ${health.consecutiveHeartbeatFailures} consecutive heartbeat failures; `
+              + `presence is offline. Retrying with ${health.nextHeartbeatInMs}ms backoff. `
+              + `Run 'ccd doctor --spool ${this.options.spool.getIdentity("spoolFile") ?? "<bridge.spool>"}' `
+              + "and inspect bridge.log.",
+          );
+        }
+        if (authenticationFailure) continue;
       }
+      await this.flushRelationshipMcpAcknowledgements();
       // Publish the default route from here, not start(): by the first heartbeat the
       // session-creation congestion that starves the event loop has cleared, so the request
       // no longer aborts spuriously. Attempt once per beat until it lands, then stop.
@@ -620,6 +772,9 @@ export class RuntimeBridge {
       try {
         for await (const event of this.options.adapter.subscribeSessionEvents(nativeHandle, cursor)) {
           if (this.#controller.signal.aborted) return;
+          if (event.type === "turn_failed") {
+            this.#continuationRecovery.handleRuntimeEvent(nativeHandle, event);
+          }
           if (event.type === "reply" && event.inReplyTo) {
             const original = this.options.spool.getMessage(event.inReplyTo);
             if (!original) {
@@ -658,6 +813,9 @@ export class RuntimeBridge {
                 correlationId,
                 ...(collaborationReply ? { collaborationTurn: collaborationReply.turn } : {}),
               });
+              // Completion follows durable reply storage. A crash can replay an unsent reply,
+              // but must never leave a completed continuation with no answer to deliver.
+              this.#continuationRecovery.handleRuntimeEvent(nativeHandle, event);
             }
           }
           if (event.cursor) {
@@ -709,13 +867,14 @@ export class RuntimeBridge {
     return this.#endpointId;
   }
 
-  private rotateDefaultRouteAfterActivation(activatedServerHandle: string): void {
-    const currentDefault = this.#pendingDefaultRoute ?? this.#publishedDefaultRoute;
-    if (currentDefault && currentDefault !== activatedServerHandle) return;
-    const replacement = this.options.spool.listSessionMappings()
-      .map((mapping) => mapping.serverHandle)
-      .find((serverHandle) => serverHandle !== activatedServerHandle);
-    if (replacement) this.#pendingDefaultRoute = replacement;
+}
+
+function relationshipPolicyContents(file: string): string | undefined {
+  try {
+    return readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
 }
 
@@ -879,6 +1038,20 @@ function numberField(data: Record<string, unknown>, key: string): number | undef
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
+function recordField(data: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = data[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
 function isRelationshipAccessPreset(value: string | undefined): value is RelationshipAccessPreset {
   return value === "chat-only" || value === "read-project" || value === "edit-project";
+}
+
+function isToolApprovalGateway(value: unknown): value is ToolApprovalGateway {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<ToolApprovalGateway>;
+  return typeof candidate.requestToolApproval === "function"
+    && typeof candidate.getToolApproval === "function";
 }

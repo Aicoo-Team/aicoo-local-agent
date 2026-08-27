@@ -6,7 +6,12 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { CodexAdapter } from "../../src/adapters/codex/codex-adapter.js";
 import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
-import { upsertRelationshipPreset } from "../../src/security/relationship-policy.js";
+import {
+  setRelationshipMcpGrants,
+  upsertRelationshipPreset,
+} from "../../src/security/relationship-policy.js";
+import { ContinuationStore } from "../../src/shared/continuation-store.js";
+import { upsertTrustedToolPolicy } from "../../src/security/trusted-tool-policy.js";
 import { FakeCodexDriver } from "../helpers/fake-codex-driver.js";
 
 describe("CodexAdapter managed sessions", () => {
@@ -51,12 +56,27 @@ describe("CodexAdapter managed sessions", () => {
   });
 
   it("maps app-server Git approvals to dedicated tools and refuses raw shell", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-app-approval-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    mkdirSync(project);
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["GitStatus"],
+        folders: [project],
+      }],
+    }));
     const driver = new FakeCodexDriver("done");
-    driver.resultDelayMs = 5_000;
+    driver.resultDelayMs = 100;
     const asked: string[] = [];
     const adapter = new CodexAdapter({
       stateFile: ":memory:",
-      cwd: process.cwd(),
+      cwd: project,
+      relationshipPolicyFile: policyFile,
       driver,
       turnAckTimeoutMs: 500,
       approvalGateway: {
@@ -79,7 +99,221 @@ describe("CodexAdapter managed sessions", () => {
       .resolves.toBe("accept");
     await expect(approve!({ kind: "commandExecution", summary: "Run: git reset --hard" }))
       .resolves.toBe("decline");
+    await expect(approve!({ kind: "permissions", summary: "Widen this session's sandbox permissions" }))
+      .resolves.toBe("decline");
+    await expect(approve!({
+      kind: "fileChange",
+      summary: "Modify: /srv/outside.ts",
+      paths: ["/srv/outside.ts"],
+    })).resolves.toBe("decline");
     expect(asked).toEqual(["GitStatus"]);
+  });
+
+  it("allows owner-approved raw shell only in gated full-agent mode", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-full-capability-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "edit-project",
+      folder: project,
+    });
+    setRelationshipMcpGrants({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      grants: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["read", "search"],
+      }],
+    });
+    const driver = new FakeCodexDriver("token ghp_abcdefghijklmnopqrstuvwxyz123456");
+    driver.resultDelayMs = 100;
+    const asked: string[] = [];
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input.toolName);
+          return { approvalId: "appr-shell", status: "allow", decision: "allow", scope: "session" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow", scope: "session" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_full_shell"), "new_turn");
+
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "commandExecution",
+      command: "npm test",
+      cwd: project,
+      summary: "Run: npm test",
+    })).resolves.toBe("acceptForSession");
+    expect(driver.turns[0]?.writableRoots).toEqual([realpathSync.native(project)]);
+    const fullProfile = readFileSync(
+      join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"),
+      "utf8",
+    );
+    expect(fullProfile).toContain('[mcp_servers."docs"]');
+    expect(fullProfile).toContain('enabled_tools = ["read", "search"]');
+    expect(asked).toEqual(["Bash"]);
+
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "commandExecution",
+      command: "npm test",
+      cwd: directory,
+      summary: "Run outside the granted project",
+    })).resolves.toBe("decline");
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "commandExecution",
+      command: "bad\0command",
+      cwd: project,
+      summary: "Run invalid command",
+    })).resolves.toBe("decline");
+    expect(asked).toEqual(["Bash"]);
+    expect(await events).toEqual([
+      expect.objectContaining({ type: "turn_started" }),
+      expect.objectContaining({
+        type: "reply",
+        payload: expect.objectContaining({ text: "token [REDACTED]" }),
+      }),
+    ]);
+  });
+
+  it("attaches exact MCP grants in full-agent mode without requiring folder access", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-mcp-only-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    setRelationshipMcpGrants({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      grants: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["read", "search"],
+      }],
+    });
+    const driver = new FakeCodexDriver("MCP request completed.");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      capabilitySurface: "full-agent",
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_mcp_only", {
+      payload: { text: "Use the granted docs MCP search tool." },
+    }), "new_turn");
+
+    expect(driver.turns[0]?.permissionProfile).toBeDefined();
+    expect(driver.turns[0]?.permissionProfile?.workspaceRoots).toEqual([]);
+    const profile = readFileSync(
+      join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"),
+      "utf8",
+    );
+    expect(profile).toContain("Aicoo c2c relationship (chat-only)");
+    expect(profile).toContain('[mcp_servers."docs"]');
+    expect(profile).toContain('enabled_tools = ["read", "search"]');
+    expect(profile).not.toContain("[permissions.aicoo-c2c.workspace_roots]");
+    await events;
+  });
+
+  it("creates a durable rebuild continuation for an out-of-boundary file change", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-boundary-expansion-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    const outside = join(directory, "outside");
+    mkdirSync(project);
+    mkdirSync(outside);
+    const requestedFile = join(outside, "index.ts");
+    writeFileSync(requestedFile, "export {};");
+    const policyFile = join(directory, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "edit-project",
+      folder: project,
+    });
+    const requests: Array<Record<string, unknown>> = [];
+    const driver = new FakeCodexDriver("done");
+    driver.resultDelayMs = 5_000;
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      approvalGateway: {
+        async requestToolApproval(input) {
+          requests.push(input as unknown as Record<string, unknown>);
+          return {
+            approvalId: "appr_expand",
+            status: "allow",
+            decision: "allow",
+            activation: {
+              grantId: "grant_expand",
+              grantRevision: 2,
+              canonicalFolder: realpathSync.native(outside),
+              accessPreset: "edit-project",
+              expectedBoundaryManifestHash: "manifest_expand",
+            },
+          };
+        },
+        async getToolApproval() {
+          return { status: "pending", decision: null };
+        },
+      },
+    });
+    const store = new ContinuationStore(new DatabaseSync(":memory:"));
+    adapter.configureContinuationStore(store);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_expand"), "new_turn");
+
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "fileChange",
+      summary: `Modify: ${requestedFile}`,
+      paths: [requestedFile],
+    })).resolves.toBe("decline");
+
+    expect(requests).toEqual([expect.objectContaining({
+      communicationSessionId: "comm_1",
+      sessionHandle: "codex-managed-1",
+      messageId: "msg_expand",
+      boundaryExpansion: expect.objectContaining({
+        canonicalResource: realpathSync.native(requestedFile),
+        requestedAccessPreset: "edit-project",
+        requiresSessionRebuild: true,
+      }),
+    })]);
+    expect(store.list()).toEqual([expect.objectContaining({
+      state: "approved_pending_activation",
+      messageId: "msg_expand",
+      runtimeTurnId: expect.any(String),
+      approvedCanonicalFolder: realpathSync.native(outside),
+    })]);
   });
 
   it("turns a read-project relationship preset into a Codex sandbox profile", async () => {
@@ -97,6 +331,12 @@ describe("CodexAdapter managed sessions", () => {
       deviceId: "device_a",
       preset: "read-project",
       folder: project,
+    });
+    setRelationshipMcpGrants({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      grants: [{ name: "docs", url: "https://mcp.example.com/v1", enabledTools: ["read"] }],
     });
     const driver = new FakeCodexDriver("README says to run npm test.");
     const adapter = new CodexAdapter({
@@ -128,6 +368,7 @@ describe("CodexAdapter managed sessions", () => {
     expect(profile).toContain("Aicoo c2c relationship (read-project)");
     expect(profile).toContain('extends = ":read-only"');
     expect(profile).toContain(`${JSON.stringify(realpathSync.native(project))} = true`);
+    expect(profile).not.toContain("[mcp_servers.");
   });
 
   it("fails closed for ambiguous projects and uses the explicitly selected folder", async () => {
@@ -175,6 +416,176 @@ describe("CodexAdapter managed sessions", () => {
     expect(driver.turns[0]?.cwd).toBe(realpathSync.native(second));
     expect(driver.turns[0]?.prompt).toContain(realpathSync.native(second));
     expect(driver.turns[0]?.prompt).not.toContain(`- ${realpathSync.native(first)}`);
+  });
+
+  it("rejects a project-scoped task before Codex starts when the peer has no project grant", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-no-project-access-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{ principalId: "prn_a", deviceId: "device_a", tools: [], folders: [] }],
+    }));
+    const driver = new FakeCodexDriver("must not run");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_no_access", {
+      kind: "task_invite",
+      payload: { task: "Summarize the project and explain its current state." },
+    }), "queue")).toEqual({ status: "project_access_required" });
+    expect(driver.turns).toHaveLength(0);
+  });
+
+  it("preflights several objective-named projects into one Codex boundary", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-multi-project-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    const driver = new FakeCodexDriver("Both projects inspected.");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    expect(await adapter.deliverToSession("codex-managed-1", inbound("msg_multi", {
+      kind: "task_invite",
+      payload: {
+        task: { text: "Compare first-project with second-project" },
+      },
+    }), "queue")).toMatchObject({ status: "runtime_acked" });
+
+    const profile = readFileSync(join(driver.turns[0]!.permissionProfile!.codexHome, "config.toml"), "utf8");
+    expect(profile).toContain(`${JSON.stringify(realpathSync.native(first))} = true`);
+    expect(profile).toContain(`${JSON.stringify(realpathSync.native(second))} = true`);
+    expect(driver.turns[0]?.prompt).toContain(`- ${realpathSync.native(first)}`);
+    expect(driver.turns[0]?.prompt).toContain(`- ${realpathSync.native(second)}`);
+  });
+
+  it("quiesces an old turn, rebuilds its approved profile, and resumes on the original correlation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-continuation-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const first = join(directory, "first");
+    const second = join(directory, "second");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const policyFile = join(config, "relationships.json");
+    const trustedToolPolicyFile = join(config, "trusted-tools.json");
+    writeFileSync(policyFile, JSON.stringify({
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device_a",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    }));
+    upsertTrustedToolPolicy({
+      file: trustedToolPolicyFile,
+      policyId: "grant_2",
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      requesterPrincipalId: "prn_a",
+      requesterDeviceId: "device_a",
+      folder: second,
+      accessPreset: "read-project",
+      scope: "bridge_run",
+      bridgeInstanceId: "bridge_1",
+      createdFrom: "approval_prompt",
+      createdBy: "prn_b",
+      serverRevision: 2,
+    });
+    const driver = new FakeCodexDriver("resumed answer");
+    driver.resultDelayMs = 50;
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      trustedToolPolicyFile,
+      ownerPrincipalId: "prn_b",
+      ownerDeviceId: "device_b",
+      bridgeInstanceId: "bridge_1",
+      driver,
+      turnAckTimeoutMs: 500,
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    const original = inbound("msg_continuation", {
+      kind: "task_invite",
+      correlationId: "corr_continuation",
+      payload: { task: { text: "Compare first and second", projectAccessId: first } },
+    });
+    const events = collectEvents(adapter, "codex-managed-1", 3);
+    expect(await adapter.deliverToSession("codex-managed-1", original, "queue"))
+      .toMatchObject({ status: "runtime_acked" });
+    const checkpoint = {
+      continuationId: "cont_1",
+      idempotencyKey: "comm_1:msg_continuation:tool_1",
+      correlationId: "corr_continuation",
+      communicationSessionId: "comm_1",
+      messageId: original.id,
+      sessionHandle: "codex-managed-1",
+      runtimeTurnId: "tool_1",
+      originalMessage: original,
+      requestedCapability: {
+        toolName: "Read",
+        canonicalResource: join(second, "README.md"),
+        summary: "Read second README",
+      },
+      state: "rebuilding_session" as const,
+      grantId: "grant_2",
+      grantRevision: 2,
+      approvedCanonicalFolder: realpathSync.native(second),
+      approvedAccessPreset: "read-project" as const,
+      expectedBoundaryManifestHash: "set by server",
+    };
+
+    await adapter.quiesceContinuation(checkpoint);
+    await expect(adapter.rebuildContinuation(checkpoint)).resolves.toEqual({
+      boundaryManifestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    await expect(adapter.resumeContinuation(checkpoint)).resolves.toMatchObject({ status: "runtime_acked" });
+    expect(driver.turns.at(-1)?.resumeThreadId).toBeUndefined();
+    const profile = readFileSync(join(driver.turns.at(-1)!.permissionProfile!.codexHome, "config.toml"), "utf8");
+    expect(profile).toContain(JSON.stringify(realpathSync.native(first)));
+    expect(profile).toContain(JSON.stringify(realpathSync.native(second)));
+
+    const delivered = await events;
+    expect(delivered.filter((event) => event.type === "reply")).toEqual([
+      expect.objectContaining({
+        inReplyTo: original.id,
+        correlationId: "corr_continuation",
+        payload: expect.objectContaining({ text: "resumed answer" }),
+      }),
+    ]);
   });
 
   it("uses the kernel profile without a second local approval layer", async () => {
@@ -476,6 +887,24 @@ describe("CodexAdapter managed sessions", () => {
     expect(adapter.providerThreadId("codex-managed-1")).not.toBe(firstProviderThreadId);
   });
 
+  it("invalidates a Codex thread only for the exact relationship device", async () => {
+    const driver = new FakeCodexDriver();
+    const adapter = makeAdapter(driver);
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_policy"), "queue");
+    await events;
+    const providerThreadId = adapter.providerThreadId("codex-managed-1");
+
+    await adapter.invalidateRelationshipSessions("prn_other", "device_a");
+    expect(adapter.providerThreadId("codex-managed-1")).toBe(providerThreadId);
+
+    await adapter.invalidateRelationshipSessions("prn_a", "device_a");
+    expect(adapter.providerThreadId("codex-managed-1")).toBeUndefined();
+  });
+
   it("discards an unbound legacy Codex thread instead of resuming it for a relationship", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-legacy-state-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -586,6 +1015,44 @@ describe("CodexAdapter managed sessions", () => {
     expect(second.providerThreadId("codex-managed-1")).toBe(providerThreadId);
     expect((await second.deliverToSession("codex-managed-1", inbound("msg_resume"), "queue")).status).toBe("runtime_acked");
     expect(secondDriver.turns[0]?.resumeThreadId).toBe(providerThreadId);
+  });
+
+  it("rebuilds persisted full-agent threads after a bridge restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-full-agent-restart-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const stateFile = join(directory, "sessions.db");
+    const firstDriver = new FakeCodexDriver();
+    const first = new CodexAdapter({
+      stateFile,
+      cwd: directory,
+      driver: firstDriver,
+      turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
+    });
+    await first.initialize();
+    const firstEvents = collectEvents(first, "codex-managed-1", 2);
+    await first.deliverToSession("codex-managed-1", inbound("msg_full_agent_seed"), "queue");
+    await firstEvents;
+    const oldThreadId = first.providerThreadId("codex-managed-1");
+    expect(oldThreadId).toMatch(/^fake-codex-thread-/);
+    await first.close();
+
+    const secondDriver = new FakeCodexDriver();
+    const second = new CodexAdapter({
+      stateFile,
+      cwd: directory,
+      driver: secondDriver,
+      turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
+    });
+    cleanups.push(() => second.close());
+    await second.initialize();
+    expect(second.providerThreadId("codex-managed-1")).toBeUndefined();
+    const secondEvents = collectEvents(second, "codex-managed-1", 2);
+    await second.deliverToSession("codex-managed-1", inbound("msg_full_agent_after_restart"), "queue");
+    await secondEvents;
+    expect(secondDriver.turns[0]?.resumeThreadId).toBeUndefined();
+    expect(second.providerThreadId("codex-managed-1")).not.toBe(oldThreadId);
   });
 
   it("reconciles persisted sessions to a smaller configured count", async () => {

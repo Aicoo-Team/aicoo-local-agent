@@ -1,7 +1,13 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { RelationshipAccessPreset } from "../../security/relationship-policy.js";
+import {
+  parseRemoteMcpGrants,
+  renderCodexRemoteMcpGrants,
+  type RemoteMcpGrantInput,
+} from "../../security/mcp-capability-grant.js";
 
 /**
  * Codex permission profiles: kernel-enforced scoping for a c2c relationship.
@@ -40,17 +46,28 @@ export interface CodexPermissionProfileInput {
   profileName?: string;
   /** Override used by tests; defaults to the active Codex login's auth.json. */
   authFile?: string;
+  /** Exact relationship grants; never inferred by copying the owner's Codex configuration. */
+  mcpServers?: readonly RemoteMcpGrantInput[];
+  /** Test seam for platform-specific system-tool dependencies. */
+  platform?: NodeJS.Platform;
+  /** Test seam; production discovers the active macOS toolchain with xcode-select. */
+  developerDirectory?: string;
+  /** Private scratch directory for system-tool caches; never shared with the project. */
+  runtimeTempDirectory?: string;
 }
 
 /**
- * `chat-only` gets no profile at all — the caller keeps the text-only path, where Codex is given
- * no folders and told not to touch anything. A profile with zero workspace roots would still
- * grant `:minimal`, so returning undefined keeps that distinction honest.
+ * Plain `chat-only` gets no profile at all. When exact MCP tools are granted, however, it gets a
+ * private profile with no workspace roots so Codex can load only those tools without gaining
+ * project access or inheriting the owner's settings.
  */
 export function renderCodexPermissionProfile(input: CodexPermissionProfileInput): string | undefined {
-  if (input.preset === "chat-only") return undefined;
-  const folders = [...new Set(input.folders)].filter((folder) => folder.trim().length > 0);
-  if (folders.length === 0) return undefined;
+  const mcpServers = parseRemoteMcpGrants(input.mcpServers ?? []);
+  if (input.preset === "chat-only" && mcpServers.length === 0) return undefined;
+  const folders = input.preset === "chat-only"
+    ? []
+    : [...new Set(input.folders)].filter((folder) => folder.trim().length > 0);
+  if (folders.length === 0 && mcpServers.length === 0) return undefined;
 
   const name = input.profileName ?? CODEX_PROFILE_NAME;
   // read-project may only read; edit-project may also write. Codex resolves "deny" ahead of any
@@ -62,39 +79,96 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   const writable = writableFolders.length > 0;
   const base = writable ? ":workspace" : ":read-only";
   const workspaceAccess = writableFolders.length === folders.length ? "write" : "read";
+  const mcpConfig = renderCodexRemoteMcpGrants(mcpServers);
+  const shellEnvironmentExclusions = [...new Set([
+    "*TOKEN*",
+    "*SECRET*",
+    "*PASSWORD*",
+    "*PASSWD*",
+    "*API_KEY*",
+    "*PRIVATE_KEY*",
+    "DATABASE_URL",
+    ...mcpServers.flatMap((server) => server.bearerTokenEnvVar ? [server.bearerTokenEnvVar] : []),
+  ])];
+  const developerDirectory = folders.length > 0 ? resolveDeveloperDirectory(input) : undefined;
+  const runtimeTempDirectory = folders.length > 0 ? input.runtimeTempDirectory : undefined;
+  const gitConfigGlobal = nullDevice(input.platform ?? process.platform);
 
   return [
     `default_permissions = ${tomlString(name)}`,
+    // The private home must not fall back to owner OAuth stored in a system keyring. A granted
+    // server either uses its named bearer environment variable or connects without credentials.
+    'mcp_oauth_credentials_store = "file"',
+    "",
+    "[history]",
+    'persistence = "none"',
+    "",
+    "[memories]",
+    "disable_on_external_context = true",
+    "",
+    "[shell_environment_policy]",
+    'inherit = "core"',
+    `exclude = [${shellEnvironmentExclusions.map(tomlString).join(", ")}]`,
+    ...(runtimeTempDirectory ? [
+      `set = { TMPDIR = ${tomlString(runtimeTempDirectory)}, GIT_CONFIG_GLOBAL = ${tomlString(gitConfigGlobal)}, GIT_CONFIG_NOSYSTEM = "1" }`,
+    ] : []),
     "",
     `[permissions.${name}]`,
     `description = "Aicoo c2c relationship (${input.preset})"`,
     `extends = "${base}"`,
     "",
-    `[permissions.${name}.workspace_roots]`,
-    ...folders.map((folder) => `${tomlString(folder)} = true`),
-    "",
+    ...(folders.length > 0 ? [
+      `[permissions.${name}.workspace_roots]`,
+      ...folders.map((folder) => `${tomlString(folder)} = true`),
+      "",
+    ] : []),
     `[permissions.${name}.filesystem]`,
     // Order matters far less than presence: deny the root read the preset would otherwise grant,
     // then add back only what a process needs to start.
     '":root" = "deny"',
     '":minimal" = "read"',
+    ...(developerDirectory ? [`${tomlString(developerDirectory)} = "read"`] : []),
+    ...(runtimeTempDirectory ? [`${tomlString(runtimeTempDirectory)} = "write"`] : []),
     ...writableFolders.map((folder) => `${tomlString(folder)} = "write"`),
     "",
-    `[permissions.${name}.filesystem.":workspace_roots"]`,
-    `"." = "${workspaceAccess}"`,
-    "",
+    ...(folders.length > 0 ? [
+      `[permissions.${name}.filesystem.":workspace_roots"]`,
+      `"." = "${workspaceAccess}"`,
+      "",
+    ] : []),
     `[permissions.${name}.network]`,
     // Off for every preset. A peer's agent that can read your files and reach the network can
     // copy them out; keeping egress closed is what makes granting a folder a bounded decision.
     "enabled = false",
     "",
+    ...(mcpConfig ? [mcpConfig, ""] : []),
   ].join("\n");
+}
+
+function resolveDeveloperDirectory(input: CodexPermissionProfileInput): string | undefined {
+  if ((input.platform ?? process.platform) !== "darwin") return undefined;
+  if (input.developerDirectory !== undefined) return input.developerDirectory.trim() || undefined;
+
+  try {
+    const selected = execFileSync("/usr/bin/xcode-select", ["-p"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    }).trim();
+    if (!selected || !existsSync(selected)) return undefined;
+    return realpathSync.native(selected);
+  } catch {
+    return undefined;
+  }
 }
 
 export interface PreparedCodexProfile {
   /** Value for the CODEX_HOME environment variable of the spawned process. */
   codexHome: string;
   profileName: string;
+  workspaceRoots?: string[];
+  /** Environment required by platform tools without inheriting owner configuration. */
+  environment?: Record<string, string>;
 }
 
 /**
@@ -106,10 +180,18 @@ export function writeCodexPermissionProfile(
   directory: string,
   input: CodexPermissionProfileInput,
 ): PreparedCodexProfile | undefined {
-  const profile = renderCodexPermissionProfile(input);
-  if (!profile) return undefined;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);
+  const hasProjectAccess = input.preset !== "chat-only"
+    && input.folders.some((folder) => folder.trim().length > 0);
+  const gitConfigGlobal = nullDevice(input.platform ?? process.platform);
+  const runtimeTempDirectory = hasProjectAccess ? join(directory, "tmp") : undefined;
+  if (runtimeTempDirectory) {
+    mkdirSync(runtimeTempDirectory, { recursive: true, mode: 0o700 });
+    chmodSync(runtimeTempDirectory, 0o700);
+  }
+  const profile = renderCodexPermissionProfile({ ...input, ...(runtimeTempDirectory ? { runtimeTempDirectory } : {}) });
+  if (!profile) return undefined;
   writeFileSync(join(directory, "config.toml"), profile, { mode: 0o600 });
   // CODEX_HOME isolates the owner's settings, plugins and MCP configuration, but Codex also
   // locates its login there. Copy only the credential file into the private home; the generated
@@ -120,7 +202,22 @@ export function writeCodexPermissionProfile(
     copyFileSync(authFile, join(directory, "auth.json"));
     chmodSync(join(directory, "auth.json"), 0o600);
   }
-  return { codexHome: directory, profileName: input.profileName ?? CODEX_PROFILE_NAME };
+  return {
+    codexHome: directory,
+    profileName: input.profileName ?? CODEX_PROFILE_NAME,
+    workspaceRoots: [...new Set(input.folders)],
+    ...(runtimeTempDirectory ? {
+      environment: {
+        TMPDIR: runtimeTempDirectory,
+        GIT_CONFIG_GLOBAL: gitConfigGlobal,
+        GIT_CONFIG_NOSYSTEM: "1",
+      },
+    } : {}),
+  };
+}
+
+function nullDevice(platform: NodeJS.Platform): string {
+  return platform === "win32" ? "NUL" : "/dev/null";
 }
 
 function tomlString(value: string): string {

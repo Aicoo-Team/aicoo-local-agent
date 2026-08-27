@@ -133,7 +133,7 @@ export class Injector {
       return;
     }
     if (!validation.valid) {
-      this.spool.markResult(message.messageId, "blocked", validation.reason);
+      await this.reportFailure(message, validation.reason, false);
       return;
     }
     const nativeHandle = this.serverToNativeHandle.get(message.sessionHandle);

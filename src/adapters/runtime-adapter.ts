@@ -1,4 +1,5 @@
 import type { MessageEnvelope } from "../shared/contracts.js";
+import type { ContinuationCheckpoint, ContinuationStore } from "../shared/continuation-store.js";
 
 export interface RuntimeSessionDescriptor {
   sessionHandle: string;
@@ -12,6 +13,7 @@ export type InboundMessage = MessageEnvelope & {
 };
 
 export interface RuntimeAdapter {
+  configureContinuationStore?(store: ContinuationStore): void;
   initialize?(): Promise<void>;
   close?(): Promise<void>;
   capabilities(): Promise<{
@@ -34,7 +36,19 @@ export interface RuntimeAdapter {
     payload?: Record<string, unknown>;
   }>;
   releaseCommunicationSession?(communicationSessionId: string): Promise<void>;
+  invalidateRelationshipSessions?(principalId: string, deviceId: string): Promise<void>;
   prepareCommunicationSession?(sessionHandle: string, communicationSessionId: string): Promise<void>;
+  canActivateContinuation?(checkpoint: ContinuationCheckpoint): Promise<boolean>;
+  attestBoundaryActivation?(input: {
+    continuationId: string;
+    grantId: string;
+    grantRevision: number;
+    canonicalFolder: string;
+    accessPreset: "read-project" | "edit-project";
+  }): Promise<string | undefined>;
+  quiesceContinuation?(checkpoint: ContinuationCheckpoint): Promise<void>;
+  rebuildContinuation?(checkpoint: ContinuationCheckpoint): Promise<{ boundaryManifestHash: string }>;
+  resumeContinuation?(checkpoint: ContinuationCheckpoint): Promise<{ status: string; runtimeAckId?: string }>;
   deliverToSession(
     sessionHandle: string,
     message: InboundMessage,
@@ -50,6 +64,7 @@ export interface RuntimeAdapter {
           | "runtime_unavailable"
           | "unsupported"
           | "permission_required"
+          | "project_access_required"
           | "project_selection_required"
           | "project_access_not_found";
       }

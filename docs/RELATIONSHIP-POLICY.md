@@ -102,7 +102,17 @@ The generated file is ordinary JSON for auditability and advanced editing:
       "principalId": "USER_UUID",
       "deviceId": "VERIFIED_DEVICE_ID",
       "tools": ["Read"],
-      "folders": ["/path/to/project"]
+      "folders": ["/path/to/project"],
+      "mcpServers": [
+        {
+          "name": "docs",
+          "url": "https://mcp.example.com/v1",
+          "enabledTools": ["read", "search"],
+          "bearerTokenEnvVar": "DOCS_MCP_TOKEN",
+          "startupTimeoutSec": 10,
+          "toolTimeoutSec": 60
+        }
+      ]
     }
   ]
 }
@@ -114,8 +124,8 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 ## Enforcement
 
 - Both `principalId` and `deviceId` must match exactly.
-- Unknown, MCP, shell, delegation, web, Glob, and Grep tools deny by default.
-- The path gate recognizes only `Read`, `Write`, and `Edit`.
+- Restricted mode denies unknown, MCP, shell, delegation, and web tools by default.
+- The path gate recognizes file, search, notebook, and constrained Git operations.
 - Literal paths are resolved through the filesystem before containment checks;
   the canonical authorized path is also the path passed forward for execution.
 - A policy inside a granted folder is rejected, and the policy itself cannot be
@@ -125,11 +135,35 @@ with `CCD_RELATIONSHIP_POLICY` or `--relationship-policy`.
 - Each Claude conversation and Codex thread binds to one communication session,
   rejects messages from a different relationship, and is released when that
   communication session is revoked or expired.
-- Claude Code exposes only `Read`, `Write`, and `Edit` and denies every call
-  that the relationship policy does not explicitly allow.
-- Codex exposes no direct relationship-policy tools; the bridge broker executes
-  only policy-authorized `Read`, `Write`, and `Edit` requests. Shell, network,
-  MCP, browser, Git, and package-manager actions remain unsupported.
+- A relationship policy update validates its complete folder, tool, and MCP
+  grant before changing local state. A real change immediately invalidates only
+  runtime sessions bound to that exact verified user+device, for both Codex and
+  Claude Code, so an active session cannot retain revoked capability. Replayed
+  events with identical policy are no-ops and do not restart the runtime.
+- In restricted mode, both runtimes expose only the narrow project capability
+  surface and constrained Git operations allowed by the active relationship.
+- Full-agent mode is explicit and stays closed until rebuild-health evidence,
+  kernel scoping, owner approval, and an interruptible runtime path are present.
+- Full-agent shell commands are size/timeout bounded, credential-filtered,
+  sandboxed to the selected folders, and owner-approved. Direct runtime network
+  access remains denied.
+- Claude's wider tool and MCP surface uses the same owner gate. Codex keeps the
+  owner's ambient MCP/plugin configuration isolated.
+- Codex MCP access requires full-agent mode, an active project boundary, an exact
+  verified user+device grant, an exact remote URL, and at least one named tool.
+- Only HTTPS and exact loopback HTTP endpoints are accepted. URLs containing
+  credentials, queries, or fragments are rejected, as are stdio commands and
+  static headers. Authentication may reference one explicitly named environment
+  variable without writing its value into the generated configuration.
+- The generated private Codex home disables conversation history and memory
+  generation for external context, uses a private file OAuth store, hides every
+  unlisted MCP tool, and bounds startup/tool execution time.
+- Whole Codex plugin bundles are intentionally not inherited or grantable in this
+  phase. A plugin may include skills, MCP servers, browser capabilities, or executable
+  hooks; granting its name would not express which of those powers the owner approved.
+  Owners can grant the plugin's remote MCP endpoint and exact tool allowlist instead.
+  Native plugin grants require a separate manifest-level capability contract and the
+  same new-session invalidation lifecycle before they can be enabled.
 
 The hosted control plane must include `senderDeviceId` in dispatch envelopes,
 and `requesterDeviceId` in grant responses, both derived from authenticated

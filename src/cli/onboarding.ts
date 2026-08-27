@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import {
   ApiError,
   type PollDeviceCodeResponse,
@@ -8,6 +8,7 @@ import {
   type StartDeviceCodeResponse,
 } from "../shared/http-client.js";
 import type { TeamAgentDirectory } from "../shared/contracts.js";
+import type { CapabilitySurface } from "../shared/capability-rollout.js";
 
 const MINIMUM_NODE_VERSION = [22, 5, 0] as const;
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
@@ -25,16 +26,27 @@ export interface BridgeReadinessClient {
   heartbeatEndpoint(endpointId: string): Promise<void>;
 }
 
+function relationshipLabel(relationships: TeamAgentDirectory["agents"][number]["relationships"]): string {
+  const isTeam = relationships?.includes("team") ?? false;
+  const isFriend = relationships?.includes("friend") ?? false;
+  if (isTeam && isFriend) return "Team + Friend";
+  if (isFriend) return "Friend";
+  // Older servers only returned Team cards and omitted relationship metadata.
+  return "Team";
+}
+
 export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] {
-  const heading = directory.team
-    ? `Bridge connected. Here are the agents in ${directory.team.name} and what they can help with:`
-    : "Bridge connected. You are not in an Aicoo Team yet.";
+  const heading = directory.agents.length > 0
+    ? "Bridge connected. Here are your Team and connected friend agents:"
+    : directory.team
+      ? `Bridge connected. Your ${directory.team.name} Team has no other discoverable agents yet.`
+      : "Bridge connected. You have no discoverable Team or connected friend agents yet.";
   if (directory.agents.length === 0) {
     return [
       heading,
       directory.team
-        ? "No other team agents are available yet. The first task plan will still be created locally."
-        : "Join a team to discover teammate agents automatically.",
+        ? "The first task plan will still be created locally."
+        : "Join a Team or accept an individual agent connection to discover agents here.",
       "Give me a task, or tell me whose agent you want to connect with.",
     ];
   }
@@ -45,7 +57,8 @@ export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] 
       : agent.connectionState === "connection_pending" ? "connection pending" : "contact";
     const skills = agent.agentCard.skills.map((skill) => skill.name).join(", ")
       || agent.agentCard.description;
-    return `- ${agent.agentCard.name} — ${agent.displayName}'s agent (${agent.role}; ${status}) — ${skills}`;
+    const relationship = relationshipLabel(agent.relationships);
+    return `- ${agent.agentCard.name} [${relationship}] — ${agent.displayName}'s agent (${agent.role}; ${status}) — ${skills}`;
   });
 
   return [
@@ -54,6 +67,8 @@ export function formatTeamAgentWelcome(directory: TeamAgentDirectory): string[] 
     "Give me a task, or tell me whose agent you want to connect with.",
   ];
 }
+
+export const formatAgentWelcome = formatTeamAgentWelcome;
 
 export interface SavedDeviceCredentials {
   token: string;
@@ -170,6 +185,7 @@ export function launchDetachedBridge(options: {
   pidFile: string;
   serverUrl: string;
   workspace?: string;
+  capabilitySurface?: CapabilitySurface;
   spawnProcess?: typeof spawn;
 }): { pid: number } {
   mkdirSync(dirname(options.logFile), { recursive: true });
@@ -181,16 +197,28 @@ export function launchDetachedBridge(options: {
       ...process.execArgv,
       options.cliEntry,
       "start",
+      // App-server carries the named permission profile and runtime workspace roots together.
+      // The legacy exec path can advertise edit-project while its managed apply_patch helper
+      // still loses the writable root and fails inside the kernel sandbox.
       "--adapter",
       options.runtime,
+      ...(options.runtime === "codex" ? ["--codex-app-server"] : []),
       "--spool",
       options.spoolFile,
       ...(options.workspace ? ["--workspace", options.workspace] : []),
+      ...(options.capabilitySurface
+        ? ["--capability-surface", options.capabilitySurface]
+        : []),
     ], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
       windowsHide: true,
-      env: { ...process.env, CCD_AICOO: "1", CCD_SERVER_URL: options.serverUrl },
+      env: {
+        ...process.env,
+        CCD_AICOO: "1",
+        CCD_SERVER_URL: options.serverUrl,
+        CCD_SPOOL: resolve(options.spoolFile),
+      },
     });
   } finally {
     closeSync(logFd);

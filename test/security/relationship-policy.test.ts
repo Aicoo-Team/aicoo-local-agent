@@ -14,6 +14,7 @@ import type { InboundMessage } from "../../src/adapters/runtime-adapter.js";
 import {
   RelationshipPolicy,
   resetRelationshipPolicy,
+  setRelationshipMcpGrants,
   upsertRelationshipPreset,
 } from "../../src/security/relationship-policy.js";
 
@@ -163,6 +164,59 @@ describe("RelationshipPolicy", () => {
     expect(document.relationships).toHaveLength(1);
   });
 
+  it("binds MCP grants to the exact peer device and an active project selection", () => {
+    const directory = makeDirectory();
+    const project = join(directory, "project");
+    const config = join(directory, "config");
+    mkdirSync(project);
+    mkdirSync(config);
+    const file = join(config, "relationships.json");
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "read-project",
+      folder: project,
+    });
+    setRelationshipMcpGrants({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      grants: [{
+        name: "docs",
+        url: "https://mcp.example.com/v1",
+        enabledTools: ["read", "search"],
+      }],
+    });
+
+    const policy = RelationshipPolicy.fromFile(file, directory);
+    expect(policy.mcpServersFor(inbound())).toEqual([{
+      name: "docs",
+      url: "https://mcp.example.com/v1",
+      enabledTools: ["read", "search"],
+      startupTimeoutSec: 10,
+      toolTimeoutSec: 60,
+    }]);
+    expect(policy.mcpServersFor(inbound({ senderDeviceId: "device-a2" }))).toEqual([]);
+
+    upsertRelationshipPreset({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      preset: "edit-project",
+      folder: project,
+    });
+    expect(RelationshipPolicy.fromFile(file, directory).mcpServersFor(inbound()))
+      .toHaveLength(1);
+    setRelationshipMcpGrants({
+      file,
+      principalId: "prn_a",
+      deviceId: "device-a1",
+      grants: [],
+    });
+    expect(RelationshipPolicy.fromFile(file, directory).mcpServersFor(inbound())).toEqual([]);
+  });
+
   it("requires explicit project selection when one verified device has multiple folders", () => {
     const directory = makeDirectory();
     const first = join(directory, "first-project");
@@ -210,6 +264,117 @@ describe("RelationshipPolicy", () => {
       { toolName: "Read", input: { file_path: join(first, "README.md") } },
       selected,
     )).toMatchObject({ behavior: "deny", message: expect.stringContaining("outside") });
+  });
+
+  it("selects several explicitly granted projects for one initial boundary", () => {
+    const directory = makeDirectory();
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(config);
+    const file = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+    const selected = inbound({
+      payload: {
+        task: {
+          text: "Compare both projects",
+          projectAccessIds: [first, second],
+        },
+      },
+    });
+
+    expect(permissions.accessFor(selected)).toMatchObject({
+      status: "selected",
+      preset: "read-project",
+      folders: [realpathSync.native(first), realpathSync.native(second)].sort(),
+    });
+    for (const project of [first, second]) {
+      expect(permissions.authorize(
+        { toolName: "Read", input: { file_path: join(project, "README.md") } },
+        selected,
+      )).toMatchObject({ behavior: "allow" });
+    }
+  });
+
+  it("preflights unambiguous project names from the objective using active grants only", () => {
+    const directory = makeDirectory();
+    const first = join(directory, "first-project");
+    const second = join(directory, "second-project");
+    const unrelated = join(directory, "unrelated-project");
+    const config = join(directory, "config");
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(unrelated);
+    mkdirSync(config);
+    const file = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second, unrelated],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: "Compare first-project with second-project" } },
+    }))).toMatchObject({
+      status: "selected",
+      selectionSource: "objective_preflight",
+      folders: [realpathSync.native(first), realpathSync.native(second)].sort(),
+    });
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: "Compare both projects" } },
+    }))).toMatchObject({
+      status: "selection_required",
+      folders: [],
+    });
+  });
+
+  it("does not guess between duplicate project names during objective preflight", () => {
+    const directory = makeDirectory();
+    const first = join(directory, "first", "project");
+    const second = join(directory, "second", "project");
+    const config = join(directory, "config");
+    mkdirSync(first, { recursive: true });
+    mkdirSync(second, { recursive: true });
+    mkdirSync(config);
+    const file = writePolicy(config, {
+      version: 1,
+      relationships: [{
+        principalId: "prn_a",
+        deviceId: "device-a1",
+        tools: ["Read"],
+        folders: [first, second],
+      }],
+    });
+    const permissions = RelationshipPolicy.fromFile(file, directory);
+
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: "Inspect project" } },
+    }))).toMatchObject({ status: "selection_required", folders: [] });
+    expect(permissions.accessFor(inbound({
+      kind: "task_invite",
+      payload: { task: { text: `Inspect ${realpathSync.native(second)}` } },
+    }))).toMatchObject({
+      status: "selected",
+      selectionSource: "objective_preflight",
+      folders: [realpathSync.native(second)],
+    });
   });
 
   it("forgets generated peer permissions when a bridge run resets its policy", () => {
@@ -422,11 +587,19 @@ describe("RelationshipPolicy", () => {
     expect(permissions.authorize(
       { toolName: "Glob", input: { pattern: "../../../**/*.env" } },
       inbound(),
-    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("Unsupported") });
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("traverse") });
     expect(permissions.authorize(
       { toolName: "Grep", input: { pattern: "AWS_SECRET", glob: "../../**/*" } },
       inbound(),
-    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("Unsupported") });
+    )).toMatchObject({ behavior: "deny", message: expect.stringContaining("traverse") });
+    expect(permissions.authorize(
+      { toolName: "Glob", input: { pattern: "src/**/*.ts", path: project } },
+      inbound(),
+    )).toMatchObject({ behavior: "allow", updatedInput: { path: realpathSync.native(project) } });
+    expect(permissions.authorize(
+      { toolName: "Grep", input: { pattern: "TODO", glob: "**/*.ts", path: project } },
+      inbound(),
+    )).toMatchObject({ behavior: "allow", updatedInput: { path: realpathSync.native(project) } });
     expect(permissions.authorize(
       { toolName: "MultiEdit", input: { file_path: join(project, "a.ts") } },
       inbound(),

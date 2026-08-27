@@ -47,6 +47,8 @@ export interface CodexTurnStartInput {
    * Only the app-server driver can honour this; `codex exec` has no way to be interrupted.
    */
   onApproval?: (request: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
+  /** Hard wall-clock limit for one app-server turn, including tool execution. */
+  turnTimeoutMs?: number;
   log?: (line: string) => void;
 }
 
@@ -87,7 +89,11 @@ class CodexExecTurn implements CodexTurn {
       cwd: input.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: input.permissionProfile
-        ? { ...process.env, CODEX_HOME: input.permissionProfile.codexHome }
+        ? {
+            ...process.env,
+            ...input.permissionProfile.environment,
+            CODEX_HOME: input.permissionProfile.codexHome,
+          }
         : process.env,
       windowsVerbatimArguments: false,
     });

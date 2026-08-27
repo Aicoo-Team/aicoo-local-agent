@@ -5,8 +5,11 @@ export type FileAccessPreset = Exclude<RelationshipAccessPreset, "chat-only">;
 
 export const PRESET_TOOLS: Readonly<Record<RelationshipAccessPreset, readonly string[]>> = {
   "chat-only": [],
-  "read-project": ["Read", "GitStatus", "GitDiff", "GitLog"],
-  "edit-project": ["Read", "Write", "Edit", "GitStatus", "GitDiff", "GitLog", "GitAdd", "GitCommit"],
+  "read-project": ["Read", "Glob", "Grep", "GitStatus", "GitDiff", "GitLog"],
+  "edit-project": [
+    "Read", "Glob", "Grep", "Write", "Edit", "NotebookEdit",
+    "GitStatus", "GitDiff", "GitLog", "GitAdd", "GitCommit",
+  ],
 };
 
 export function isRelationshipAccessPreset(value: string): value is RelationshipAccessPreset {
@@ -30,8 +33,8 @@ export function accessPresetAllowsTool(preset: RelationshipAccessPreset, tool: s
 }
 
 export function accessPresetForTool(tool: string): FileAccessPreset | undefined {
-  if (["Write", "Edit", "GitAdd", "GitCommit"].includes(tool)) return "edit-project";
-  if (["Read", "GitStatus", "GitDiff", "GitLog"].includes(tool)) return "read-project";
+  if (["Write", "Edit", "NotebookEdit", "GitAdd", "GitCommit"].includes(tool)) return "edit-project";
+  if (["Read", "Glob", "Grep", "GitStatus", "GitDiff", "GitLog"].includes(tool)) return "read-project";
   return undefined;
 }
 

@@ -91,7 +91,10 @@ describe("codex app-server protocol translation", () => {
     it("names the files a change would touch", () => {
       expect(classifyApproval(APPROVAL_METHODS.fileChange, {
         changes: [{ path: "/srv/project/app.ts" }, { path: "/srv/project/README.md" }],
-      })?.summary).toBe("Modify: /srv/project/app.ts, /srv/project/README.md");
+      })).toMatchObject({
+        summary: "Modify: /srv/project/app.ts, /srv/project/README.md",
+        paths: ["/srv/project/app.ts", "/srv/project/README.md"],
+      });
 
       expect(classifyApproval(APPROVAL_METHODS.fileChange, {
         changes: { "/srv/a.ts": {} },

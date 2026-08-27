@@ -93,41 +93,40 @@ export function safeGitOperation(input: {
 export function executeSafeGit(operation: SafeGitOperation): string {
   const repository = canonical(operation.repository);
   validatePathArguments(repository, operation);
-  if (operation.toolName === "GitAdd") return stageFilesWithoutFilters(repository, operation.args.slice(2));
+  if (operation.toolName === "GitAdd") {
+    return stageFilesWithoutFilters(repository, operation.args.slice(2), process.platform);
+  }
   const output = execFileSync(
     "git",
-    [...secureGitPrefix(repository), ...operation.args],
+    [...secureGitPrefix(repository, process.platform), ...operation.args],
     {
       encoding: "utf8",
       timeout: 15_000,
       maxBuffer: 1_000_000,
-      env: {
-        ...process.env,
-        GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
-        GIT_OPTIONAL_LOCKS: READ_TOOLS.has(operation.toolName) ? "0" : "1",
-        GIT_TERMINAL_PROMPT: "0",
-      },
+      env: gitEnvironment(operation.toolName, process.platform),
     },
   );
   return output.slice(0, 128_000);
 }
 
-export function safeGitShellInput(operation: SafeGitOperation): Record<string, unknown> {
+export function safeGitShellInput(
+  operation: SafeGitOperation,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, unknown> {
   const repository = canonical(operation.repository);
   validatePathArguments(repository, operation);
   if (operation.toolName === "GitAdd") {
     const commands = operation.args.slice(2).map((path) => {
       const mode = safeFileMode(repository, path);
-      const hash = gitShell(repository, ["hash-object", "-w", "--no-filters", "--", path]);
+      const hash = gitShell(repository, ["hash-object", "-w", "--no-filters", "--", path], platform);
       const updatePrefix = [
-        "git", ...secureGitPrefix(repository), "update-index", "--add", "--cacheinfo", mode,
+        "git", ...secureGitPrefix(repository, platform), "update-index", "--add", "--cacheinfo", mode,
       ].map(shellQuote).join(" ");
-      return `oid=$(${hash}) && ${updatePrefix} "$oid" ${shellQuote(path)}`;
+      return `oid=$(${hash}) && ${shellEnvironment(platform)} ${updatePrefix} "$oid" ${shellQuote(path)}`;
     });
     return { command: commands.map((command) => `(${command})`).join(" && ") };
   }
-  return { command: gitShell(repository, operation.args) };
+  return { command: gitShell(repository, operation.args, platform) };
 }
 
 function operation(toolName: GitToolName, repository: string, args: string[]): SafeGitOperation {
@@ -230,18 +229,32 @@ function validatePathArguments(repository: string, operation: SafeGitOperation):
   }
 }
 
-function stageFilesWithoutFilters(repository: string, paths: string[]): string {
+function stageFilesWithoutFilters(
+  repository: string,
+  paths: string[],
+  platform: NodeJS.Platform,
+): string {
   for (const path of paths) {
     const mode = safeFileMode(repository, path);
     const oid = execFileSync(
       "git",
-      [...secureGitPrefix(repository), "hash-object", "-w", "--no-filters", "--", path],
-      { encoding: "utf8", timeout: 15_000, maxBuffer: 128_000 },
+      [...secureGitPrefix(repository, platform), "hash-object", "-w", "--no-filters", "--", path],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        maxBuffer: 128_000,
+        env: gitEnvironment("GitAdd", platform),
+      },
     ).trim();
     execFileSync(
       "git",
-      [...secureGitPrefix(repository), "update-index", "--add", "--cacheinfo", `${mode},${oid},${path}`],
-      { encoding: "utf8", timeout: 15_000, maxBuffer: 128_000 },
+      [...secureGitPrefix(repository, platform), "update-index", "--add", "--cacheinfo", `${mode},${oid},${path}`],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        maxBuffer: 128_000,
+        env: gitEnvironment("GitAdd", platform),
+      },
     );
   }
   return "";
@@ -253,9 +266,9 @@ function safeFileMode(repository: string, path: string): "100644" | "100755" {
   return stat.mode & 0o111 ? "100755" : "100644";
 }
 
-function secureGitPrefix(repository: string): string[] {
+function secureGitPrefix(repository: string, platform: NodeJS.Platform): string[] {
   return [
-    "-c", "core.hooksPath=/dev/null",
+    "-c", `core.hooksPath=${nullDevice(platform)}`,
     "-c", "core.fsmonitor=false",
     "-c", "core.pager=cat",
     "-c", "diff.external=",
@@ -263,8 +276,31 @@ function secureGitPrefix(repository: string): string[] {
   ];
 }
 
-function gitShell(repository: string, args: string[]): string {
-  return ["git", ...secureGitPrefix(repository), ...args].map(shellQuote).join(" ");
+function gitShell(repository: string, args: string[], platform: NodeJS.Platform): string {
+  const command = ["git", ...secureGitPrefix(repository, platform), ...args].map(shellQuote).join(" ");
+  return `${shellEnvironment(platform)} ${command}`;
+}
+
+function gitEnvironment(toolName: GitToolName, platform: NodeJS.Platform): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: nullDevice(platform),
+    GIT_OPTIONAL_LOCKS: READ_TOOLS.has(toolName) ? "0" : "1",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+function shellEnvironment(platform: NodeJS.Platform): string {
+  return [
+    ["GIT_CONFIG_NOSYSTEM", "1"],
+    ["GIT_CONFIG_GLOBAL", nullDevice(platform)],
+    ["GIT_TERMINAL_PROMPT", "0"],
+  ].map(([name, value]) => `${name}=${shellQuote(value!)}`).join(" ");
+}
+
+function nullDevice(platform: NodeJS.Platform): string {
+  return platform === "win32" ? "NUL" : "/dev/null";
 }
 
 function canonical(path: string): string {

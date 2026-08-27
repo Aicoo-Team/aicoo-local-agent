@@ -4,8 +4,11 @@ import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { Command, Option } from "commander";
 import { selectRuntimeAdapter, type RuntimeAdapterKind } from "../adapters/select-adapter.js";
+import { BoundaryTelemetry } from "../adapters/boundary-telemetry.js";
+import { bridgeHealthIsFresh, parseBridgeHealth } from "../bridge/health.js";
 import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
+import { readProcessWatchdogDiagnostic, startProcessWatchdog } from "../bridge/process-watchdog.js";
 import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport, type ResolvedPersonResponse } from "../shared/http-client.js";
@@ -44,6 +47,7 @@ import { parseGoalPlan } from "../shared/goal-plan.js";
 import { runGoalPlan } from "./goal-runner.js";
 import {
   authorityDecisionFromEnvelope,
+  delegationDeliveryFailure,
   isFinalDelegationReplyEnvelope,
 } from "./delegation-replies.js";
 import {
@@ -56,17 +60,29 @@ import {
   waitForBridgeReady,
 } from "./onboarding.js";
 import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
+import {
+  evaluateCapabilityRollout,
+  resolveCapabilitySurface,
+  type CapabilitySurfaceActivation,
+  type CapabilitySurface,
+} from "../shared/capability-rollout.js";
 
 const LOCAL_SERVER_URL = "http://127.0.0.1:7790";
 const PRODUCT_AICOO_SERVER_URL = "https://www.aicoo.io";
 const PREVIEW_AICOO_SERVER_URL = "https://www.yourcoo.ai";
-const DEFAULT_SPOOL = join(homedir(), ".aicoo", "local-agent", "bridge.spool");
+const DEFAULT_SPOOL = process.env.CCD_SPOOL?.trim()
+  ? resolve(process.env.CCD_SPOOL)
+  : join(homedir(), ".aicoo", "local-agent", "bridge.spool");
 
 const program = new Command()
   .name("ccd")
   .description("aicoo-local-agent realtime runtime-messaging CLI")
   .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? LOCAL_SERVER_URL)
   .option("--token <token>", "device bearer token", process.env.CCD_TOKEN);
+
+function collectOption(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
 
 program.command("login")
   .description("log in this machine via Aicoo device-code pairing flow")
@@ -145,6 +161,9 @@ program.command("onboard")
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--workspace <dir>", "workspace exposed to the local runtime", process.cwd())
   .option("--server <url>", "control-plane URL")
+  .addOption(new Option("--capability-surface <surface>", "peer agent capability surface")
+    .choices(["restricted", "full-agent"])
+    .default("restricted"))
   .option("--ready-timeout <milliseconds>", "time to wait for bidirectional readiness", "30000")
   .option("--no-open", "print the approval URL instead of opening a browser")
   .action(async (options) => {
@@ -203,6 +222,7 @@ program.command("onboard")
         pidFile,
         serverUrl: server,
         workspace: options.workspace,
+        capabilitySurface: options.capabilitySurface,
       });
       console.log(`✓ Local bridge started in the background (${started.pid})`);
     }
@@ -234,22 +254,22 @@ program.command("onboard")
     console.log(`Endpoint: ${ready.endpointId}`);
     console.log(`Logs: ${logFile}`);
     try {
-      const directory = await makeHostedClient(server, options.spool).listTeamAgents();
+      const directory = await makeHostedClient(server, options.spool).listAgentDirectory();
       console.log("");
       for (const line of formatTeamAgentWelcome(directory)) console.log(line);
     } catch (error) {
       console.log("Bridge connected. Give me a task, or tell me whose agent you want to connect with.");
-      console.log(`Team-agent directory is temporarily unavailable: ${errorMessage(error)}`);
+      console.log(`Agent directory is temporarily unavailable: ${errorMessage(error)}`);
     }
   });
 
 program.command("agents")
-  .description("list the agents in your Aicoo Team and their published capabilities")
+  .description("list your Aicoo Team and connected friend agents and their published capabilities")
   .option("--spool <file>", "durable bridge spool", DEFAULT_SPOOL)
   .option("--server <url>", "control-plane URL")
   .option("--json", "print the machine-readable private Agent Card directory", false)
   .action(async (options) => {
-    const directory = await makeHostedClient(options.server, options.spool).listTeamAgents();
+    const directory = await makeHostedClient(options.server, options.spool).listAgentDirectory();
     if (options.json) {
       print(directory);
       return;
@@ -279,9 +299,11 @@ program.command("goal")
       const result = await runGoalPlan(plan, {
         runSubtask: async (subtask, identifiers) => {
           const resolved = await resolvePerson(client, subtask.target, options.spool);
-          const task = subtask.project
-            ? { text: subtask.task, projectAccessId: subtask.project }
-            : subtask.task;
+          const task = subtask.projects
+            ? { text: subtask.task, projectAccessIds: subtask.projects }
+            : subtask.project
+              ? { text: subtask.task, projectAccessId: subtask.project }
+              : subtask.task;
           let context: CollaborationContext | undefined;
           if (subtask.contextFile) {
             if (statSync(subtask.contextFile).size > COLLABORATION_CONTEXT_MAX_BYTES) {
@@ -309,6 +331,11 @@ program.command("goal")
             spool,
             identifiers.correlationId,
             timeoutMs,
+            delegation.status === "delegated"
+              ? { transport: client, messageId: delegation.receipt.messageId }
+              : delegation.status === "folder_access_requested"
+                ? { transport: client, messageId: delegation.messageId }
+              : undefined,
           );
           if (!reply) {
             return {
@@ -374,6 +401,9 @@ program.command("bridge")
   .option("--codex-state <file>", "Codex managed-session state database")
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
   .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
+  .addOption(new Option("--capability-surface <surface>", "peer agent capability surface")
+    .choices(["restricted", "full-agent"])
+    .default("restricted"))
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
   .option("--no-local-helper", "disable the localhost folder/file picker helper")
@@ -395,6 +425,9 @@ program.command("start")
   .option("--workspace <dir>", "managed-session workspace", process.cwd())
   .option("--codex-path <file>", "codex executable", process.env.CODEX_PATH)
   .option("--codex-app-server", "drive codex through app-server so tool calls can be put to you for approval")
+  .addOption(new Option("--capability-surface <surface>", "peer agent capability surface")
+    .choices(["restricted", "full-agent"])
+    .default("restricted"))
   .option("--claude-path <file>", "Claude Code executable", process.env.CLAUDE_CODE_PATH)
   .option("--local-helper-port <port>", "localhost folder/file picker helper port", process.env.CCD_LOCAL_HELPER_PORT ?? "43177")
   .option("--local-helper-host <host>", "localhost folder/file picker helper host", process.env.CCD_LOCAL_HELPER_HOST ?? "127.0.0.1")
@@ -405,7 +438,15 @@ program.command("start")
     await startBridge({ ...options, hosted: true, server: hostedServerUrl() });
   });
 
-program.command("whoami").action(async () => print(await makeClient().whoami()));
+program.command("whoami")
+  .description("show the Aicoo identity bound to this machine")
+  .option("--spool <file>", "bridge spool whose saved device credential should be used", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .action(async (options, command) => {
+    const server = commandLineOption(command, "server", options.server);
+    const spool = commandLineOption(command, "spool", options.spool);
+    print(await makeHostedClient(server, spool).whoami());
+  });
 
 const trustedTools = program.command("trusted-access")
   .alias("trusted-tools")
@@ -773,7 +814,12 @@ program.command("delegate")
   .option("--timeout <seconds>", "local pending-delegation timeout", "1800")
   .option("--request-timeout <seconds>", "delegation HTTP submission timeout", "30")
   .option("--context-file <path>", "bounded JSON context capsule prepared by your local agent")
-  .option("--project <id-or-folder>", "exact shared-project grant ID or approved absolute folder")
+  .option(
+    "--project <id-or-folder>",
+    "exact shared-project grant ID or approved absolute folder (repeat for one multi-project boundary)",
+    collectOption,
+    [],
+  )
   .option("--no-wait", "return after dispatch instead of waiting for the peer reply")
   .option("--server <url>", "control-plane URL")
   .action(async (person, taskParts, options) => {
@@ -792,9 +838,14 @@ program.command("delegate")
 
     const route = await resolveRoute({ spool: options.spool });
     const taskText = taskParts.join(" ");
-    const task = options.project
-      ? { text: taskText, projectAccessId: String(options.project).trim() }
-      : taskText;
+    const projects = Array.isArray(options.project)
+      ? [...new Set(options.project.map((project: unknown) => String(project).trim()).filter(Boolean))]
+      : [];
+    const task = projects.length > 1
+      ? { text: taskText, projectAccessIds: projects }
+      : projects.length === 1
+        ? { text: taskText, projectAccessId: projects[0] }
+        : taskText;
     let context: CollaborationContext | undefined;
     if (options.contextFile) {
       try {
@@ -803,7 +854,7 @@ program.command("delegate")
         }
         context = parseCollaborationContext(
           JSON.parse(readFileSync(options.contextFile, "utf8")) as unknown,
-          task,
+          taskText,
         );
       } catch (error) {
         console.error(`Could not load context capsule: ${errorMessage(error)}`);
@@ -852,6 +903,11 @@ program.command("delegate")
           spool,
           result.correlationId ?? correlationId,
           Number.parseInt(options.timeout, 10) * 1000,
+          result.status === "delegated"
+            ? { transport: client, messageId: result.receipt.messageId }
+            : result.status === "folder_access_requested"
+              ? { transport: client, messageId: result.messageId }
+            : undefined,
         );
         const replyText = reply.envelope.payload.text;
         console.log("");
@@ -976,6 +1032,28 @@ program.command("doctor")
             detail: { endpointId, sessions },
             ...(endpointId && sessions.length > 0 ? {} : { next: "Start the bridge with this spool file." }),
           });
+          const bridgeHealth = parseBridgeHealth(spool.getIdentity("bridgeHealth"));
+          const bridgeHealthFresh = bridgeHealth ? bridgeHealthIsFresh(bridgeHealth) : false;
+          checks.push({
+            name: "localBridgeHealth",
+            ok: bridgeHealthFresh
+              && (bridgeHealth?.status === "healthy" || bridgeHealth?.status === "starting"),
+            detail: bridgeHealth ? { ...bridgeHealth, fresh: bridgeHealthFresh } : { status: "unknown" },
+            ...(bridgeHealthFresh
+              && (bridgeHealth?.status === "healthy" || bridgeHealth?.status === "starting")
+              ? {}
+              : { next: "Restart the bridge and inspect bridge.log for heartbeat or event-loop failures." }),
+          });
+          const processWatchdog = readProcessWatchdogDiagnostic(`${resolve(options.spool)}.watchdog.json`);
+          if (processWatchdog) {
+            checks.push({
+              name: "processWatchdog",
+              ok: false,
+              detail: processWatchdog,
+              next: "The independent watchdog stopped a stalled bridge. Restart it, then attach bridge.log "
+                + "and this watchdog diagnostic to the incident report.",
+            });
+          }
         } finally {
           spool.close();
         }
@@ -989,6 +1067,21 @@ program.command("doctor")
       mode: "text-only",
       checks,
     });
+  });
+
+program.command("capability-readiness")
+  .description("show whether local C2C rebuild evidence permits wider agent capabilities")
+  .option("--spool <file>", "bridge spool to inspect", DEFAULT_SPOOL)
+  .action((options) => {
+    const spool = new BridgeSpool(options.spool);
+    try {
+      print({
+        surface: "full-agent-capability",
+        ...evaluateCapabilityRollout(new BoundaryTelemetry(spool.db).snapshot()),
+      });
+    } finally {
+      spool.close();
+    }
   });
 
 program.command("install-codex-skill")
@@ -1033,6 +1126,7 @@ async function startBridge(options: {
   codexState?: string;
   codexPath?: string;
   codexAppServer?: boolean;
+  capabilitySurface?: CapabilitySurface;
   localHelper?: boolean;
   localHelperPort?: string;
   localHelperHost?: string;
@@ -1042,7 +1136,25 @@ async function startBridge(options: {
   server?: string;
   json?: boolean;
 }): Promise<void> {
+  // Managed Codex/Claude turns inherit this bridge process environment. Preserve the exact
+  // control plane and identity spool selected for this bridge so `ccd agents/delegate/goal`
+  // invoked by the installed skill cannot silently fall back to another account or localhost.
+  process.env.CCD_SPOOL = resolve(options.spool);
+  process.env.CCD_SERVER_URL = options.server
+    ?? process.env.CCD_SERVER_URL
+    ?? program.opts<{ server?: string }>().server;
   ensureParentDirectory(options.spool);
+  const readinessSpool = new BridgeSpool(options.spool);
+  let boundaryMetrics: ReturnType<BoundaryTelemetry["snapshot"]>;
+  try {
+    boundaryMetrics = new BoundaryTelemetry(readinessSpool.db).snapshot();
+  } finally {
+    readinessSpool.close();
+  }
+  const rebuildReadiness = evaluateCapabilityRollout(boundaryMetrics);
+  if (options.capabilitySurface === "full-agent" && !rebuildReadiness.eligible) {
+    throw new Error(`full-agent capability is not ready: ${rebuildReadiness.reasons.join(", ")}`);
+  }
   const bridgeInstanceId = randomUUID();
   const relationshipPolicyFile = options.relationshipPolicy ?? `${resolve(options.spool)}.relationships.json`;
   const trustedToolPolicyFile = `${resolve(options.spool)}.trusted-tools.json`;
@@ -1058,6 +1170,16 @@ async function startBridge(options: {
   const approvalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
     ? (transport as unknown as ToolApprovalGateway)
     : undefined;
+  const codexAppServer = options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1";
+  const capabilityActivation: CapabilitySurfaceActivation = resolveCapabilitySurface(
+    options.capabilitySurface ?? "restricted",
+    boundaryMetrics,
+    {
+      runtime: options.adapter,
+      ownerApprovalGateway: Boolean(approvalGateway),
+      ...(options.adapter === "codex" ? { codexAppServer } : {}),
+    },
+  );
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
     sessions: Number.parseInt(options.sessions, 10),
@@ -1073,9 +1195,10 @@ async function startBridge(options: {
     ownerPrincipalId: ownerIdentity.principalId,
     ownerDeviceId: ownerIdentity.deviceId,
     bridgeInstanceId,
+    capabilitySurface: capabilityActivation.active,
     ...(approvalGateway ? { approvalGateway } : {}),
     // Opt-in: drives Codex through app-server so the owner can be asked mid-turn.
-    ...(options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1" ? { codexAppServer: true } : {}),
+    ...(codexAppServer ? { codexAppServer: true } : {}),
     model: options.model,
     log: console.log,
   });
@@ -1090,6 +1213,12 @@ async function startBridge(options: {
   spool.setIdentity("ownerPrincipalId", ownerIdentity.principalId);
   spool.setIdentity("ownerDeviceId", ownerIdentity.deviceId);
   spool.setIdentity("bridgeInstanceId", bridgeInstanceId);
+  spool.setIdentity("spoolFile", resolve(options.spool));
+  // This watchdog owns a separate event loop. Unlike heartbeat timers in this process, it can
+  // still stop the daemon if runtime execution completely starves the bridge's main thread.
+  const processWatchdog = startProcessWatchdog({
+    diagnosticFile: `${resolve(options.spool)}.watchdog.json`,
+  });
   const bridge = new RuntimeBridge({
     transport,
     spool,
@@ -1121,11 +1250,25 @@ async function startBridge(options: {
       console.log(`[local-helper] not started: ${String(error)}`);
     }
   }
-  const started = await bridge.start();
+  let started: Awaited<ReturnType<RuntimeBridge["start"]>>;
+  try {
+    started = await bridge.start();
+  } catch (error) {
+    await processWatchdog.stop();
+    localHelper?.close();
+    if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
+    spool.close();
+    throw error;
+  }
   if (options.json) {
     console.log(JSON.stringify({
       status: "ready",
-      mode: "text-only",
+      mode: capabilityActivation.active === "restricted" ? "text-only" : "full-agent",
+      capabilitySurface: capabilityActivation.active,
+      capabilityGate: {
+        rollout: capabilityActivation.rollout,
+        security: capabilityActivation.security,
+      },
       adapter: selected.label,
       ...started,
     }, null, 2));
@@ -1134,12 +1277,17 @@ async function startBridge(options: {
     console.log("  Aicoo Local Agent Bridge is running!");
     console.log(`     Adapter:  ${selected.label}`);
     console.log(`     Device:   ${deviceId}`);
+    console.log(`     Surface:  ${capabilityActivation.active}`);
+    if (capabilityActivation.active === "full-agent") {
+      console.log("     Gate:     sandbox + approval + timeout + credential/output controls");
+    }
     console.log("     Status:   Ready for C2C collaboration");
     console.log("========================================================\n");
     console.log("Listening for incoming C2C session tasks... (Press Ctrl+C to stop)");
   }
   const shutdown = async () => {
     await bridge.stop();
+    await processWatchdog.stop();
     localHelper?.close();
     if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
     spool.deleteIdentity("relationshipPolicyFile");
@@ -1423,13 +1571,16 @@ async function waitForDelegationReply(
   spool: BridgeSpool,
   correlationId: string,
   timeoutMs: number,
+  delivery?: DelegationDeliveryMonitor,
 ): Promise<ReturnType<BridgeSpool["findReplyByCorrelation"]> & {}> {
   const deadline = Date.now() + timeoutMs;
+  let nextDeliveryCheckAt = 0;
   while (Date.now() < deadline) {
     const reply = spool.findReplyByCorrelation(correlationId);
-    // A bounded collaboration can exchange follow-up turns. Keep waiting for questions and
-    // owner decisions, but return a peer's completion proposal as the delegated artifact.
+    // A bounded collaboration can exchange follow-up turns. Tool-boundary approvals do not
+    // emit a peer reply until resume completes, so a received needs_owner reply is actionable.
     if (isFinalDelegationReply(reply)) return reply;
+    nextDeliveryCheckAt = await throwIfDelegationFailed(delivery, nextDeliveryCheckAt);
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Timed out waiting for the peer reply (${correlationId})`);
@@ -1439,14 +1590,40 @@ async function waitForDelegationReplyOrUndefined(
   spool: BridgeSpool,
   correlationId: string,
   timeoutMs: number,
+  delivery?: DelegationDeliveryMonitor,
 ): Promise<ReturnType<BridgeSpool["findReplyByCorrelation"]>> {
   const deadline = Date.now() + timeoutMs;
+  let nextDeliveryCheckAt = 0;
   while (Date.now() < deadline) {
     const reply = spool.findReplyByCorrelation(correlationId);
     if (isFinalDelegationReply(reply)) return reply;
+    nextDeliveryCheckAt = await throwIfDelegationFailed(delivery, nextDeliveryCheckAt);
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return undefined;
+}
+
+type DelegationDeliveryMonitor = {
+  transport: Pick<HttpMessageTransport, "getMessageStatus">;
+  messageId: string;
+};
+
+async function throwIfDelegationFailed(
+  delivery: DelegationDeliveryMonitor | undefined,
+  nextCheckAt: number,
+): Promise<number> {
+  if (!delivery || Date.now() < nextCheckAt) return nextCheckAt;
+  const retryAt = Date.now() + 1_000;
+  let status;
+  try {
+    status = await delivery.transport.getMessageStatus(delivery.messageId);
+  } catch {
+    // Status polling is advisory while the correlated reply channel remains healthy.
+    return retryAt;
+  }
+  const failure = delegationDeliveryFailure(status);
+  if (failure) throw new Error(failure);
+  return retryAt;
 }
 
 function isFinalDelegationReply(

@@ -180,8 +180,10 @@ export function revokeTrustedToolPolicy(input: {
   now?: Date;
 }): TrustedToolPolicy | undefined {
   const document = readTrustedToolPolicies(input.file);
-  const serverRevision = input.serverRevision ?? 0;
   const latestServerRevision = document.serverRevisions[input.policyId];
+  // Hosted events supply a revision and remain monotonic. A local owner command has no revision,
+  // so use the revision already synchronized into this file instead of treating it as revision 0.
+  const serverRevision = input.serverRevision ?? latestServerRevision ?? 0;
   if (latestServerRevision !== undefined && serverRevision < latestServerRevision) return undefined;
   const index = document.policies.findIndex((policy) => policy.policyId === input.policyId);
   if (index < 0) {
