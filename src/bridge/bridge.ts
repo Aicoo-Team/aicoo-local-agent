@@ -35,6 +35,8 @@ import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import { ContinuationRecovery } from "./continuation-recovery.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
 import { HeartbeatWatchdog } from "./health.js";
+import { AuthenticationFailureBudget } from "./auth-failure-budget.js";
+import { IdlePollBackoff } from "./idle-backoff.js";
 import { BridgeSpool } from "./spool.js";
 
 /**
@@ -70,6 +72,9 @@ export interface BridgeOptions {
   bridgeInstanceId?: string;
   hooks?: InjectionHooks;
   log?: (line: string) => void;
+  unrecoverableAuthTimeoutMs?: number;
+  nowMs?: () => number;
+  onFatalError?: (error: Error) => void;
 }
 
 export class RuntimeBridge {
@@ -89,6 +94,7 @@ export class RuntimeBridge {
   readonly #continuationRecovery: ContinuationRecovery;
   readonly #boundaryTelemetry: BoundaryTelemetry;
   readonly #heartbeatWatchdog: HeartbeatWatchdog;
+  readonly #authenticationFailureBudget: AuthenticationFailureBudget;
 
   constructor(private readonly options: BridgeOptions) {
     this.#bridgeInstanceId = options.bridgeInstanceId ?? id("bridge");
@@ -100,6 +106,10 @@ export class RuntimeBridge {
       maxBackoffMs: options.heartbeatMaxBackoffMs ?? DEFAULT_HEARTBEAT_MAX_BACKOFF_MS,
       failureThreshold: options.heartbeatFailureThreshold ?? DEFAULT_HEARTBEAT_FAILURE_THRESHOLD,
       persist: (state) => options.spool.setIdentity("bridgeHealth", JSON.stringify(state)),
+    });
+    this.#authenticationFailureBudget = new AuthenticationFailureBudget({
+      timeoutMs: options.unrecoverableAuthTimeoutMs ?? 300_000,
+      now: options.nowMs,
     });
     options.adapter.configureContinuationStore?.(continuationStore);
     this.#continuationRecovery = new ContinuationRecovery(
@@ -295,11 +305,13 @@ export class RuntimeBridge {
           if (error instanceof ApiError && error.status === 401) {
             const recovered = await this.options.transport.recoverAuthentication();
             if (recovered.recovered) {
+              this.#authenticationFailureBudget.recordRecovery();
               reconnectDelayMs = 50;
               reconnectFailures = 0;
               this.options.log?.(`[bridge] Device token refreshed from ${recovered.source}; reconnecting event stream.`);
               continue;
             }
+            this.recordUnrecoverableAuthenticationFailure(recovered.reason);
             reconnectFailures += 1;
             if (shouldLogReconnect(reconnectFailures)) {
               this.options.log?.(
@@ -332,13 +344,15 @@ export class RuntimeBridge {
   }
 
   private async runContinuationRecovery(): Promise<void> {
+    const backoff = new IdlePollBackoff({ minimumMs: 250, maximumMs: 2_000 });
     while (!this.#controller.signal.aborted) {
+      let worked = false;
       try {
-        await this.#continuationRecovery.recover();
+        worked = await this.#continuationRecovery.recover();
       } catch (error) {
         this.options.log?.(`[bridge] continuation recovery deferred: ${String(error)}`);
       }
-      await delay(250, this.#controller.signal);
+      await delay(backoff.next(worked), this.#controller.signal);
     }
   }
 
@@ -660,6 +674,7 @@ export class RuntimeBridge {
       const eventLoopLagMs = Math.max(0, Date.now() - delayStartedAt - nextHeartbeatInMs);
       try {
         await this.options.transport.heartbeatEndpoint(this.requireEndpoint());
+        this.#authenticationFailureBudget.recordRecovery();
         const health = this.#heartbeatWatchdog.recordSuccess(eventLoopLagMs);
         nextHeartbeatInMs = health.nextHeartbeatInMs;
         if (health.status === "healthy" && unhealthyReported) {
@@ -676,9 +691,11 @@ export class RuntimeBridge {
           authenticationFailure = true;
           const recovered = await this.options.transport.recoverAuthentication();
           if (recovered.recovered) {
+            this.#authenticationFailureBudget.recordRecovery();
             this.options.log?.(`[bridge] Device token refreshed from ${recovered.source}; heartbeat will resume.`);
           } else {
             this.options.log?.(`[bridge] Device token rejected (401); recovery pending: ${recovered.reason}.`);
+            this.recordUnrecoverableAuthenticationFailure(recovered.reason);
           }
         }
         const health = this.#heartbeatWatchdog.recordFailure(error, eventLoopLagMs);
@@ -714,9 +731,10 @@ export class RuntimeBridge {
   }
 
   private async runInjector(): Promise<void> {
+    const backoff = new IdlePollBackoff({ minimumMs: this.options.injectorMs ?? 100, maximumMs: 2_000 });
     while (!this.#controller.signal.aborted) {
-      await this.#injector?.runOnce();
-      await delay(this.options.injectorMs ?? 100, this.#controller.signal);
+      const worked = await this.#injector?.runOnce() ?? false;
+      await delay(backoff.next(worked), this.#controller.signal);
     }
   }
 
@@ -844,8 +862,10 @@ export class RuntimeBridge {
   }
 
   private async runOutboundReplies(): Promise<void> {
+    const backoff = new IdlePollBackoff({ minimumMs: this.options.injectorMs ?? 100, maximumMs: 2_000 });
     while (!this.#controller.signal.aborted) {
-      for (const reply of this.options.spool.listPendingOutboundReplies()) {
+      const replies = this.options.spool.listPendingOutboundReplies();
+      for (const reply of replies) {
         try {
           await this.options.transport.sendMessage({
             communicationSessionId: reply.communicationSessionId,
@@ -867,8 +887,20 @@ export class RuntimeBridge {
           if (!terminal) break;
         }
       }
-      await delay(this.options.injectorMs ?? 100, this.#controller.signal);
+      await delay(backoff.next(replies.length > 0), this.#controller.signal);
     }
+  }
+
+  private recordUnrecoverableAuthenticationFailure(reason: string): void {
+    const decision = this.#authenticationFailureBudget.recordFailure();
+    if (!decision.fatal) return;
+    const error = new Error(
+      `Device authentication did not recover for ${Math.round(decision.elapsedMs / 1_000)}s: ${reason}. `
+        + "Run 'ccd onboard' to authorize this machine again.",
+    );
+    this.options.log?.(`[bridge] FATAL: ${error.message}`);
+    this.#controller.abort();
+    this.options.onFatalError?.(error);
   }
 
   private requireEndpoint(): string {

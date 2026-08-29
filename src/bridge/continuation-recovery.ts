@@ -29,12 +29,13 @@ export class ContinuationRecovery {
     this.#coordinator = new SessionRebuildCoordinator(store);
   }
 
-  async recover(): Promise<void> {
-    await this.recoverAwaitingDecisions();
+  async recover(): Promise<boolean> {
+    const awaitingWork = await this.recoverAwaitingDecisions();
     const { quiesceContinuation, rebuildContinuation, resumeContinuation } = this.adapter;
-    if (!quiesceContinuation || !rebuildContinuation || !resumeContinuation) return;
+    if (!quiesceContinuation || !rebuildContinuation || !resumeContinuation) return awaitingWork;
 
-    await Promise.all(this.store.listRecoverable().map(async (checkpoint) => {
+    const recoverable = this.store.listRecoverable();
+    await Promise.all(recoverable.map(async (checkpoint) => {
       if (this.#inFlight.has(checkpoint.continuationId) || this.#resumedThisProcess.has(checkpoint.continuationId)) {
         return;
       }
@@ -82,11 +83,13 @@ export class ContinuationRecovery {
         this.#inFlight.delete(checkpoint.continuationId);
       }
     }));
+    return awaitingWork || recoverable.length > 0;
   }
 
-  private async recoverAwaitingDecisions(): Promise<void> {
-    if (!this.approvalGateway) return;
-    await Promise.all(this.store.listAwaitingDecisions().map(async (checkpoint) => {
+  private async recoverAwaitingDecisions(): Promise<boolean> {
+    if (!this.approvalGateway) return false;
+    const awaiting = this.store.listAwaitingDecisions();
+    await Promise.all(awaiting.map(async (checkpoint) => {
       try {
         const current = await this.approvalGateway!.getToolApproval(checkpoint.approvalId!);
         if (current.status === "pending" && current.decision === null) return;
@@ -114,6 +117,7 @@ export class ContinuationRecovery {
         this.log?.(`[bridge] continuation approval recovery deferred: ${String(error)}`);
       }
     }));
+    return awaiting.length > 0;
   }
 
   handleRuntimeEvent(sessionHandle: string, event: ContinuationRuntimeEvent): void {

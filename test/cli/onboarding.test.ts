@@ -1,17 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   authorizeDevice,
   bridgeLaunchConfigMatches,
   formatTeamAgentWelcome,
+  inspectManagedBridge,
   launchDetachedBridge,
+  managedBridgeHealthAllowsReuse,
   nodeMeetsMinimumVersion,
   readRegisteredEndpointId,
   readRunningProcessId,
   resolveOnboardingRuntimeFiles,
   stopManagedBridge,
+  stopManagedBridgeFromPidFile,
   waitForBridgeReady,
   type DeviceAuthorizationClient,
 } from "../../src/cli/onboarding.js";
@@ -192,6 +195,60 @@ describe("local-agent onboarding", () => {
       delay: vi.fn().mockResolvedValue(undefined),
     })).resolves.toBeUndefined();
     expect(signalProcess).toHaveBeenCalledWith(4321, "SIGTERM");
+  });
+
+  it("reports managed bridge lifecycle and launch configuration from its spool", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-bridge-status-"));
+    const spoolFile = join(directory, "bridge.spool");
+    const pidFile = join(directory, "bridge.pid");
+    writeFileSync(pidFile, "4321\n");
+    const spool = new BridgeSpool(spoolFile);
+    spool.setIdentity("endpointId", "endpoint-1");
+    spool.setIdentity("launchRuntime", "codex");
+    spool.setIdentity("launchCapabilitySurface", "full-agent");
+    spool.setIdentity("launchWorkspace", "/tmp/project");
+    spool.close();
+
+    expect(inspectManagedBridge({ spoolFile, pidFile, probe: (pid) => pid === 4321 })).toMatchObject({
+      running: true,
+      pid: 4321,
+      endpointId: "endpoint-1",
+      runtime: "codex",
+      capabilitySurface: "full-agent",
+      workspace: "/tmp/project",
+    });
+  });
+
+  it("stops the exact managed PID and removes its stale PID file", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-bridge-stop-"));
+    const pidFile = join(directory, "bridge.pid");
+    writeFileSync(pidFile, "4321\n");
+    let running = true;
+
+    await expect(stopManagedBridgeFromPidFile(pidFile, {
+      probe: () => running,
+      signalProcess: () => {
+        running = false;
+      },
+      delay: vi.fn().mockResolvedValue(undefined),
+    })).resolves.toEqual({ stopped: true, pid: 4321 });
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it("does not reuse a running bridge whose persisted health stopped advancing", () => {
+    const spoolFile = join(mkdtempSync(join(tmpdir(), "ccd-bridge-stale-")), "bridge.spool");
+    const spool = new BridgeSpool(spoolFile);
+    spool.setIdentity("bridgeHealth", JSON.stringify({
+      status: "healthy",
+      consecutiveHeartbeatFailures: 0,
+      nextHeartbeatInMs: 10_000,
+      eventLoopLagMs: 0,
+      updatedAt: "2026-08-29T00:00:00.000Z",
+    }));
+    spool.close();
+
+    expect(managedBridgeHealthAllowsReuse(spoolFile, Date.parse("2026-08-29T00:02:00.000Z")))
+      .toBe(false);
   });
 
   it("isolates detached PID and log files for custom spools in one directory", () => {

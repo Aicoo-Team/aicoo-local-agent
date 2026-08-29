@@ -42,10 +42,14 @@ export class Injector {
     private readonly hooks: InjectionHooks = noOpInjectionHooks,
   ) {}
 
-  async runOnce(): Promise<void> {
-    await this.flushPendingReports();
-    await this.ackReceived();
-    for (const message of this.spool.listInjectable()) await this.inject(message);
+  async runOnce(): Promise<boolean> {
+    const reports = this.spool.listPendingReports();
+    const received = this.spool.listReceived();
+    const injectable = this.spool.listInjectable();
+    await this.flushPendingReports(reports);
+    await this.ackReceived(received);
+    for (const message of injectable) await this.inject(message);
+    return reports.length > 0 || received.length > 0 || injectable.length > 0;
   }
 
   /**
@@ -53,9 +57,9 @@ export class Injector {
    * the SSE consumer, with retry — means a slow or failing control-plane ack can never wedge the
    * stream or stall the cursor. Expired messages are dropped so they never loop forever.
    */
-  private async ackReceived(): Promise<void> {
+  private async ackReceived(messages: SpoolMessage[]): Promise<void> {
     const now = Date.now();
-    for (const message of this.spool.listReceived()) {
+    for (const message of messages) {
       if (new Date(message.envelope.expiresAt).getTime() <= now) {
         this.spool.markResult(message.messageId, "blocked", "expired_before_ack");
         continue;
@@ -74,8 +78,8 @@ export class Injector {
     }
   }
 
-  private async flushPendingReports(): Promise<void> {
-    for (const report of this.spool.listPendingReports()) {
+  private async flushPendingReports(reports: ReturnType<BridgeSpool["listPendingReports"]>): Promise<void> {
+    for (const report of reports) {
       const message = this.spool.getMessage(report.messageId);
       if (!message || message.status === "blocked") {
         this.spool.markAttemptReported(report.attemptId);
