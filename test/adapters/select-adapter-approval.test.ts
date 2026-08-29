@@ -81,6 +81,7 @@ describe("selectRuntimeAdapter Codex approvals", () => {
       approvalGateway,
       codexAppServer: true,
       capabilitySurface: "full-agent",
+      verifyCodexSandbox: async () => undefined,
     });
 
     expect(capturedConfigs[0]).toMatchObject({
@@ -88,5 +89,37 @@ describe("selectRuntimeAdapter Codex approvals", () => {
       capabilitySurface: "full-agent",
       driver: expect.any(Object),
     });
+  });
+
+  it("fails closed when the Codex sandbox probe cannot enforce the governed profile", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-select-probe-failure-"));
+    directories.push(directory);
+    const codexPath = join(directory, "codex");
+    writeFileSync(codexPath, "#!/bin/sh\n");
+    chmodSync(codexPath, 0o700);
+    const verifyCodexSandbox = vi.fn(async () => {
+      throw new Error("outside read unexpectedly succeeded");
+    });
+
+    await expect(selectRuntimeAdapter({
+      kind: "codex",
+      sessions: 1,
+      spoolFile: join(directory, "bridge.spool"),
+      workspace: directory,
+      codexPath,
+      approvalGateway: {
+        async requestToolApproval() {
+          return { approvalId: "approval-full", status: "allow", decision: "allow" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow" };
+        },
+      },
+      codexAppServer: true,
+      capabilitySurface: "full-agent",
+      verifyCodexSandbox,
+    })).rejects.toThrow("outside read unexpectedly succeeded");
+    expect(verifyCodexSandbox).toHaveBeenCalledWith(expect.objectContaining({ codexPath }));
+    expect(capturedConfigs).toHaveLength(0);
   });
 });
