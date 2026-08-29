@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, parse } from "node:path";
 import type { RelationshipAccessPreset } from "../../security/relationship-policy.js";
 import {
   parseRemoteMcpGrants,
@@ -56,7 +56,23 @@ export interface CodexPermissionProfileInput {
   runtimeTempDirectory?: string;
   /** Exact Codex launcher used by app-server when it creates its sandbox helper process. */
   runtimeExecutable?: string;
+  /** Test seam; production discovers only known language/package-manager launchers on PATH. */
+  commandExecutables?: readonly string[];
+  /** Test seam for the shell PATH written into the isolated runtime environment. */
+  commandSearchPath?: string;
 }
+
+const PROJECT_COMMAND_EXECUTABLES = [
+  "node",
+  "npm",
+  "npx",
+  "pnpm",
+  "pnpx",
+  "yarn",
+  "yarnpkg",
+  "bun",
+  "deno",
+] as const;
 
 /**
  * Plain `chat-only` gets no profile at all. When exact MCP tools are granted, however, it gets a
@@ -95,7 +111,13 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   const developerDirectory = folders.length > 0 ? resolveDeveloperDirectory(input) : undefined;
   const runtimeTempDirectory = folders.length > 0 ? input.runtimeTempDirectory : undefined;
   const runtimeExecutablePaths = folders.length > 0 ? resolveRuntimeExecutablePaths(input.runtimeExecutable) : [];
+  const commandRuntimePaths = folders.length > 0
+    ? resolveCommandExecutablePaths(input.commandExecutables ?? [], input.platform ?? process.platform)
+    : [];
   const gitConfigGlobal = nullDevice(input.platform ?? process.platform);
+  const shellEnvironment = runtimeTempDirectory
+    ? shellEnvironmentValues(input, runtimeTempDirectory, gitConfigGlobal, developerDirectory)
+    : undefined;
 
   return [
     `default_permissions = ${tomlString(name)}`,
@@ -112,8 +134,8 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     "[shell_environment_policy]",
     'inherit = "core"',
     `exclude = [${shellEnvironmentExclusions.map(tomlString).join(", ")}]`,
-    ...(runtimeTempDirectory ? [
-      `set = { TMPDIR = ${tomlString(runtimeTempDirectory)}, GIT_CONFIG_GLOBAL = ${tomlString(gitConfigGlobal)}, GIT_CONFIG_NOSYSTEM = "1" }`,
+    ...(shellEnvironment ? [
+      `set = { ${Object.entries(shellEnvironment).map(([name, value]) => `${name} = ${tomlString(value)}`).join(", ")} }`,
     ] : []),
     "",
     `[permissions.${name}]`,
@@ -132,6 +154,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     '":minimal" = "read"',
     ...(developerDirectory ? [`${tomlString(developerDirectory)} = "read"`] : []),
     ...runtimeExecutablePaths.map((path) => `${tomlString(path)} = "read"`),
+    ...commandRuntimePaths.map((path) => `${tomlString(path)} = "read"`),
     ...(runtimeTempDirectory ? [`${tomlString(runtimeTempDirectory)} = "write"`] : []),
     ...writableFolders.map((folder) => `${tomlString(folder)} = "write"`),
     "",
@@ -162,6 +185,138 @@ function resolveRuntimeExecutablePaths(executable: string | undefined): string[]
   } catch {
     return [dirname(configured), configured];
   }
+}
+
+function resolveCommandExecutablePaths(
+  executables: readonly string[],
+  platform: NodeJS.Platform,
+): string[] {
+  const paths = new Set<string>();
+  for (const executable of executables) {
+    if (!executable.trim() || !existsSync(executable)) continue;
+    const configured = executable.trim();
+    paths.add(dirname(configured));
+    paths.add(configured);
+    try {
+      const target = realpathSync.native(configured);
+      paths.add(dirname(target));
+      paths.add(target);
+      if (/^node(?:\.exe)?$/iu.test(basename(configured)) && basename(dirname(target)) === "bin") {
+        // Dynamically linked Node distributions keep libnode and ICU data beside bin/. Grant the
+        // exact versioned runtime root, not the package-manager prefix or the owner's home.
+        paths.add(dirname(dirname(target)));
+        if (platform === "darwin") {
+          for (const dependency of macDynamicLibraryPaths(target)) paths.add(dependency);
+        }
+      }
+      const packageRoot = nearestPackageRoot(target);
+      if (packageRoot) paths.add(packageRoot);
+    } catch {
+      // The launcher and its direct directory remain the narrow fail-closed grant.
+    }
+  }
+  return [...paths];
+}
+
+function macDynamicLibraryPaths(executable: string): string[] {
+  const paths = new Set<string>();
+  const pending = [executable];
+  const visited = new Set<string>();
+  while (pending.length > 0 && visited.size < 64) {
+    const binary = pending.shift()!;
+    if (visited.has(binary)) continue;
+    visited.add(binary);
+    let output: string;
+    try {
+      output = execFileSync("/usr/bin/otool", ["-L", binary], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 2_000,
+      });
+    } catch {
+      continue;
+    }
+    for (const line of output.split("\n").slice(1)) {
+      const dependency = line.trim().match(/^(\/\S+)\s+\(/u)?.[1];
+      if (!dependency || dependency.startsWith("/usr/lib/") || dependency.startsWith("/System/Library/")) {
+        continue;
+      }
+      // dyld resolves Homebrew's formula symlink through the shared `opt` directory first. The
+      // formula and canonical Cellar roots below constrain the actual library contents.
+      paths.add(dirname(dirname(dirname(dependency))));
+      paths.add(dirname(dirname(dependency)));
+      paths.add(dirname(dependency));
+      paths.add(dependency);
+      const formulaRoot = dirname(dirname(dependency));
+      if (basename(formulaRoot).startsWith("openssl@")) {
+        const homebrewPrefix = dirname(dirname(formulaRoot));
+        paths.add(join(homebrewPrefix, "etc", basename(formulaRoot)));
+      }
+      if (!existsSync(dependency)) continue;
+      try {
+        const target = realpathSync.native(dependency);
+        paths.add(dirname(dirname(target)));
+        paths.add(dirname(target));
+        paths.add(target);
+        pending.push(target);
+      } catch {
+        // Keep the loader-declared path; dyld will fail closed if it is stale.
+      }
+    }
+  }
+  return [...paths];
+}
+
+function nearestPackageRoot(target: string): string | undefined {
+  let current = dirname(target);
+  const filesystemRoot = parse(current).root;
+  for (let depth = 0; depth < 6 && current !== filesystemRoot; depth += 1) {
+    if (existsSync(join(current, "package.json"))) return current;
+    current = dirname(current);
+  }
+  return undefined;
+}
+
+function discoverCommandExecutables(pathValue: string | undefined, platform: NodeJS.Platform): string[] {
+  if (!pathValue?.trim()) return [];
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const suffixes = platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""];
+  const discovered = new Set<string>();
+  for (const directory of pathValue.split(pathDelimiter).map((value) => value.trim()).filter(Boolean)) {
+    for (const name of PROJECT_COMMAND_EXECUTABLES) {
+      for (const suffix of suffixes) {
+        const candidate = join(directory, `${name}${suffix}`);
+        if (existsSync(candidate)) {
+          discovered.add(candidate);
+          break;
+        }
+      }
+    }
+  }
+  return [...discovered];
+}
+
+function shellEnvironmentValues(
+  input: CodexPermissionProfileInput,
+  runtimeTempDirectory: string,
+  gitConfigGlobal: string,
+  developerDirectory: string | undefined,
+): Record<string, string> {
+  const values: Record<string, string> = {
+    TMPDIR: runtimeTempDirectory,
+    NPM_CONFIG_CACHE: join(runtimeTempDirectory, "npm-cache"),
+    NPM_CONFIG_USERCONFIG: gitConfigGlobal,
+    GIT_CONFIG_GLOBAL: gitConfigGlobal,
+    GIT_CONFIG_NOSYSTEM: "1",
+  };
+  if ((input.platform ?? process.platform) === "darwin" && developerDirectory) {
+    const developerBin = join(developerDirectory, "usr", "bin");
+    const existingPath = input.commandSearchPath ?? process.env.PATH ?? "";
+    const entries = existingPath.split(":").filter((entry) => entry && entry !== developerBin);
+    values.DEVELOPER_DIR = developerDirectory;
+    values.PATH = [developerBin, ...entries].join(":");
+  }
+  return values;
 }
 
 function resolveDeveloperDirectory(input: CodexPermissionProfileInput): string | undefined {
@@ -209,7 +364,18 @@ export function writeCodexPermissionProfile(
     mkdirSync(runtimeTempDirectory, { recursive: true, mode: 0o700 });
     chmodSync(runtimeTempDirectory, 0o700);
   }
-  const profile = renderCodexPermissionProfile({ ...input, ...(runtimeTempDirectory ? { runtimeTempDirectory } : {}) });
+  const platform = input.platform ?? process.platform;
+  const developerDirectory = hasProjectAccess ? resolveDeveloperDirectory(input) : undefined;
+  const commandExecutables = hasProjectAccess
+    ? input.commandExecutables ?? discoverCommandExecutables(input.commandSearchPath ?? process.env.PATH, platform)
+    : [];
+  const profile = renderCodexPermissionProfile({
+    ...input,
+    platform,
+    commandExecutables,
+    ...(developerDirectory ? { developerDirectory } : {}),
+    ...(runtimeTempDirectory ? { runtimeTempDirectory } : {}),
+  });
   if (!profile) return undefined;
   writeFileSync(join(directory, "config.toml"), profile, { mode: 0o600 });
   // CODEX_HOME isolates the owner's settings, plugins and MCP configuration, but Codex also
@@ -221,17 +387,14 @@ export function writeCodexPermissionProfile(
     copyFileSync(authFile, join(directory, "auth.json"));
     chmodSync(join(directory, "auth.json"), 0o600);
   }
+  const environment = runtimeTempDirectory
+    ? shellEnvironmentValues(input, runtimeTempDirectory, gitConfigGlobal, developerDirectory)
+    : undefined;
   return {
     codexHome: directory,
     profileName: input.profileName ?? CODEX_PROFILE_NAME,
     workspaceRoots: [...new Set(input.folders)],
-    ...(runtimeTempDirectory ? {
-      environment: {
-        TMPDIR: runtimeTempDirectory,
-        GIT_CONFIG_GLOBAL: gitConfigGlobal,
-        GIT_CONFIG_NOSYSTEM: "1",
-      },
-    } : {}),
+    ...(environment ? { environment } : {}),
   };
 }
 
