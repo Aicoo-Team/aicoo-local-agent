@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CODEX_PROFILE_NAME,
@@ -50,6 +50,31 @@ describe("codex permission profile", () => {
     })!;
 
     expect(profile).toContain('"/Library/Developer/CommandLineTools" = "read"');
+  });
+
+  it("allows the configured Codex launcher, its target, and the directories needed to execute them", () => {
+    const dir = tempDir("codex-runtime-path-");
+    const launcherDirectory = join(dir, "launcher");
+    const targetDirectory = join(dir, "runtime");
+    mkdirSync(launcherDirectory);
+    mkdirSync(targetDirectory);
+    const target = join(targetDirectory, "codex-real");
+    const launcher = join(launcherDirectory, "codex");
+    writeFileSync(target, "runtime");
+    symlinkSync(target, launcher);
+
+    const profile = renderCodexPermissionProfile({
+      preset: "read-project",
+      folders: ["/srv/project"],
+      runtimeExecutable: launcher,
+    })!;
+
+    expect(profile).toContain(`${JSON.stringify(launcherDirectory)} = "read"`);
+    expect(profile).toContain(`${JSON.stringify(launcher)} = "read"`);
+    const resolvedTarget = realpathSync.native(target);
+    expect(profile).toContain(`${JSON.stringify(dirname(resolvedTarget))} = "read"`);
+    expect(profile).toContain(`${JSON.stringify(resolvedTarget)} = "read"`);
+    expect(profile).not.toContain(`${JSON.stringify(dir)} = "read"`);
   });
 
   it("uses the native null device for Git in Windows project sessions", () => {

@@ -132,6 +132,7 @@ export class CodexAdapter implements RuntimeAdapter {
           return "decline";
         }
         const rawShell = request.kind === "commandExecution" && !gitOperation;
+        const rawShellTool = sessionAccess?.preset === "read-project" ? "Read" : "Edit";
         if (rawShell) {
           const hardened = hardenBashInput({ command: request.command ?? request.summary.replace(/^Run:\s*/u, "") });
           if (hardened.behavior === "deny") {
@@ -146,9 +147,16 @@ export class CodexAdapter implements RuntimeAdapter {
           const actions = gitOperation
             ? [{ toolName: gitOperation.toolName, input: { repository: gitOperation.repository } }]
             : rawShell
-              ? [{ toolName: "Edit", input: { file_path: request.cwd ?? turnCwd } }]
-            : request.kind === "fileChange" && request.paths?.length
-              ? request.paths.map((path) => ({ toolName: "Edit", input: { file_path: path } }))
+              ? [{ toolName: rawShellTool, input: { file_path: request.cwd ?? turnCwd } }]
+            : request.kind === "fileChange"
+              ? request.paths?.length
+                ? request.paths.map((path) => ({ toolName: "Edit", input: { file_path: path } }))
+                : sessionAccess?.preset === "edit-project"
+                  // Some Codex app-server file-change requests omit paths. Treat the granted
+                  // project root as the policy target; the immutable edit-project sandbox still
+                  // confines the eventual write to the owner-approved writable roots.
+                  ? [{ toolName: "Edit", input: { file_path: turnCwd } }]
+                  : []
               : [];
           boundaryAllowed = actions.length > 0;
           for (const action of actions) {
@@ -199,6 +207,14 @@ export class CodexAdapter implements RuntimeAdapter {
           this.#config.log?.("codex approval denied: request is outside the active session boundary");
           return "decline";
         }
+        if (rawShell && rawShellTool === "Read") {
+          // The owner already approved this exact read-only folder boundary. Codex commonly
+          // implements Read with sed/cat/rg commandExecution requests; asking the control plane
+          // again adds no authority because the immutable kernel profile still denies writes,
+          // out-of-folder reads, and network access.
+          this.#config.log?.("codex read command accepted inside the active read-only kernel boundary");
+          return "accept";
+        }
         const outcome = await awaitToolApproval(
           gateway,
           {
@@ -206,7 +222,15 @@ export class CodexAdapter implements RuntimeAdapter {
             sessionHandle,
             ...(message.id ? { messageId: message.id } : {}),
             // The owner reads one line, so it names the command, not the mechanism.
-            toolName: gitOperation?.toolName ?? (rawShell ? "Bash" : request.kind === "fileChange" ? "Edit" : "Permissions"),
+            // A read-project kernel profile cannot mutate or reach the network, even when Codex
+            // implements a read using sed/rg through commandExecution. Route that operation
+            // through the already-granted Read capability; edit-project raw shell remains Bash
+            // and still needs its own explicit owner decision.
+            toolName: gitOperation?.toolName ?? (
+              rawShell
+                ? rawShellTool === "Read" ? "Read" : "Bash"
+                : request.kind === "fileChange" ? "Edit" : "Permissions"
+            ),
             toolInputSummary: gitOperation?.summary ?? request.summary,
           },
           { log: this.#config.log },
@@ -453,6 +477,7 @@ export class CodexAdapter implements RuntimeAdapter {
             preset: accessPreset,
             folders: grantedFolders,
             writableFolders,
+            ...(this.#config.codexPath ? { runtimeExecutable: this.#config.codexPath } : {}),
             ...(mcpServers.length > 0 ? { mcpServers } : {}),
           });
         }

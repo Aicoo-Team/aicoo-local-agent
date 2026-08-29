@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { RelationshipAccessPreset } from "../../security/relationship-policy.js";
 import {
   parseRemoteMcpGrants,
@@ -54,6 +54,8 @@ export interface CodexPermissionProfileInput {
   developerDirectory?: string;
   /** Private scratch directory for system-tool caches; never shared with the project. */
   runtimeTempDirectory?: string;
+  /** Exact Codex launcher used by app-server when it creates its sandbox helper process. */
+  runtimeExecutable?: string;
 }
 
 /**
@@ -92,6 +94,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   ])];
   const developerDirectory = folders.length > 0 ? resolveDeveloperDirectory(input) : undefined;
   const runtimeTempDirectory = folders.length > 0 ? input.runtimeTempDirectory : undefined;
+  const runtimeExecutablePaths = folders.length > 0 ? resolveRuntimeExecutablePaths(input.runtimeExecutable) : [];
   const gitConfigGlobal = nullDevice(input.platform ?? process.platform);
 
   return [
@@ -128,6 +131,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     '":root" = "deny"',
     '":minimal" = "read"',
     ...(developerDirectory ? [`${tomlString(developerDirectory)} = "read"`] : []),
+    ...runtimeExecutablePaths.map((path) => `${tomlString(path)} = "read"`),
     ...(runtimeTempDirectory ? [`${tomlString(runtimeTempDirectory)} = "write"`] : []),
     ...writableFolders.map((folder) => `${tomlString(folder)} = "write"`),
     "",
@@ -143,6 +147,21 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     "",
     ...(mcpConfig ? [mcpConfig, ""] : []),
   ].join("\n");
+}
+
+function resolveRuntimeExecutablePaths(executable: string | undefined): string[] {
+  if (!executable?.trim()) return [];
+  const configured = executable.trim();
+  if (!existsSync(configured)) return [];
+  try {
+    const target = realpathSync.native(configured);
+    // macOS Seatbelt needs directory traversal permission before execvp can reach an
+    // otherwise-readable file. Keep this narrow: grant only each executable's direct
+    // parent plus the configured launcher and resolved target, never an ancestor tree.
+    return [...new Set([dirname(configured), configured, dirname(target), target])];
+  } catch {
+    return [dirname(configured), configured];
+  }
 }
 
 function resolveDeveloperDirectory(input: CodexPermissionProfileInput): string | undefined {
