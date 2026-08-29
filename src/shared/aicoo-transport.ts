@@ -35,6 +35,7 @@ import type {
 const LA = "/api/v1/local-agent";
 const LR = "/api/v1/local-realtime";
 const DEFAULT_DELEGATION_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_TOOL_APPROVAL_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 10_000;
 
 /**
@@ -558,7 +559,16 @@ export class AicooTransport extends HttpMessageTransport {
     decision: "allow" | "deny" | null;
     scope?: "once" | "session" | null;
   }> {
-    return this.requestJson(`${LA}/tool-approvals`, { method: "POST", body: input });
+    // Approval creation performs authorization, exact folder-policy matching, precedent lookup,
+    // durable persistence, and owner notification. Let that control-plane transaction outlive
+    // the transport-wide heartbeat cap. Do not retry this mutation until the protocol carries a
+    // server-enforced idempotency key, otherwise a lost response could create duplicate cards.
+    return this.requestJson(`${LA}/tool-approvals`, {
+      method: "POST",
+      body: input,
+      timeoutMs: DEFAULT_TOOL_APPROVAL_REQUEST_TIMEOUT_MS,
+      attempts: 1,
+    });
   }
 
   async getToolApproval(approvalId: string): Promise<{

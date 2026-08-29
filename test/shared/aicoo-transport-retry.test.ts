@@ -132,6 +132,31 @@ describe("hosted transport retry", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it("allows tool-approval creation to outlive the transport-wide timeout without duplicating it", async () => {
+    const fetchImpl = vi.fn(((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(Response.json({
+        approvalId: "appr-1",
+        status: "pending",
+        decision: null,
+      })), 30);
+      init?.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject((init.signal as AbortSignal).reason);
+      });
+    })) as unknown as typeof fetch);
+
+    await expect(
+      transport(fetchImpl, 10).requestToolApproval({
+        communicationSessionId: "comm-1",
+        sessionHandle: "rs-owner",
+        messageId: "msg-1",
+        toolName: "Edit",
+        toolInputSummary: "Modify files",
+      }),
+    ).resolves.toMatchObject({ approvalId: "appr-1", status: "pending" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("honors the delegation-specific submission timeout across idempotent retries", async () => {
     const fetchImpl = vi.fn(hangingFetch());
 
