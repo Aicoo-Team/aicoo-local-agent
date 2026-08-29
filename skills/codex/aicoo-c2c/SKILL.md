@@ -209,11 +209,27 @@ A running command is not evidence that the owner has not acted. Approval
 delivery, session startup, and the peer's work can all happen before the final
 reply is printed. While `ccd delegate` is still running, never tell the user
 that approval is still pending, repeat the approval ID as if action is still
-required, or infer a failure from elapsed time. If a progress update is needed,
-say only: "The same delegation is still running; I’ll continue waiting."
-Report pending, denied, failed, or timed out only after `ccd` returns that
-terminal result. This prevents a successful approval from being described as
-unapproved moments before its answer arrives.
+required, or infer a failure from elapsed time. Do not send repeated unchanged
+progress updates. Report a progress update only when the command exposes a new
+stage or the user needs to act. If no state changed, keep waiting on the same
+command instead of restating that it is running.
+
+When the CLI explicitly prints a collaboration or file-access request, guide
+the user once with concrete information from that output:
+
+```text
+Access needed: <collaboration or file access, including the known project>
+Owner action: Open Aicoo as <recipient> and review the request; choose the
+appropriate Deny, Allow once, or Always allow option shown there.
+Why: <the task step that requires the access>
+```
+
+Tell the user exactly what decision is needed and where to make it. Do not
+invent a requested folder, permission, or approval state that the CLI did not
+report. After that notice, do not keep repeating it while the same command is
+running. Report denied, failed, expired, or timed out only after `ccd` returns
+that terminal result. This prevents a successful approval from being described
+as unapproved moments before its answer arrives.
 
 Use `--no-wait` only when the user explicitly wants asynchronous dispatch. In
 that mode, tell the user the task was sent and that the reply will arrive later
@@ -227,14 +243,16 @@ partially collected result as the finished deliverable.
 
 ## Final Delivery
 
-After `ccd goal` returns, synthesize its result bundle into exactly one user-facing
-artifact with this shape:
+After `ccd delegate` or `ccd goal` returns, synthesize its result into exactly
+one user-facing artifact with this shape:
 
 ```text
-Outcome: <the completed proposal, launch artifact, or decision>
-Evidence: <only the facts that materially support it>
-Approvals: <human decisions and their scope>
-Open risks: <remaining blockers, or "none">
+Outcome: <the completed result, or "incomplete" plus the terminal reason>
+Actions completed:
+- <action attempted> — <result>
+Approvals: <human decisions and their scope, or "none">
+Failures or skipped actions: <items with reasons, or "none">
+Remaining work: <specific next step, or "none">
 ```
 
 Do not paste the result bundle or peer-agent transcript. If any required subtask
