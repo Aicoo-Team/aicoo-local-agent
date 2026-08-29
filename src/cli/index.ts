@@ -54,11 +54,15 @@ import {
 import {
   assertRuntimeAvailable,
   authorizeDevice,
+  bridgeLaunchConfigMatches,
   formatTeamAgentWelcome,
   launchDetachedBridge,
   nodeMeetsMinimumVersion,
+  readRegisteredEndpointId,
   readRunningProcessId,
   resolveOnboardingRuntimeFiles,
+  stopManagedBridge,
+  type BridgeLaunchConfig,
   waitForBridgeReady,
 } from "./onboarding.js";
 import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
@@ -211,10 +215,24 @@ program.command("onboard")
     }
 
     const { logFile, pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
-    const runningPid = readRunningProcessId(pidFile);
+    let runningPid = readRunningProcessId(pidFile);
     if (runningPid) {
-      console.log(`✓ Existing local bridge process found (${runningPid})`);
-    } else {
+      const existingConfig = readBridgeLaunchConfig(options.spool);
+      const requestedConfig: BridgeLaunchConfig = {
+        runtime: options.runtime,
+        capabilitySurface: options.capabilitySurface,
+        workspace: resolve(options.workspace),
+      };
+      if (bridgeLaunchConfigMatches(existingConfig, requestedConfig)) {
+        console.log(`✓ Existing local bridge process found (${runningPid})`);
+      } else {
+        console.log(`Existing bridge configuration differs; restarting process ${runningPid}.`);
+        await stopManagedBridge(runningPid);
+        runningPid = undefined;
+      }
+    }
+    if (!runningPid) {
+      clearLocalEndpointIdentity(options.spool);
       const cliEntry = process.argv[1];
       if (!cliEntry) throw new Error("Cannot determine the ccd CLI entry point.");
       const started = launchDetachedBridge({
@@ -230,18 +248,7 @@ program.command("onboard")
       console.log(`✓ Local bridge started in the background (${started.pid})`);
     }
 
-    const readLocalEndpointId = () => {
-      try {
-        const spool = new BridgeSpool(options.spool);
-        try {
-          return spool.listSessionMappings().length > 0 ? spool.getIdentity("endpointId") : undefined;
-        } finally {
-          spool.close();
-        }
-      } catch {
-        return undefined;
-      }
-    };
+    const readLocalEndpointId = () => readRegisteredEndpointId(options.spool);
     const readyTimeoutMs = Number.parseInt(options.readyTimeout, 10);
     if (!Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs <= 0) {
       throw new Error("--ready-timeout must be a positive number of milliseconds.");
@@ -1231,6 +1238,9 @@ async function startBridge(options: {
   spool.setIdentity("ownerDeviceId", ownerIdentity.deviceId);
   spool.setIdentity("bridgeInstanceId", bridgeInstanceId);
   spool.setIdentity("spoolFile", resolve(options.spool));
+  spool.setIdentity("launchRuntime", selected.runtime);
+  spool.setIdentity("launchCapabilitySurface", capabilityActivation.active);
+  spool.setIdentity("launchWorkspace", resolve(options.workspace ?? process.cwd()));
   // This watchdog owns a separate event loop. Unlike heartbeat timers in this process, it can
   // still stop the daemon if runtime execution completely starves the bridge's main thread.
   const processWatchdog = startProcessWatchdog({
@@ -1315,6 +1325,40 @@ async function startBridge(options: {
   };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+}
+
+function readBridgeLaunchConfig(spoolFile: string): BridgeLaunchConfig | undefined {
+  try {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      const runtime = spool.getIdentity("launchRuntime");
+      const capabilitySurface = spool.getIdentity("launchCapabilitySurface");
+      const workspace = spool.getIdentity("launchWorkspace");
+      if ((runtime !== "claude-code" && runtime !== "codex")
+        || (capabilitySurface !== "restricted" && capabilitySurface !== "full-agent")
+        || !workspace) {
+        return undefined;
+      }
+      return { runtime, capabilitySurface, workspace };
+    } finally {
+      spool.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function clearLocalEndpointIdentity(spoolFile: string): void {
+  try {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      spool.deleteIdentity("endpointId");
+    } finally {
+      spool.close();
+    }
+  } catch {
+    // A new spool has no endpoint identity to clear.
+  }
 }
 
 function resolveRunningRelationshipPolicy(explicitPolicy: string | undefined, spoolFile: string): string {

@@ -4,15 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   authorizeDevice,
+  bridgeLaunchConfigMatches,
   formatTeamAgentWelcome,
   launchDetachedBridge,
   nodeMeetsMinimumVersion,
+  readRegisteredEndpointId,
   readRunningProcessId,
   resolveOnboardingRuntimeFiles,
+  stopManagedBridge,
   waitForBridgeReady,
   type DeviceAuthorizationClient,
 } from "../../src/cli/onboarding.js";
 import { ApiError } from "../../src/shared/http-client.js";
+import { BridgeSpool } from "../../src/bridge/spool.js";
 
 describe("local-agent onboarding", () => {
   it("opens the approval page and continues after one human approval", async () => {
@@ -141,6 +145,53 @@ describe("local-agent onboarding", () => {
     writeFileSync(pidFile, "4321\n");
     expect(readRunningProcessId(pidFile, (pid) => pid === 4321)).toBe(4321);
     expect(readRunningProcessId(pidFile, () => false)).toBeUndefined();
+  });
+
+  it("recognizes a freshly registered endpoint before any collaboration session exists", () => {
+    const spoolFile = join(mkdtempSync(join(tmpdir(), "ccd-onboarding-ready-")), "bridge.spool");
+    const spool = new BridgeSpool(spoolFile);
+    spool.setIdentity("endpointId", "endpoint-fresh");
+    expect(spool.listSessionMappings()).toHaveLength(0);
+    spool.close();
+
+    expect(readRegisteredEndpointId(spoolFile)).toBe("endpoint-fresh");
+  });
+
+  it("does not reuse a restricted bridge when onboarding requests full-agent", () => {
+    expect(bridgeLaunchConfigMatches({
+      runtime: "codex",
+      capabilitySurface: "restricted",
+      workspace: "/tmp/project",
+    }, {
+      runtime: "codex",
+      capabilitySurface: "full-agent",
+      workspace: "/tmp/project",
+    })).toBe(false);
+  });
+
+  it("reuses a bridge only when runtime, capability surface, and workspace match", () => {
+    const config = {
+      runtime: "codex" as const,
+      capabilitySurface: "full-agent" as const,
+      workspace: "/tmp/project",
+    };
+    expect(bridgeLaunchConfigMatches(config, config)).toBe(true);
+    expect(bridgeLaunchConfigMatches(undefined, config)).toBe(false);
+    expect(bridgeLaunchConfigMatches({ ...config, workspace: "/tmp/other" }, config)).toBe(false);
+  });
+
+  it("stops a managed bridge before relaunching it with a different configuration", async () => {
+    let running = true;
+    const signalProcess = vi.fn(() => {
+      running = false;
+    });
+
+    await expect(stopManagedBridge(4321, {
+      signalProcess,
+      probe: () => running,
+      delay: vi.fn().mockResolvedValue(undefined),
+    })).resolves.toBeUndefined();
+    expect(signalProcess).toHaveBeenCalledWith(4321, "SIGTERM");
   });
 
   it("isolates detached PID and log files for custom spools in one directory", () => {

@@ -9,12 +9,28 @@ import {
 } from "../shared/http-client.js";
 import type { TeamAgentDirectory } from "../shared/contracts.js";
 import type { CapabilitySurface } from "../shared/capability-rollout.js";
+import { BridgeSpool } from "../bridge/spool.js";
 
 const MINIMUM_NODE_VERSION = [22, 5, 0] as const;
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_READY_POLL_INTERVAL_MS = 1_000;
 
 export type OnboardingRuntime = "claude-code" | "codex";
+
+export interface BridgeLaunchConfig {
+  runtime: OnboardingRuntime;
+  capabilitySurface: CapabilitySurface;
+  workspace: string;
+}
+
+export function bridgeLaunchConfigMatches(
+  actual: BridgeLaunchConfig | undefined,
+  requested: BridgeLaunchConfig,
+): boolean {
+  return actual?.runtime === requested.runtime
+    && actual.capabilitySurface === requested.capabilitySurface
+    && resolve(actual.workspace) === resolve(requested.workspace);
+}
 
 export interface DeviceAuthorizationClient {
   startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse>;
@@ -256,6 +272,41 @@ export function readRunningProcessId(
     return Number.isSafeInteger(pid) && pid > 0 && probe(pid) ? pid : undefined;
   } catch {
     return undefined;
+  }
+}
+
+export function readRegisteredEndpointId(spoolFile: string): string | undefined {
+  try {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      return spool.getIdentity("endpointId");
+    } finally {
+      spool.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+export async function stopManagedBridge(
+  pid: number,
+  options: {
+    signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
+    probe?: (pid: number) => boolean;
+    delay?: (milliseconds: number) => Promise<void>;
+    timeoutMs?: number;
+  } = {},
+): Promise<void> {
+  const signalProcess = options.signalProcess ?? ((target, signal) => process.kill(target, signal));
+  const probe = options.probe ?? defaultProcessProbe;
+  const delay = options.delay ?? defaultDelay;
+  signalProcess(pid, "SIGTERM");
+  const deadline = Date.now() + (options.timeoutMs ?? 10_000);
+  while (probe(pid) && Date.now() < deadline) {
+    await delay(100);
+  }
+  if (probe(pid)) {
+    throw new Error(`Local bridge process ${pid} did not stop after SIGTERM.`);
   }
 }
 
