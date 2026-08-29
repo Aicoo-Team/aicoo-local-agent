@@ -14,6 +14,7 @@ import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInp
 import { ApiError, HttpMessageTransport, type ResolvedPersonResponse } from "../shared/http-client.js";
 import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
 import type { ToolApprovalGateway } from "../shared/tool-approval.js";
+import { LocalToolApprovalGateway } from "../shared/local-tool-approval.js";
 import {
   resetRelationshipPolicy,
   upsertRelationshipPreset,
@@ -57,11 +58,14 @@ import {
   launchDetachedBridge,
   nodeMeetsMinimumVersion,
   readRunningProcessId,
+  resolveOnboardingRuntimeFiles,
   waitForBridgeReady,
 } from "./onboarding.js";
 import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
 import {
+  DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS,
   evaluateCapabilityRollout,
+  isLoopbackControlPlane,
   resolveCapabilitySurface,
   type CapabilitySurfaceActivation,
   type CapabilitySurface,
@@ -76,6 +80,7 @@ const DEFAULT_SPOOL = process.env.CCD_SPOOL?.trim()
 
 const program = new Command()
   .name("ccd")
+  .version("0.5.0")
   .description("aicoo-local-agent realtime runtime-messaging CLI")
   .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? LOCAL_SERVER_URL)
   .option("--token <token>", "device bearer token", process.env.CCD_TOKEN);
@@ -205,9 +210,7 @@ program.command("onboard")
       console.log("✓ Identity verified and device authorization saved");
     }
 
-    const localAgentDirectory = dirname(resolve(options.spool));
-    const logFile = join(localAgentDirectory, "bridge.log");
-    const pidFile = join(localAgentDirectory, "bridge.pid");
+    const { logFile, pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
     const runningPid = readRunningProcessId(pidFile);
     if (runningPid) {
       console.log(`✓ Existing local bridge process found (${runningPid})`);
@@ -1151,7 +1154,15 @@ async function startBridge(options: {
   } finally {
     readinessSpool.close();
   }
-  const rebuildReadiness = evaluateCapabilityRollout(boundaryMetrics);
+  const selectedServer = options.server ?? program.opts<{ server: string }>().server;
+  // Pulse localhost uses the hosted/Aicoo protocol so browser approvals work, but it is still a
+  // local functional test. Only literal loopback hosts get the zero-sample exception; preview,
+  // production and remote self-hosted deployments retain the production evidence threshold.
+  const localFunctionalValidation = isLoopbackControlPlane(selectedServer);
+  const rolloutThresholds = localFunctionalValidation
+    ? { ...DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS, minimumEligibleTasks: 0 }
+    : DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS;
+  const rebuildReadiness = evaluateCapabilityRollout(boundaryMetrics, rolloutThresholds);
   if (options.capabilitySurface === "full-agent" && !rebuildReadiness.eligible) {
     throw new Error(`full-agent capability is not ready: ${rebuildReadiness.reasons.join(", ")}`);
   }
@@ -1167,9 +1178,14 @@ async function startBridge(options: {
   const ownerIdentity = await transport.whoami();
   // Only the hosted transport can reach the approval endpoints; a self-hosted mock cannot, and
   // wiring it anyway would turn every un-preauthorized tool into a confusing runtime error.
-  const approvalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
+  const hostedApprovalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
     ? (transport as unknown as ToolApprovalGateway)
     : undefined;
+  const approvalGateway = hostedApprovalGateway ?? (
+    !options.hosted && process.stdin.isTTY && process.stdout.isTTY
+      ? new LocalToolApprovalGateway({ log: console.log })
+      : undefined
+  );
   const codexAppServer = options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1";
   const capabilityActivation: CapabilitySurfaceActivation = resolveCapabilitySurface(
     options.capabilitySurface ?? "restricted",
@@ -1179,6 +1195,7 @@ async function startBridge(options: {
       ownerApprovalGateway: Boolean(approvalGateway),
       ...(options.adapter === "codex" ? { codexAppServer } : {}),
     },
+    rolloutThresholds,
   );
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
@@ -1231,6 +1248,7 @@ async function startBridge(options: {
     ownerPrincipalId: ownerIdentity.principalId,
     ownerDeviceId: ownerIdentity.deviceId,
     bridgeInstanceId,
+    capabilitySurface: capabilityActivation.active,
     log: console.log,
   });
   let localHelper: ReturnType<typeof startLocalHelper> | undefined;

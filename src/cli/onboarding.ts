@@ -26,6 +26,24 @@ export interface BridgeReadinessClient {
   heartbeatEndpoint(endpointId: string): Promise<void>;
 }
 
+export function resolveOnboardingRuntimeFiles(
+  spoolFile: string,
+  defaultSpoolFile: string,
+): { logFile: string; pidFile: string } {
+  const spoolPath = resolve(spoolFile);
+  if (spoolPath === resolve(defaultSpoolFile)) {
+    const directory = dirname(spoolPath);
+    return {
+      logFile: resolve(directory, "bridge.log"),
+      pidFile: resolve(directory, "bridge.pid"),
+    };
+  }
+  return {
+    logFile: `${spoolPath}.bridge.log`,
+    pidFile: `${spoolPath}.bridge.pid`,
+  };
+}
+
 function relationshipLabel(relationships: TeamAgentDirectory["agents"][number]["relationships"]): string {
   const isTeam = relationships?.includes("team") ?? false;
   const isFriend = relationships?.includes("friend") ?? false;

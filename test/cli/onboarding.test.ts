@@ -8,6 +8,7 @@ import {
   launchDetachedBridge,
   nodeMeetsMinimumVersion,
   readRunningProcessId,
+  resolveOnboardingRuntimeFiles,
   waitForBridgeReady,
   type DeviceAuthorizationClient,
 } from "../../src/cli/onboarding.js";
@@ -140,6 +141,27 @@ describe("local-agent onboarding", () => {
     writeFileSync(pidFile, "4321\n");
     expect(readRunningProcessId(pidFile, (pid) => pid === 4321)).toBe(4321);
     expect(readRunningProcessId(pidFile, () => false)).toBeUndefined();
+  });
+
+  it("isolates detached PID and log files for custom spools in one directory", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-onboarding-profiles-"));
+    const defaultSpool = join(directory, "bridge.spool");
+    const abhinav = resolveOnboardingRuntimeFiles(join(directory, "abhinav.spool"), defaultSpool);
+    const omkar = resolveOnboardingRuntimeFiles(join(directory, "omkar.spool"), defaultSpool);
+
+    expect(abhinav).toEqual({
+      logFile: join(directory, "abhinav.spool.bridge.log"),
+      pidFile: join(directory, "abhinav.spool.bridge.pid"),
+    });
+    expect(omkar).toEqual({
+      logFile: join(directory, "omkar.spool.bridge.log"),
+      pidFile: join(directory, "omkar.spool.bridge.pid"),
+    });
+    expect(abhinav).not.toEqual(omkar);
+    expect(resolveOnboardingRuntimeFiles(defaultSpool, defaultSpool)).toEqual({
+      logFile: join(directory, "bridge.log"),
+      pidFile: join(directory, "bridge.pid"),
+    });
   });
 
   it("propagates the selected server and spool to managed agent commands", () => {

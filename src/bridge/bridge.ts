@@ -26,6 +26,11 @@ import type {
 import { ApiError, HttpMessageTransport } from "../shared/http-client.js";
 import { id } from "../shared/ids.js";
 import { ContinuationStore } from "../shared/continuation-store.js";
+import type { CapabilitySurface } from "../shared/capability-rollout.js";
+import {
+  GOVERNED_AGENT_CAPABILITIES,
+  GOVERNED_AGENT_SURFACE,
+} from "../shared/governed-agent-access.js";
 import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import { ContinuationRecovery } from "./continuation-recovery.js";
 import { Injector, noOpInjectionHooks, type InjectionHooks } from "./injector.js";
@@ -52,6 +57,7 @@ export interface BridgeOptions {
   bridgeVersion?: string;
   adapterVersion?: string;
   workspaceBoundary?: string;
+  capabilitySurface?: CapabilitySurface;
   heartbeatMs?: number;
   heartbeatFailureThreshold?: number;
   heartbeatMaxBackoffMs?: number;
@@ -129,6 +135,9 @@ export class RuntimeBridge {
         ?? (this.options.adapter instanceof FakeRuntimeAdapter ? FakeRuntimeAdapter.adapterVersion : "unknown"),
       capabilities: [
         ...Object.entries(adapterCapabilities).filter(([, value]) => value).map(([key]) => key),
+        ...(this.options.capabilitySurface === "full-agent"
+          ? [GOVERNED_AGENT_SURFACE, ...GOVERNED_AGENT_CAPABILITIES]
+          : []),
         `bridge-instance:${this.#bridgeInstanceId}`,
       ],
     });
