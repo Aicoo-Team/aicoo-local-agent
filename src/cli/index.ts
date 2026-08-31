@@ -56,6 +56,7 @@ import {
   assertRuntimeAvailable,
   authorizeDevice,
   bridgeLaunchConfigMatches,
+  formatCapabilitySurfaceStatus,
   formatTeamAgentWelcome,
   inspectManagedBridge,
   launchDetachedBridge,
@@ -270,6 +271,11 @@ program.command("onboard")
     console.log("\nAicoo Local Agent is ready.");
     console.log(`Runtime: ${options.runtime}`);
     console.log(`Endpoint: ${ready.endpointId}`);
+    const bridgeStatus = inspectManagedBridge({ spoolFile: options.spool, pidFile });
+    console.log(formatCapabilitySurfaceStatus({
+      requested: bridgeStatus.requestedCapabilitySurface ?? options.capabilitySurface,
+      active: bridgeStatus.capabilitySurface ?? options.capabilitySurface,
+    }));
     console.log(`Logs: ${logFile}`);
     try {
       const directory = await makeHostedClient(server, options.spool).listAgentDirectory();
@@ -1245,8 +1251,8 @@ async function startBridge(options: {
   }
   const selectedServer = options.server ?? program.opts<{ server: string }>().server;
   // Pulse localhost uses the hosted/Aicoo protocol so browser approvals work, but it is still a
-  // local functional test. Only literal loopback hosts get the zero-sample exception; preview,
-  // production and remote self-hosted deployments retain the production evidence threshold.
+  // local functional test. Apply health thresholds immediately there; hosted and remote bridges
+  // wait for a representative local sample before machine-specific telemetry can downgrade them.
   const localFunctionalValidation = isLoopbackControlPlane(selectedServer);
   const rolloutThresholds = localFunctionalValidation
     ? { ...DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS, minimumEligibleTasks: 0 }

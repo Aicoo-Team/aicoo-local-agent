@@ -300,6 +300,14 @@ export interface ManagedBridgeStatus {
   workspace?: string;
 }
 
+export function formatCapabilitySurfaceStatus(input: {
+  requested: CapabilitySurface;
+  active: CapabilitySurface;
+}): string {
+  if (input.active === input.requested) return `Capability: ${input.active}`;
+  return `Capability: ${input.active} (requested ${input.requested}; local rebuild health is outside its limits)`;
+}
+
 export function inspectManagedBridge(options: {
   spoolFile: string;
   pidFile: string;

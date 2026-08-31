@@ -28,7 +28,6 @@ export function isLoopbackControlPlane(serverUrl: string): boolean {
 }
 
 export type CapabilityRolloutBlocker =
-  | "insufficient_sample"
   | "rebuild_rate_too_high"
   | "rebuild_failure_rate_too_high"
   | "rebuild_latency_too_high";
@@ -78,21 +77,28 @@ export interface CapabilitySurfaceActivation {
   security: CapabilitySecurityDecision;
 }
 
-/** Fail-closed evidence gate for enabling the wider C2C capability surface. */
+/**
+ * Local health gate for a wider C2C capability surface.
+ *
+ * A new bridge has no local history, which is not evidence of failure. The minimum sample is the
+ * point at which local rebuild rates become representative enough to downgrade this machine.
+ * Security eligibility is evaluated separately and never receives this warm-up behavior.
+ */
 export function evaluateCapabilityRollout(
   metrics: BoundaryMetricsSnapshot,
   thresholds: CapabilityRolloutThresholds = DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS,
 ): CapabilityRolloutDecision {
   const reasons: CapabilityRolloutBlocker[] = [];
-  if (metrics.eligibleTasks < thresholds.minimumEligibleTasks) reasons.push("insufficient_sample");
-  if (metrics.rebuildRate > thresholds.maximumRebuildRate) reasons.push("rebuild_rate_too_high");
-  if (metrics.rebuildFailureRate > thresholds.maximumRebuildFailureRate) {
-    reasons.push("rebuild_failure_rate_too_high");
+  if (metrics.eligibleTasks >= thresholds.minimumEligibleTasks) {
+    if (metrics.rebuildRate > thresholds.maximumRebuildRate) reasons.push("rebuild_rate_too_high");
+    if (metrics.rebuildFailureRate > thresholds.maximumRebuildFailureRate) {
+      reasons.push("rebuild_failure_rate_too_high");
+    }
+    if (
+      metrics.rebuildLatencyP95Ms !== null
+      && metrics.rebuildLatencyP95Ms > thresholds.maximumRebuildP95Ms
+    ) reasons.push("rebuild_latency_too_high");
   }
-  if (
-    metrics.rebuildLatencyP95Ms !== null
-    && metrics.rebuildLatencyP95Ms > thresholds.maximumRebuildP95Ms
-  ) reasons.push("rebuild_latency_too_high");
   return { eligible: reasons.length === 0, reasons, thresholds, metrics };
 }
 
@@ -130,19 +136,12 @@ export function evaluateCapabilitySecurity(
  * there has no safe fallback that still honours the request, so it throws and the bridge
  * refuses to start.
  *
- * `evaluateCapabilityRollout` asks a quality question: has this machine shown that boundary
- * rebuilding is rare, reliable and fast? A "no" there — and `insufficient_sample`, meaning the
- * machine has not shown anything yet, is the answer every new bridge gives — is not a reason to
- * refuse to start. It is a reason to come up on the narrower surface. Throwing made the first
- * ever run of `--capability-surface full-agent` fail against a hosted control plane, and because
- * `ccd onboard` launches the bridge detached, the reason only ever reached a log file while the
- * owner watched a bidirectional-readiness timeout.
+ * `evaluateCapabilityRollout` asks a quality question: once this machine has a representative
+ * local sample, are boundary rebuilds rare, reliable and fast? Missing history is not a negative
+ * result; otherwise every new hosted bridge would be unable to start the requested surface.
  *
- * So a rollout blocker degrades instead. `active` is the surface the caller must use; the wider
- * capability set is simply never advertised while it is `restricted`, which is the same posture
- * the owner would have had by asking for `restricted` in the first place. Evidence accrues from
- * ordinary folder-scoped tasks, so a later restart activates full-agent without the owner having
- * to know this gate exists.
+ * An observed rollout blocker degrades instead. `active` is the surface the caller must use; the
+ * wider capability set is never advertised while it is `restricted`.
  */
 export function resolveCapabilitySurface(
   requested: CapabilitySurface,
@@ -165,10 +164,7 @@ export function describeCapabilityDegradation(
 ): string | undefined {
   if (activation.active === activation.requested) return undefined;
   const { rollout } = activation;
-  const detail = rollout.reasons.includes("insufficient_sample")
-    ? `${Math.max(rollout.thresholds.minimumEligibleTasks - rollout.metrics.eligibleTasks, 0)} more `
-      + "folder-scoped collaboration tasks are needed before it activates"
-    : `local boundary-rebuild health is outside its limits (${rollout.reasons.join(", ")})`;
+  const detail = `local boundary-rebuild health is outside its limits (${rollout.reasons.join(", ")})`;
   return `Full agent is not active yet, so this bridge is running on the restricted surface: ${detail}. `
     + "Everything else works; restart the bridge once the gate clears.";
 }

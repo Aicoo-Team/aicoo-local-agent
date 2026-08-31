@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   authorizeDevice,
   bridgeLaunchConfigMatches,
+  formatCapabilitySurfaceStatus,
   formatTeamAgentWelcome,
   inspectManagedBridge,
   launchDetachedBridge,
@@ -252,6 +253,17 @@ describe("local-agent onboarding", () => {
       { ...requested, capabilitySurface: status.capabilitySurface! },
       requested,
     )).toBe(false);
+  });
+
+  it("formats a degraded capability surface for the onboarding terminal", () => {
+    expect(formatCapabilitySurfaceStatus({
+      requested: "full-agent",
+      active: "restricted",
+    })).toBe("Capability: restricted (requested full-agent; local rebuild health is outside its limits)");
+    expect(formatCapabilitySurfaceStatus({
+      requested: "full-agent",
+      active: "full-agent",
+    })).toBe("Capability: full-agent");
   });
 
   it("stops the exact managed PID and removes its stale PID file", async () => {
