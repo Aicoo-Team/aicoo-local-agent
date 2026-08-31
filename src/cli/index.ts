@@ -9,11 +9,13 @@ import { bridgeHealthIsFresh, parseBridgeHealth } from "../bridge/health.js";
 import { requestRuntimeDelegation, RuntimeBridge } from "../bridge/bridge.js";
 import { startLocalHelper } from "../bridge/local-helper.js";
 import { readProcessWatchdogDiagnostic, startProcessWatchdog } from "../bridge/process-watchdog.js";
+import { startResourceMonitor } from "../bridge/resource-monitor.js";
 import { BridgeSpool } from "../bridge/spool.js";
 import type { CommunicationGrant, CommunicationSession, HumanInboxSendMessageInput, RequestCommunicationSessionInput } from "../shared/contracts.js";
 import { ApiError, HttpMessageTransport, type ResolvedPersonResponse } from "../shared/http-client.js";
 import { AicooTransport, makeTransport } from "../shared/aicoo-transport.js";
 import type { ToolApprovalGateway } from "../shared/tool-approval.js";
+import { LocalToolApprovalGateway } from "../shared/local-tool-approval.js";
 import {
   resetRelationshipPolicy,
   upsertRelationshipPreset,
@@ -53,15 +55,26 @@ import {
 import {
   assertRuntimeAvailable,
   authorizeDevice,
+  bridgeLaunchConfigMatches,
   formatTeamAgentWelcome,
+  inspectManagedBridge,
   launchDetachedBridge,
+  managedBridgeHealthAllowsReuse,
   nodeMeetsMinimumVersion,
+  readRegisteredEndpointId,
   readRunningProcessId,
+  resolveOnboardingRuntimeFiles,
+  removeManagedPidFile,
+  stopManagedBridge,
+  stopManagedBridgeFromPidFile,
+  type BridgeLaunchConfig,
   waitForBridgeReady,
 } from "./onboarding.js";
 import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
 import {
+  DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS,
   evaluateCapabilityRollout,
+  isLoopbackControlPlane,
   resolveCapabilitySurface,
   type CapabilitySurfaceActivation,
   type CapabilitySurface,
@@ -76,6 +89,7 @@ const DEFAULT_SPOOL = process.env.CCD_SPOOL?.trim()
 
 const program = new Command()
   .name("ccd")
+  .version("0.5.0")
   .description("aicoo-local-agent realtime runtime-messaging CLI")
   .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? LOCAL_SERVER_URL)
   .option("--token <token>", "device bearer token", process.env.CCD_TOKEN);
@@ -205,13 +219,27 @@ program.command("onboard")
       console.log("✓ Identity verified and device authorization saved");
     }
 
-    const localAgentDirectory = dirname(resolve(options.spool));
-    const logFile = join(localAgentDirectory, "bridge.log");
-    const pidFile = join(localAgentDirectory, "bridge.pid");
-    const runningPid = readRunningProcessId(pidFile);
+    const { logFile, pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
+    let runningPid = readRunningProcessId(pidFile);
     if (runningPid) {
-      console.log(`✓ Existing local bridge process found (${runningPid})`);
-    } else {
+      const existingConfig = readBridgeLaunchConfig(options.spool);
+      const requestedConfig: BridgeLaunchConfig = {
+        runtime: options.runtime,
+        capabilitySurface: options.capabilitySurface,
+        workspace: resolve(options.workspace),
+      };
+      if (bridgeLaunchConfigMatches(existingConfig, requestedConfig)
+        && managedBridgeHealthAllowsReuse(options.spool)) {
+        console.log(`✓ Existing local bridge process found (${runningPid})`);
+      } else {
+        console.log(`Existing bridge is stale, unhealthy, or differently configured; restarting process ${runningPid}.`);
+        await stopManagedBridge(runningPid);
+        removeManagedPidFile(pidFile, runningPid);
+        runningPid = undefined;
+      }
+    }
+    if (!runningPid) {
+      clearLocalEndpointIdentity(options.spool);
       const cliEntry = process.argv[1];
       if (!cliEntry) throw new Error("Cannot determine the ccd CLI entry point.");
       const started = launchDetachedBridge({
@@ -227,18 +255,7 @@ program.command("onboard")
       console.log(`✓ Local bridge started in the background (${started.pid})`);
     }
 
-    const readLocalEndpointId = () => {
-      try {
-        const spool = new BridgeSpool(options.spool);
-        try {
-          return spool.listSessionMappings().length > 0 ? spool.getIdentity("endpointId") : undefined;
-        } finally {
-          spool.close();
-        }
-      } catch {
-        return undefined;
-      }
-    };
+    const readLocalEndpointId = () => readRegisteredEndpointId(options.spool);
     const readyTimeoutMs = Number.parseInt(options.readyTimeout, 10);
     if (!Number.isSafeInteger(readyTimeoutMs) || readyTimeoutMs <= 0) {
       throw new Error("--ready-timeout must be a positive number of milliseconds.");
@@ -934,10 +951,16 @@ program.command("send-inbox")
   });
 
 program.command("status")
-  .argument("<messageId>")
+  .argument("[messageId]")
   .option("--watch", "poll until a terminal/runtime state", false)
+  .option("--spool <file>", "managed bridge spool", DEFAULT_SPOOL)
   .action(async (messageId, options) => {
-    const client = makeClient();
+    if (!messageId) {
+      const { pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
+      print(inspectManagedBridge({ spoolFile: options.spool, pidFile }));
+      return;
+    }
+    const client = makeClient({ spool: options.spool });
     do {
       const status = await client.getMessageStatus(messageId);
       console.log(formatDelivery(status));
@@ -945,6 +968,54 @@ program.command("status")
       await new Promise((resolve) => setTimeout(resolve, 250));
       console.log("");
     } while (true);
+  });
+
+program.command("stop")
+  .description("stop the bridge managed for a spool without affecting other bridge profiles")
+  .option("--spool <file>", "managed bridge spool", DEFAULT_SPOOL)
+  .action(async (options) => {
+    const { pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
+    const result = await stopManagedBridgeFromPidFile(pidFile);
+    print(result.stopped
+      ? { status: "stopped", pid: result.pid, spool: resolve(options.spool) }
+      : { status: "not_running", spool: resolve(options.spool) });
+  });
+
+program.command("restart")
+  .description("restart the bridge managed for a spool with its last governed configuration")
+  .option("--spool <file>", "managed bridge spool", DEFAULT_SPOOL)
+  .option("--server <url>", "control-plane URL")
+  .option("--ready-timeout <milliseconds>", "time to wait for readiness", "30000")
+  .action(async (options) => {
+    const config = readBridgeLaunchConfig(options.spool);
+    if (!config) throw new Error("No complete bridge launch configuration was found; run 'ccd onboard' first.");
+    assertRuntimeAvailable(config.runtime);
+    const server = hostedServerUrl(options.server);
+    const { logFile, pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
+    await stopManagedBridgeFromPidFile(pidFile);
+    clearLocalEndpointIdentity(options.spool);
+    const cliEntry = process.argv[1];
+    if (!cliEntry) throw new Error("Cannot determine the ccd CLI entry point.");
+    const started = launchDetachedBridge({
+      cliEntry,
+      runtime: config.runtime,
+      spoolFile: options.spool,
+      logFile,
+      pidFile,
+      serverUrl: server,
+      workspace: config.workspace,
+      capabilitySurface: config.capabilitySurface,
+    });
+    const timeoutMs = Number.parseInt(options.readyTimeout, 10);
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("--ready-timeout must be a positive number of milliseconds.");
+    }
+    const ready = await waitForBridgeReady({
+      clientFactory: () => makeHostedClient(server, options.spool),
+      localEndpointId: () => readRegisteredEndpointId(options.spool),
+      timeoutMs,
+    });
+    print({ status: "ready", pid: started.pid, endpointId: ready.endpointId, ...config });
   });
 
 program.command("watch")
@@ -1022,6 +1093,16 @@ program.command("doctor")
 
     if (options.spool) {
       try {
+        const { pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
+        const managedBridge = inspectManagedBridge({ spoolFile: options.spool, pidFile });
+        checks.push({
+          name: "managedProcess",
+          ok: managedBridge.running,
+          detail: managedBridge,
+          ...(managedBridge.running
+            ? {}
+            : { next: `Run 'ccd onboard --spool ${options.spool}' to start this bridge profile.` }),
+        });
         const spool = new BridgeSpool(options.spool);
         try {
           const endpointId = spool.getIdentity("endpointId");
@@ -1054,6 +1135,16 @@ program.command("doctor")
                 + "and this watchdog diagnostic to the incident report.",
             });
           }
+          const resourceUsage = parseResourceUsage(spool.getIdentity("bridgeResourceUsage"));
+          const resourceHealthy = !resourceUsage || resourceUsage.consecutiveHighCpuSamples < 3;
+          checks.push({
+            name: "bridgeResources",
+            ok: resourceHealthy,
+            detail: resourceUsage ?? { status: "not_sampled_yet" },
+            ...(resourceHealthy
+              ? {}
+              : { next: "If CPU stays above 80%, inspect bridge.log; the bridge will self-stop after 10 samples." }),
+          });
         } finally {
           spool.close();
         }
@@ -1151,7 +1242,15 @@ async function startBridge(options: {
   } finally {
     readinessSpool.close();
   }
-  const rebuildReadiness = evaluateCapabilityRollout(boundaryMetrics);
+  const selectedServer = options.server ?? program.opts<{ server: string }>().server;
+  // Pulse localhost uses the hosted/Aicoo protocol so browser approvals work, but it is still a
+  // local functional test. Only literal loopback hosts get the zero-sample exception; preview,
+  // production and remote self-hosted deployments retain the production evidence threshold.
+  const localFunctionalValidation = isLoopbackControlPlane(selectedServer);
+  const rolloutThresholds = localFunctionalValidation
+    ? { ...DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS, minimumEligibleTasks: 0 }
+    : DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS;
+  const rebuildReadiness = evaluateCapabilityRollout(boundaryMetrics, rolloutThresholds);
   if (options.capabilitySurface === "full-agent" && !rebuildReadiness.eligible) {
     throw new Error(`full-agent capability is not ready: ${rebuildReadiness.reasons.join(", ")}`);
   }
@@ -1167,9 +1266,14 @@ async function startBridge(options: {
   const ownerIdentity = await transport.whoami();
   // Only the hosted transport can reach the approval endpoints; a self-hosted mock cannot, and
   // wiring it anyway would turn every un-preauthorized tool into a confusing runtime error.
-  const approvalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
+  const hostedApprovalGateway = typeof (transport as Partial<ToolApprovalGateway>).requestToolApproval === "function"
     ? (transport as unknown as ToolApprovalGateway)
     : undefined;
+  const approvalGateway = hostedApprovalGateway ?? (
+    !options.hosted && process.stdin.isTTY && process.stdout.isTTY
+      ? new LocalToolApprovalGateway({ log: console.log })
+      : undefined
+  );
   const codexAppServer = options.codexAppServer || process.env.CCD_CODEX_APP_SERVER === "1";
   const capabilityActivation: CapabilitySurfaceActivation = resolveCapabilitySurface(
     options.capabilitySurface ?? "restricted",
@@ -1179,6 +1283,7 @@ async function startBridge(options: {
       ownerApprovalGateway: Boolean(approvalGateway),
       ...(options.adapter === "codex" ? { codexAppServer } : {}),
     },
+    rolloutThresholds,
   );
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
@@ -1214,11 +1319,15 @@ async function startBridge(options: {
   spool.setIdentity("ownerDeviceId", ownerIdentity.deviceId);
   spool.setIdentity("bridgeInstanceId", bridgeInstanceId);
   spool.setIdentity("spoolFile", resolve(options.spool));
+  spool.setIdentity("launchRuntime", selected.runtime);
+  spool.setIdentity("launchCapabilitySurface", capabilityActivation.active);
+  spool.setIdentity("launchWorkspace", resolve(options.workspace ?? process.cwd()));
   // This watchdog owns a separate event loop. Unlike heartbeat timers in this process, it can
   // still stop the daemon if runtime execution completely starves the bridge's main thread.
   const processWatchdog = startProcessWatchdog({
     diagnosticFile: `${resolve(options.spool)}.watchdog.json`,
   });
+  let shutdown: ((exitCode?: number) => Promise<void>) | undefined;
   const bridge = new RuntimeBridge({
     transport,
     spool,
@@ -1231,7 +1340,12 @@ async function startBridge(options: {
     ownerPrincipalId: ownerIdentity.principalId,
     ownerDeviceId: ownerIdentity.deviceId,
     bridgeInstanceId,
+    capabilitySurface: capabilityActivation.active,
     log: console.log,
+    onFatalError: (error) => {
+      console.error(`[bridge] stopping: ${error.message}`);
+      void shutdown?.(1);
+    },
   });
   let localHelper: ReturnType<typeof startLocalHelper> | undefined;
   if (options.localHelper ?? true) {
@@ -1251,6 +1365,23 @@ async function startBridge(options: {
     }
   }
   let started: Awaited<ReturnType<RuntimeBridge["start"]>>;
+  let resourceMonitor: ReturnType<typeof startResourceMonitor> | undefined;
+  let shuttingDown = false;
+  const { pidFile } = resolveOnboardingRuntimeFiles(options.spool, DEFAULT_SPOOL);
+  shutdown = async (exitCode = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    resourceMonitor?.stop();
+    await bridge.stop();
+    await processWatchdog.stop();
+    localHelper?.close();
+    if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
+    spool.deleteIdentity("relationshipPolicyFile");
+    spool.deleteIdentity("bridgeInstanceId");
+    spool.close();
+    removeManagedPidFile(pidFile);
+    process.exit(exitCode);
+  };
   try {
     started = await bridge.start();
   } catch (error) {
@@ -1260,6 +1391,17 @@ async function startBridge(options: {
     spool.close();
     throw error;
   }
+  resourceMonitor = startResourceMonitor({
+    onSample: (sample) => spool.setIdentity("bridgeResourceUsage", JSON.stringify(sample)),
+    onSustainedHighCpu: (sample) => {
+      const error = new Error(
+        `sustained CPU usage ${sample.cpuPercent.toFixed(1)}% across `
+          + `${sample.consecutiveHighCpuSamples} samples`,
+      );
+      console.error(`[bridge] FATAL: ${error.message}`);
+      void shutdown?.(1);
+    },
+  });
   if (options.json) {
     console.log(JSON.stringify({
       status: "ready",
@@ -1285,18 +1427,64 @@ async function startBridge(options: {
     console.log("========================================================\n");
     console.log("Listening for incoming C2C session tasks... (Press Ctrl+C to stop)");
   }
-  const shutdown = async () => {
-    await bridge.stop();
-    await processWatchdog.stop();
-    localHelper?.close();
-    if (ephemeralRelationshipPolicy) resetRelationshipPolicy(relationshipPolicyFile);
-    spool.deleteIdentity("relationshipPolicyFile");
-    spool.deleteIdentity("bridgeInstanceId");
-    spool.close();
-    process.exit(0);
-  };
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  process.on("SIGINT", () => void shutdown?.());
+  process.on("SIGTERM", () => void shutdown?.());
+}
+
+function parseResourceUsage(value: string | undefined): {
+  cpuPercent: number;
+  rssBytes: number;
+  consecutiveHighCpuSamples: number;
+  sampledAt?: string;
+} | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (typeof parsed.cpuPercent !== "number" || typeof parsed.rssBytes !== "number"
+      || typeof parsed.consecutiveHighCpuSamples !== "number") return undefined;
+    return {
+      cpuPercent: parsed.cpuPercent,
+      rssBytes: parsed.rssBytes,
+      consecutiveHighCpuSamples: parsed.consecutiveHighCpuSamples,
+      ...(typeof parsed.sampledAt === "string" ? { sampledAt: parsed.sampledAt } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function readBridgeLaunchConfig(spoolFile: string): BridgeLaunchConfig | undefined {
+  try {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      const runtime = spool.getIdentity("launchRuntime");
+      const capabilitySurface = spool.getIdentity("launchCapabilitySurface");
+      const workspace = spool.getIdentity("launchWorkspace");
+      if ((runtime !== "claude-code" && runtime !== "codex")
+        || (capabilitySurface !== "restricted" && capabilitySurface !== "full-agent")
+        || !workspace) {
+        return undefined;
+      }
+      return { runtime, capabilitySurface, workspace };
+    } finally {
+      spool.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function clearLocalEndpointIdentity(spoolFile: string): void {
+  try {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      spool.deleteIdentity("endpointId");
+    } finally {
+      spool.close();
+    }
+  } catch {
+    // A new spool has no endpoint identity to clear.
+  }
 }
 
 function resolveRunningRelationshipPolicy(explicitPolicy: string | undefined, spoolFile: string): string {

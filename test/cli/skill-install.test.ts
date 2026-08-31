@@ -39,7 +39,11 @@ describe("Codex skill installer", () => {
     expect(installed).toContain("Only an explicit approval ID means an approval is pending");
     expect(installed).toContain("A running command is not evidence that the owner has not acted");
     expect(installed).toContain("never tell the user\nthat approval is still pending");
-    expect(installed).toContain("The same delegation is still running; I’ll continue waiting.");
+    expect(installed).toContain("Do not send repeated unchanged\nprogress updates");
+    expect(installed).toContain("Tell the user exactly what decision is needed");
+    expect(installed).toContain("Actions completed:");
+    expect(installed).toContain("Approvals:");
+    expect(installed).toContain("Remaining work:");
     expect(installed).toContain("transcript of agent conversations");
     expect(installed).toContain("Local first result:");
     expect(installed).toContain("goal:enterprise-proposal:engineering");

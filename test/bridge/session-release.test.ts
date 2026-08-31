@@ -13,6 +13,10 @@ import type {
 import { ApiError, type HttpMessageTransport } from "../../src/shared/http-client.js";
 import { ContinuationStore } from "../../src/shared/continuation-store.js";
 import {
+  GOVERNED_AGENT_CAPABILITIES,
+  GOVERNED_AGENT_SURFACE,
+} from "../../src/shared/governed-agent-access.js";
+import {
   markTrustedToolPolicyUsed,
   readTrustedToolPolicies,
   upsertTrustedToolPolicy,
@@ -62,6 +66,37 @@ describe("RuntimeBridge communication session release", () => {
     await callHandleEvent(bridge, event("comm.activated", "comm_new", "server-session"));
 
     expect(adapter.prepareCommunicationSession).toHaveBeenCalledWith("native-session", "comm_new");
+  });
+
+  it("advertises the complete governed-agent contract only for the full-agent surface", async () => {
+    const registerEndpoint = vi.fn(transport().registerEndpoint);
+    const { bridge } = setup({
+      transport: transport({ registerEndpoint }),
+      capabilitySurface: "full-agent",
+    });
+    cleanups.push(() => void bridge.stop());
+
+    await bridge.start();
+
+    expect(registerEndpoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        capabilities: expect.arrayContaining([
+          GOVERNED_AGENT_SURFACE,
+          ...GOVERNED_AGENT_CAPABILITIES,
+        ]),
+      }),
+    );
+
+    const restrictedRegisterEndpoint = vi.fn(transport().registerEndpoint);
+    const { bridge: restrictedBridge } = setup({
+      transport: transport({ registerEndpoint: restrictedRegisterEndpoint }),
+      capabilitySurface: "restricted",
+    });
+    cleanups.push(() => void restrictedBridge.stop());
+    await restrictedBridge.start();
+
+    const [restrictedInput] = restrictedRegisterEndpoint.mock.calls[0]!;
+    expect(restrictedInput.capabilities).not.toContain(GOVERNED_AGENT_SURFACE);
   });
 
   it("keeps the default route pinned while its collaboration awaits folder approval", async () => {
@@ -910,6 +945,7 @@ describe("RuntimeBridge communication session release", () => {
     ownerPrincipalId?: string;
     ownerDeviceId?: string;
     workspaceBoundary?: string;
+    capabilitySurface?: "restricted" | "full-agent";
     log?: (line: string) => void;
   }): {
     bridge: RuntimeBridge;
@@ -954,6 +990,7 @@ describe("RuntimeBridge communication session release", () => {
       ownerPrincipalId: options?.ownerPrincipalId,
       ownerDeviceId: options?.ownerDeviceId,
       workspaceBoundary: options?.workspaceBoundary,
+      capabilitySurface: options?.capabilitySurface,
       log: options?.log,
     });
     return { bridge, spool, adapter };

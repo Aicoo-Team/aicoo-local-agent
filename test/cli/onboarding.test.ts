@@ -1,17 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   authorizeDevice,
+  bridgeLaunchConfigMatches,
   formatTeamAgentWelcome,
+  inspectManagedBridge,
   launchDetachedBridge,
+  managedBridgeHealthAllowsReuse,
   nodeMeetsMinimumVersion,
+  readRegisteredEndpointId,
   readRunningProcessId,
+  resolveOnboardingRuntimeFiles,
+  stopManagedBridge,
+  stopManagedBridgeFromPidFile,
   waitForBridgeReady,
   type DeviceAuthorizationClient,
 } from "../../src/cli/onboarding.js";
 import { ApiError } from "../../src/shared/http-client.js";
+import { BridgeSpool } from "../../src/bridge/spool.js";
 
 describe("local-agent onboarding", () => {
   it("opens the approval page and continues after one human approval", async () => {
@@ -140,6 +148,128 @@ describe("local-agent onboarding", () => {
     writeFileSync(pidFile, "4321\n");
     expect(readRunningProcessId(pidFile, (pid) => pid === 4321)).toBe(4321);
     expect(readRunningProcessId(pidFile, () => false)).toBeUndefined();
+  });
+
+  it("recognizes a freshly registered endpoint before any collaboration session exists", () => {
+    const spoolFile = join(mkdtempSync(join(tmpdir(), "ccd-onboarding-ready-")), "bridge.spool");
+    const spool = new BridgeSpool(spoolFile);
+    spool.setIdentity("endpointId", "endpoint-fresh");
+    expect(spool.listSessionMappings()).toHaveLength(0);
+    spool.close();
+
+    expect(readRegisteredEndpointId(spoolFile)).toBe("endpoint-fresh");
+  });
+
+  it("does not reuse a restricted bridge when onboarding requests full-agent", () => {
+    expect(bridgeLaunchConfigMatches({
+      runtime: "codex",
+      capabilitySurface: "restricted",
+      workspace: "/tmp/project",
+    }, {
+      runtime: "codex",
+      capabilitySurface: "full-agent",
+      workspace: "/tmp/project",
+    })).toBe(false);
+  });
+
+  it("reuses a bridge only when runtime, capability surface, and workspace match", () => {
+    const config = {
+      runtime: "codex" as const,
+      capabilitySurface: "full-agent" as const,
+      workspace: "/tmp/project",
+    };
+    expect(bridgeLaunchConfigMatches(config, config)).toBe(true);
+    expect(bridgeLaunchConfigMatches(undefined, config)).toBe(false);
+    expect(bridgeLaunchConfigMatches({ ...config, workspace: "/tmp/other" }, config)).toBe(false);
+  });
+
+  it("stops a managed bridge before relaunching it with a different configuration", async () => {
+    let running = true;
+    const signalProcess = vi.fn(() => {
+      running = false;
+    });
+
+    await expect(stopManagedBridge(4321, {
+      signalProcess,
+      probe: () => running,
+      delay: vi.fn().mockResolvedValue(undefined),
+    })).resolves.toBeUndefined();
+    expect(signalProcess).toHaveBeenCalledWith(4321, "SIGTERM");
+  });
+
+  it("reports managed bridge lifecycle and launch configuration from its spool", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-bridge-status-"));
+    const spoolFile = join(directory, "bridge.spool");
+    const pidFile = join(directory, "bridge.pid");
+    writeFileSync(pidFile, "4321\n");
+    const spool = new BridgeSpool(spoolFile);
+    spool.setIdentity("endpointId", "endpoint-1");
+    spool.setIdentity("launchRuntime", "codex");
+    spool.setIdentity("launchCapabilitySurface", "full-agent");
+    spool.setIdentity("launchWorkspace", "/tmp/project");
+    spool.close();
+
+    expect(inspectManagedBridge({ spoolFile, pidFile, probe: (pid) => pid === 4321 })).toMatchObject({
+      running: true,
+      pid: 4321,
+      endpointId: "endpoint-1",
+      runtime: "codex",
+      capabilitySurface: "full-agent",
+      workspace: "/tmp/project",
+    });
+  });
+
+  it("stops the exact managed PID and removes its stale PID file", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-bridge-stop-"));
+    const pidFile = join(directory, "bridge.pid");
+    writeFileSync(pidFile, "4321\n");
+    let running = true;
+
+    await expect(stopManagedBridgeFromPidFile(pidFile, {
+      probe: () => running,
+      signalProcess: () => {
+        running = false;
+      },
+      delay: vi.fn().mockResolvedValue(undefined),
+    })).resolves.toEqual({ stopped: true, pid: 4321 });
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it("does not reuse a running bridge whose persisted health stopped advancing", () => {
+    const spoolFile = join(mkdtempSync(join(tmpdir(), "ccd-bridge-stale-")), "bridge.spool");
+    const spool = new BridgeSpool(spoolFile);
+    spool.setIdentity("bridgeHealth", JSON.stringify({
+      status: "healthy",
+      consecutiveHeartbeatFailures: 0,
+      nextHeartbeatInMs: 10_000,
+      eventLoopLagMs: 0,
+      updatedAt: "2026-08-29T00:00:00.000Z",
+    }));
+    spool.close();
+
+    expect(managedBridgeHealthAllowsReuse(spoolFile, Date.parse("2026-08-29T00:02:00.000Z")))
+      .toBe(false);
+  });
+
+  it("isolates detached PID and log files for custom spools in one directory", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-onboarding-profiles-"));
+    const defaultSpool = join(directory, "bridge.spool");
+    const abhinav = resolveOnboardingRuntimeFiles(join(directory, "abhinav.spool"), defaultSpool);
+    const omkar = resolveOnboardingRuntimeFiles(join(directory, "omkar.spool"), defaultSpool);
+
+    expect(abhinav).toEqual({
+      logFile: join(directory, "abhinav.spool.bridge.log"),
+      pidFile: join(directory, "abhinav.spool.bridge.pid"),
+    });
+    expect(omkar).toEqual({
+      logFile: join(directory, "omkar.spool.bridge.log"),
+      pidFile: join(directory, "omkar.spool.bridge.pid"),
+    });
+    expect(abhinav).not.toEqual(omkar);
+    expect(resolveOnboardingRuntimeFiles(defaultSpool, defaultSpool)).toEqual({
+      logFile: join(directory, "bridge.log"),
+      pidFile: join(directory, "bridge.pid"),
+    });
   });
 
   it("propagates the selected server and spool to managed agent commands", () => {

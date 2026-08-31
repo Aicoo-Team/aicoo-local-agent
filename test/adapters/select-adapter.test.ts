@@ -4,6 +4,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { selectRuntimeAdapter } from "../../src/adapters/select-adapter.js";
 
+const approvalGateway = {
+  async requestToolApproval() {
+    return { approvalId: "approval-1", status: "allow", decision: "allow" as const };
+  },
+  async getToolApproval() {
+    return { status: "allow", decision: "allow" as const };
+  },
+};
+
 describe("selectRuntimeAdapter relationship policy handling", () => {
   const directories: string[] = [];
 
@@ -105,6 +114,21 @@ describe("selectRuntimeAdapter relationship policy handling", () => {
       workspace: directory,
       capabilitySurface: "full-agent",
     })).rejects.toThrow("requires --codex-app-server");
+  });
+
+  it("rejects native Windows Claude full-agent before advertising the governed surface", async () => {
+    const directory = makeDirectory();
+
+    await expect(selectRuntimeAdapter({
+      kind: "claude-code",
+      sessions: 1,
+      spoolFile: join(directory, "bridge.spool"),
+      workspace: directory,
+      capabilitySurface: "full-agent",
+      approvalGateway,
+      platform: "win32",
+      osRelease: "10.0.26100",
+    })).rejects.toThrow("native Windows sandboxing is unavailable");
   });
 
   function makeDirectory(): string {

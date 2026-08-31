@@ -14,6 +14,19 @@ export const DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS: CapabilityRolloutThresholds 
   maximumRebuildP95Ms: 3_000,
 };
 
+/** Only a control plane bound to this machine may skip the production sample-count gate. */
+export function isLoopbackControlPlane(serverUrl: string): boolean {
+  try {
+    const hostname = new URL(serverUrl).hostname.toLowerCase();
+    return hostname === "localhost"
+      || hostname === "127.0.0.1"
+      || hostname === "::1"
+      || hostname === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
 export type CapabilityRolloutBlocker =
   | "insufficient_sample"
   | "rebuild_rate_too_high"
@@ -112,8 +125,9 @@ export function resolveCapabilitySurface(
   requested: CapabilitySurface,
   metrics: BoundaryMetricsSnapshot,
   securityContext: CapabilitySecurityContext,
+  thresholds: CapabilityRolloutThresholds = DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS,
 ): CapabilitySurfaceActivation {
-  const rollout = evaluateCapabilityRollout(metrics);
+  const rollout = evaluateCapabilityRollout(metrics, thresholds);
   const security = evaluateCapabilitySecurity(securityContext);
   if (requested === "full-agent" && (!rollout.eligible || !security.eligible)) {
     throw new Error(

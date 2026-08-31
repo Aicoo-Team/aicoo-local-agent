@@ -3,6 +3,7 @@ import type { BoundaryMetricsSnapshot } from "../../src/adapters/boundary-teleme
 import {
   evaluateCapabilitySecurity,
   evaluateCapabilityRollout,
+  isLoopbackControlPlane,
   resolveCapabilitySurface,
 } from "../../src/shared/capability-rollout.js";
 
@@ -32,6 +33,15 @@ function metrics(overrides: Partial<BoundaryMetricsSnapshot> = {}): BoundaryMetr
 }
 
 describe("full capability rollout gate", () => {
+  it("waives sample count only for literal loopback control planes", () => {
+    expect(isLoopbackControlPlane("http://localhost:3000")).toBe(true);
+    expect(isLoopbackControlPlane("http://127.0.0.1:7790")).toBe(true);
+    expect(isLoopbackControlPlane("http://[::1]:3000")).toBe(true);
+    expect(isLoopbackControlPlane("https://www.aicoo.io")).toBe(false);
+    expect(isLoopbackControlPlane("https://localhost.example.com")).toBe(false);
+    expect(isLoopbackControlPlane("not-a-url")).toBe(false);
+  });
+
   it("opens only after enough low-rebuild, low-failure evidence", () => {
     expect(evaluateCapabilityRollout(metrics())).toMatchObject({ eligible: true, reasons: [] });
   });
@@ -48,6 +58,26 @@ describe("full capability rollout gate", () => {
     }))).toMatchObject({
       eligible: false,
       reasons: ["rebuild_rate_too_high", "rebuild_failure_rate_too_high", "rebuild_latency_too_high"],
+    });
+  });
+
+  it("allows a zero-sample localhost threshold without waiving health failures", () => {
+    const localThresholds = {
+      minimumEligibleTasks: 0,
+      maximumRebuildRate: 0.1,
+      maximumRebuildFailureRate: 0.01,
+      maximumRebuildP95Ms: 3_000,
+    };
+    expect(evaluateCapabilityRollout(metrics({ eligibleTasks: 0 }), localThresholds)).toMatchObject({
+      eligible: true,
+      reasons: [],
+    });
+    expect(evaluateCapabilityRollout(metrics({
+      eligibleTasks: 0,
+      rebuildFailureRate: 0.5,
+    }), localThresholds)).toMatchObject({
+      eligible: false,
+      reasons: ["rebuild_failure_rate_too_high"],
     });
   });
 

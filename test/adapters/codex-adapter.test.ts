@@ -196,6 +196,49 @@ describe("CodexAdapter managed sessions", () => {
     ]);
   });
 
+  it("routes pathless Codex file-change approval through Edit inside an edit-project sandbox", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-pathless-edit-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const project = join(directory, "project");
+    mkdirSync(project);
+    const policyFile = join(directory, "relationships.json");
+    upsertRelationshipPreset({
+      file: policyFile,
+      principalId: "prn_a",
+      deviceId: "device_a",
+      preset: "edit-project",
+      folder: project,
+    });
+    const asked: string[] = [];
+    const driver = new FakeCodexDriver("done");
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: project,
+      relationshipPolicyFile: policyFile,
+      driver,
+      turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input.toolName);
+          return { approvalId: "appr-edit", status: "allow", decision: "allow" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+    await adapter.initialize();
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_pathless_edit"), "new_turn");
+
+    await expect(driver.turns[0]!.onApproval?.({
+      kind: "fileChange",
+      summary: "Modify files",
+    })).resolves.toBe("accept");
+    expect(asked).toEqual(["Edit"]);
+  });
+
   it("attaches exact MCP grants in full-agent mode without requiring folder access", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-mcp-only-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -612,6 +655,7 @@ describe("CodexAdapter managed sessions", () => {
       relationshipPolicyFile: policyFile,
       driver,
       turnAckTimeoutMs: 500,
+      capabilitySurface: "full-agent",
       approvalGateway: {
         async requestToolApproval(input) {
           asked.push(input);
@@ -635,6 +679,17 @@ describe("CodexAdapter managed sessions", () => {
 
     expect(asked).toEqual([]);
     expect(driver.turns[0]?.permissionProfile).toBeDefined();
+
+    // Regression: Codex implements read tools with sandboxed shell commands. Treating every
+    // raw command as Edit makes a read-project grant reject harmless reads before the existing
+    // Read policy can auto-resolve them.
+    await expect(driver.turns[0]?.onApproval?.({
+      kind: "commandExecution",
+      command: "/bin/zsh -lc \"sed -n '1,20p' package.json\"",
+      cwd: project,
+      summary: "Run: sed -n '1,20p' package.json",
+    })).resolves.toBe("accept");
+    expect(asked).toEqual([]);
   });
 
   it("derives Git read access from the read-project preset", async () => {

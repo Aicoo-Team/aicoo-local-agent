@@ -1,15 +1,19 @@
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
+import { release as osRelease } from "node:os";
 import { delimiter, resolve } from "node:path";
 import type { RuntimeKind } from "../shared/contracts.js";
 import type { ToolApprovalGateway } from "../shared/tool-approval.js";
 import { ClaudeCodeAdapter } from "./claude-code/claude-code-adapter.js";
+import { verifyClaudeFullAgentSandbox, type ClaudeSandboxProbeInput } from "./claude-code/sandbox-probe.js";
 import { CodexAdapter } from "./codex/codex-adapter.js";
 import { CodexAppServerDriver } from "./codex/app-server-driver.js";
+import { verifyCodexFullAgentSandbox, type CodexSandboxProbeInput } from "./codex/sandbox-probe.js";
 import { FakeRuntimeAdapter } from "./fake/fake-adapter.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
 import { RelationshipPolicy } from "../security/relationship-policy.js";
 import type { CapabilitySurface } from "../shared/capability-rollout.js";
+import { evaluateRuntimePlatformReadiness } from "../shared/runtime-platform-readiness.js";
 
 export type RuntimeAdapterKind = "fake" | "claude-code" | "codex";
 
@@ -38,6 +42,11 @@ export interface RuntimeAdapterSelectionOptions {
    * one that has been in production, so it stays opt-in until it has real mileage.
    */
   codexAppServer?: boolean;
+  /** Test seams for platform gates and the real Codex sandbox attestation. */
+  platform?: NodeJS.Platform;
+  osRelease?: string;
+  verifyCodexSandbox?: (input: CodexSandboxProbeInput) => Promise<void>;
+  verifyClaudeSandbox?: (input: ClaudeSandboxProbeInput) => Promise<void>;
   log?: (line: string) => void;
 }
 
@@ -68,6 +77,15 @@ export async function selectRuntimeAdapter(
     };
   }
 
+  if (options.capabilitySurface === "full-agent") {
+    const readiness = evaluateRuntimePlatformReadiness(
+      options.kind,
+      options.platform ?? process.platform,
+      options.osRelease ?? osRelease(),
+    );
+    if (!readiness.ready) throw new Error(readiness.reason);
+  }
+
   if (options.kind === "codex") {
     if (options.capabilitySurface === "full-agent" && !options.codexAppServer) {
       throw new Error("Codex full-agent capability requires --codex-app-server");
@@ -82,6 +100,12 @@ export async function selectRuntimeAdapter(
     const configuredPath = explicitPath ?? await findExecutableOnPath("codex");
     if (!configuredPath) {
       throw new Error("codex executable not found on PATH; install codex or pass --codex-path");
+    }
+    if (options.capabilitySurface === "full-agent") {
+      await (options.verifyCodexSandbox ?? verifyCodexFullAgentSandbox)({
+        codexPath: configuredPath,
+        platform: options.platform ?? process.platform,
+      });
     }
     const relationshipPolicyFile = options.relationshipPolicyFile
       ? resolve(options.relationshipPolicyFile)
@@ -129,6 +153,11 @@ export async function selectRuntimeAdapter(
   const configuredPath = explicitPath ?? await findExecutableOnPath("claude");
   if (options.capabilitySurface === "full-agent" && !options.approvalGateway) {
     throw new Error("full-agent capability requires an owner approval gateway");
+  }
+  if (options.capabilitySurface === "full-agent") {
+    await (options.verifyClaudeSandbox ?? verifyClaudeFullAgentSandbox)({
+      platform: options.platform ?? process.platform,
+    });
   }
   const relationshipPolicyFile = options.relationshipPolicyFile
     ? resolve(options.relationshipPolicyFile)

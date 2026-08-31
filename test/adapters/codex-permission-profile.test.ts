@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CODEX_PROFILE_NAME,
@@ -50,6 +50,77 @@ describe("codex permission profile", () => {
     })!;
 
     expect(profile).toContain('"/Library/Developer/CommandLineTools" = "read"');
+  });
+
+  it("pins macOS developer tools to the private runtime environment", () => {
+    // Regression: /usr/bin/git delegated through xcrun, which tried to write its cache outside
+    // the immutable project boundary even though the generated TMPDIR itself was private.
+    const dir = tempDir("codex-macos-toolchain-");
+    const developerDirectory = "/Library/Developer/CommandLineTools";
+    const prepared = writeCodexPermissionProfile(join(dir, "home"), {
+      preset: "read-project",
+      folders: ["/srv/project"],
+      platform: "darwin",
+      developerDirectory,
+      authFile: join(dir, "missing-auth.json"),
+    })!;
+    const profile = readFileSync(join(prepared.codexHome, "config.toml"), "utf8");
+
+    expect(prepared.environment).toMatchObject({ DEVELOPER_DIR: developerDirectory });
+    expect(prepared.environment?.PATH).toMatch(
+      new RegExp(`^${developerDirectory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/usr/bin:`),
+    );
+    expect(profile).toContain(`DEVELOPER_DIR = ${JSON.stringify(developerDirectory)}`);
+  });
+
+  it("allows the configured Codex launcher, its target, and the directories needed to execute them", () => {
+    const dir = tempDir("codex-runtime-path-");
+    const launcherDirectory = join(dir, "launcher");
+    const targetDirectory = join(dir, "runtime");
+    mkdirSync(launcherDirectory);
+    mkdirSync(targetDirectory);
+    const target = join(targetDirectory, "codex-real");
+    const launcher = join(launcherDirectory, "codex");
+    writeFileSync(target, "runtime");
+    symlinkSync(target, launcher);
+
+    const profile = renderCodexPermissionProfile({
+      preset: "read-project",
+      folders: ["/srv/project"],
+      runtimeExecutable: launcher,
+    })!;
+
+    expect(profile).toContain(`${JSON.stringify(launcherDirectory)} = "read"`);
+    expect(profile).toContain(`${JSON.stringify(launcher)} = "read"`);
+    const resolvedTarget = realpathSync.native(target);
+    expect(profile).toContain(`${JSON.stringify(dirname(resolvedTarget))} = "read"`);
+    expect(profile).toContain(`${JSON.stringify(resolvedTarget)} = "read"`);
+    expect(profile).not.toContain(`${JSON.stringify(dir)} = "read"`);
+  });
+
+  it("grants a known package-manager launcher and only its canonical package runtime", () => {
+    const dir = tempDir("codex-command-runtime-");
+    const launcherDirectory = join(dir, "launcher");
+    const packageRoot = join(dir, "packages", "npm");
+    const target = join(packageRoot, "bin", "npm-cli.js");
+    mkdirSync(launcherDirectory);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), '{"name":"npm"}');
+    writeFileSync(target, "runtime");
+    const launcher = join(launcherDirectory, "npm");
+    symlinkSync(target, launcher);
+
+    const profile = renderCodexPermissionProfile({
+      preset: "read-project",
+      folders: ["/srv/project"],
+      platform: "linux",
+      commandExecutables: [launcher],
+    })!;
+
+    expect(profile).toContain(`${JSON.stringify(launcher)} = "read"`);
+    expect(profile).toContain(`${JSON.stringify(realpathSync.native(target))} = "read"`);
+    expect(profile).toContain(`${JSON.stringify(realpathSync.native(packageRoot))} = "read"`);
+    expect(profile).not.toContain(`${JSON.stringify(dir)} = "read"`);
   });
 
   it("uses the native null device for Git in Windows project sessions", () => {
@@ -157,17 +228,20 @@ describe("codex permission profile", () => {
     expect(prepared.profileName).toBe(CODEX_PROFILE_NAME);
     expect(prepared.environment).toMatchObject({
       TMPDIR: join(prepared.codexHome, "tmp"),
+      NPM_CONFIG_CACHE: join(prepared.codexHome, "tmp", "npm-cache"),
+      NPM_CONFIG_USERCONFIG: "/dev/null",
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_NOSYSTEM: "1",
     });
-    expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain(
-      `set = { TMPDIR = ${JSON.stringify(join(prepared.codexHome, "tmp"))}, GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }`,
-    );
+    const profile = readFileSync(join(prepared.codexHome, "config.toml"), "utf8");
+    expect(profile).toContain(`TMPDIR = ${JSON.stringify(join(prepared.codexHome, "tmp"))}`);
+    expect(profile).toContain('GIT_CONFIG_GLOBAL = "/dev/null"');
+    expect(profile).toContain('GIT_CONFIG_NOSYSTEM = "1"');
     expect(readFileSync(join(prepared.codexHome, "auth.json"), "utf8")).toBe('{"token":"test-only"}');
     // A plugin can bundle skills, MCP servers, and executable hooks. Copying the owner's
     // plugin directory would grant all of those without a relationship-level capability record.
     expect(existsSync(join(prepared.codexHome, "plugins"))).toBe(false);
-    expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain('":root" = "deny"');
+    expect(profile).toContain('":root" = "deny"');
   });
 });
 
@@ -196,8 +270,11 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
       });
       return { ok: true, output };
     } catch (error) {
-      const err = error as { stdout?: string; stderr?: string };
-      return { ok: false, output: `${err.stdout ?? ""}${err.stderr ?? ""}` };
+      const err = error as { stdout?: string; stderr?: string; message?: string; status?: number; signal?: string };
+      return {
+        ok: false,
+        output: `${err.stdout ?? ""}${err.stderr ?? ""}${err.message ?? ""} (status=${err.status ?? "?"}, signal=${err.signal ?? "?"})`,
+      };
     }
   }
 
@@ -253,6 +330,16 @@ describe.skipIf(!codexAvailable)("codex permission profile (live sandbox)", () =
     })();
     expect(git.ok, `Apple Git should work inside the scoped sandbox: ${git.output}`).toBe(true);
     expect(git.output).toContain("git version");
+  });
+
+  it("lets an installed npm launcher reach its canonical runtime", () => {
+    // Regression: Homebrew's /opt/homebrew/bin/npm launcher was readable, but its canonical
+    // npm-cli.js target was outside the profile, so approved project scripts failed with EPERM.
+    const { granted, codexHome } = setup("read-project");
+
+    const npm = probe(codexHome, granted, ["npm", "--version"]);
+    expect(npm.ok, `npm should run inside the scoped sandbox: ${npm.output}`).toBe(true);
+    expect(npm.output.trim()).toMatch(/^\d+\.\d+/u);
   });
 
   it("edit-project writes inside the grant, but never outside it and never to the network", () => {

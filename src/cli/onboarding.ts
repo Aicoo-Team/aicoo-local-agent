@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
   ApiError,
@@ -9,12 +9,29 @@ import {
 } from "../shared/http-client.js";
 import type { TeamAgentDirectory } from "../shared/contracts.js";
 import type { CapabilitySurface } from "../shared/capability-rollout.js";
+import { BridgeSpool } from "../bridge/spool.js";
+import { bridgeHealthIsFresh, parseBridgeHealth } from "../bridge/health.js";
 
 const MINIMUM_NODE_VERSION = [22, 5, 0] as const;
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_READY_POLL_INTERVAL_MS = 1_000;
 
 export type OnboardingRuntime = "claude-code" | "codex";
+
+export interface BridgeLaunchConfig {
+  runtime: OnboardingRuntime;
+  capabilitySurface: CapabilitySurface;
+  workspace: string;
+}
+
+export function bridgeLaunchConfigMatches(
+  actual: BridgeLaunchConfig | undefined,
+  requested: BridgeLaunchConfig,
+): boolean {
+  return actual?.runtime === requested.runtime
+    && actual.capabilitySurface === requested.capabilitySurface
+    && resolve(actual.workspace) === resolve(requested.workspace);
+}
 
 export interface DeviceAuthorizationClient {
   startDeviceCode(input: StartDeviceCodeInput): Promise<StartDeviceCodeResponse>;
@@ -24,6 +41,24 @@ export interface DeviceAuthorizationClient {
 export interface BridgeReadinessClient {
   getDefaultRoute(): Promise<{ endpointId: string }>;
   heartbeatEndpoint(endpointId: string): Promise<void>;
+}
+
+export function resolveOnboardingRuntimeFiles(
+  spoolFile: string,
+  defaultSpoolFile: string,
+): { logFile: string; pidFile: string } {
+  const spoolPath = resolve(spoolFile);
+  if (spoolPath === resolve(defaultSpoolFile)) {
+    const directory = dirname(spoolPath);
+    return {
+      logFile: resolve(directory, "bridge.log"),
+      pidFile: resolve(directory, "bridge.pid"),
+    };
+  }
+  return {
+    logFile: `${spoolPath}.bridge.log`,
+    pidFile: `${spoolPath}.bridge.pid`,
+  };
 }
 
 function relationshipLabel(relationships: TeamAgentDirectory["agents"][number]["relationships"]): string {
@@ -238,6 +273,121 @@ export function readRunningProcessId(
     return Number.isSafeInteger(pid) && pid > 0 && probe(pid) ? pid : undefined;
   } catch {
     return undefined;
+  }
+}
+
+export function readRegisteredEndpointId(spoolFile: string): string | undefined {
+  try {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      return spool.getIdentity("endpointId");
+    } finally {
+      spool.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+export interface ManagedBridgeStatus {
+  running: boolean;
+  pid?: number;
+  endpointId?: string;
+  runtime?: OnboardingRuntime;
+  capabilitySurface?: CapabilitySurface;
+  workspace?: string;
+}
+
+export function inspectManagedBridge(options: {
+  spoolFile: string;
+  pidFile: string;
+  probe?: (pid: number) => boolean;
+}): ManagedBridgeStatus {
+  const pid = readRunningProcessId(options.pidFile, options.probe);
+  const status: ManagedBridgeStatus = { running: pid !== undefined, ...(pid ? { pid } : {}) };
+  try {
+    const spool = new BridgeSpool(options.spoolFile);
+    try {
+      const endpointId = spool.getIdentity("endpointId");
+      const runtime = spool.getIdentity("launchRuntime");
+      const capabilitySurface = spool.getIdentity("launchCapabilitySurface");
+      const workspace = spool.getIdentity("launchWorkspace");
+      if (endpointId) status.endpointId = endpointId;
+      if (runtime === "codex" || runtime === "claude-code") status.runtime = runtime;
+      if (capabilitySurface === "restricted" || capabilitySurface === "full-agent") {
+        status.capabilitySurface = capabilitySurface;
+      }
+      if (workspace) status.workspace = workspace;
+    } finally {
+      spool.close();
+    }
+  } catch {
+    // A missing or unreadable spool is a valid stopped/unconfigured state.
+  }
+  return status;
+}
+
+export function managedBridgeHealthAllowsReuse(spoolFile: string, nowMs = Date.now()): boolean {
+  try {
+    const spool = new BridgeSpool(spoolFile);
+    try {
+      const health = parseBridgeHealth(spool.getIdentity("bridgeHealth"));
+      return Boolean(
+        health
+        && health.status !== "stopped"
+        && health.status !== "unhealthy"
+        && bridgeHealthIsFresh(health, nowMs),
+      );
+    } finally {
+      spool.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+export async function stopManagedBridge(
+  pid: number,
+  options: {
+    signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
+    probe?: (pid: number) => boolean;
+    delay?: (milliseconds: number) => Promise<void>;
+    timeoutMs?: number;
+  } = {},
+): Promise<void> {
+  const signalProcess = options.signalProcess ?? ((target, signal) => process.kill(target, signal));
+  const probe = options.probe ?? defaultProcessProbe;
+  const delay = options.delay ?? defaultDelay;
+  signalProcess(pid, "SIGTERM");
+  const deadline = Date.now() + (options.timeoutMs ?? 10_000);
+  while (probe(pid) && Date.now() < deadline) {
+    await delay(100);
+  }
+  if (probe(pid)) {
+    throw new Error(`Local bridge process ${pid} did not stop after SIGTERM.`);
+  }
+}
+
+export async function stopManagedBridgeFromPidFile(
+  pidFile: string,
+  options: Parameters<typeof stopManagedBridge>[1] = {},
+): Promise<{ stopped: boolean; pid?: number }> {
+  const pid = readRunningProcessId(pidFile, options.probe);
+  if (pid === undefined) {
+    try { unlinkSync(pidFile); } catch { /* No PID file to clean. */ }
+    return { stopped: false };
+  }
+  await stopManagedBridge(pid, options);
+  try { unlinkSync(pidFile); } catch { /* The exiting bridge may already have removed it. */ }
+  return { stopped: true, pid };
+}
+
+export function removeManagedPidFile(pidFile: string, expectedPid = process.pid): void {
+  try {
+    const pid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+    if (pid === expectedPid) unlinkSync(pidFile);
+  } catch {
+    // Cleanup is best-effort and must not mask the original shutdown reason.
   }
 }
 
