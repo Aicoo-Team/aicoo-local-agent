@@ -27,8 +27,8 @@ The central rule: **a message conveys intent and context, not authority.**
   responder: it may read the message and answer in plain text, but it cannot run commands,
   touch the filesystem, browse, or exfiltrate data. Tool access is off unless the owner opts in.
 - **Tool access is explicit and gated.** Every relationship starts text-only. The owner may grant
-  read/edit project access, and the wider full-agent surface stays closed until OS-level
-  sandboxing, approval, redaction, and rebuild-health gates pass.
+  read/edit project access. The wider full-agent surface requires OS-level sandboxing, approval,
+  and redaction controls; mature unhealthy local rebuild telemetry downgrades it to restricted.
 - **Grant-scoped, revocable delivery.** A sender can only message a recipient through an active,
   time-boxed **communication grant** that the recipient (or an offer they published) authorized.
   Every injection is **re-validated against the control plane at delivery time**, so a revoked or
@@ -261,9 +261,11 @@ for `chat-only`, `read-project`, or `edit-project` access. Claude Code enforces
 allowed file operations per tool call; Codex launches a kernel-scoped permission
 profile for the selected project folders.
 
-`--capability-surface full-agent` is an explicit, evidence-gated mode. It stays
-closed until local rebuild metrics are healthy and the selected runtime has a
-kernel boundary, a live owner-approval route, and an interruptible approval path.
+`--capability-surface full-agent` is an explicit, governed mode. It requires the
+selected runtime to have a kernel boundary, a live owner-approval route, and an
+interruptible approval path. A new bridge's missing local history is not treated
+as failure; after the local sample matures, unhealthy rebuild metrics downgrade
+the bridge to restricted.
 In that mode, arbitrary shell is available only inside the active project boundary
 and only after owner approval. Claude can expose its wider managed tool/MCP surface
 through the same gate. Codex owner MCP/plugin configuration remains isolated until

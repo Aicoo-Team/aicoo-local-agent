@@ -34,7 +34,7 @@ function metrics(overrides: Partial<BoundaryMetricsSnapshot> = {}): BoundaryMetr
 }
 
 describe("full capability rollout gate", () => {
-  it("waives sample count only for literal loopback control planes", () => {
+  it("recognizes only literal loopback control planes for immediate health validation", () => {
     expect(isLoopbackControlPlane("http://localhost:3000")).toBe(true);
     expect(isLoopbackControlPlane("http://127.0.0.1:7790")).toBe(true);
     expect(isLoopbackControlPlane("http://[::1]:3000")).toBe(true);
@@ -47,16 +47,29 @@ describe("full capability rollout gate", () => {
     expect(evaluateCapabilityRollout(metrics())).toMatchObject({ eligible: true, reasons: [] });
   });
 
-  it("stays closed for insufficient evidence or unhealthy rebuild behavior", () => {
-    expect(evaluateCapabilityRollout(metrics({ eligibleTasks: 3 }))).toMatchObject({
-      eligible: false,
-      reasons: ["insufficient_sample"],
-    });
+  it("does not treat a new machine's missing local history as unhealthy evidence", () => {
     expect(evaluateCapabilityRollout(metrics({
+      eligibleTasks: 0,
+      rebuildRate: 0,
+      rebuildFailureRate: 0,
+      rebuildLatencyP95Ms: null,
+    }))).toMatchObject({
+      eligible: true,
+      reasons: [],
+    });
+  });
+
+  it("stays closed for unhealthy rebuild behavior after the sample matures", () => {
+    const unhealthy = {
       rebuildRate: 0.25,
       rebuildFailureRate: 0.2,
       rebuildLatencyP95Ms: 8_000,
-    }))).toMatchObject({
+    };
+    expect(evaluateCapabilityRollout(metrics({ eligibleTasks: 19, ...unhealthy }))).toMatchObject({
+      eligible: true,
+      reasons: [],
+    });
+    expect(evaluateCapabilityRollout(metrics({ eligibleTasks: 20, ...unhealthy }))).toMatchObject({
       eligible: false,
       reasons: ["rebuild_rate_too_high", "rebuild_failure_rate_too_high", "rebuild_latency_too_high"],
     });
@@ -102,20 +115,21 @@ describe("full capability rollout gate", () => {
     });
   });
 
-  it("degrades to restricted instead of refusing to start when evidence is short", () => {
+  it("starts full-agent on a security-ready first run and degrades for mature unhealthy evidence", () => {
     const security = {
       runtime: "codex" as const,
       ownerApprovalGateway: true,
       codexAppServer: true,
     };
-    // The first run of a hosted bridge is exactly this case: zero eligible tasks against a
-    // 20-task threshold. Refusing here made `ccd onboard --capability-surface full-agent` fail
-    // for every new owner, and because the bridge is launched detached the reason never reached
-    // them — they saw a readiness timeout instead.
-    const activation = resolveCapabilitySurface("full-agent", metrics({ eligibleTasks: 0 }), security);
-    expect(activation).toMatchObject({ requested: "full-agent", active: "restricted" });
-    expect(activation.rollout.reasons).toEqual(["insufficient_sample"]);
-    expect(describeCapabilityDegradation(activation)).toContain("20 more");
+    const activation = resolveCapabilitySurface("full-agent", metrics({
+      eligibleTasks: 0,
+      rebuildRate: 0,
+      rebuildFailureRate: 0,
+      rebuildLatencyP95Ms: null,
+    }), security);
+    expect(activation).toMatchObject({ requested: "full-agent", active: "full-agent" });
+    expect(activation.rollout.reasons).toEqual([]);
+    expect(describeCapabilityDegradation(activation)).toBeUndefined();
 
     const unhealthy = resolveCapabilitySurface("full-agent", metrics({ rebuildFailureRate: 0.5 }), security);
     expect(unhealthy.active).toBe("restricted");
