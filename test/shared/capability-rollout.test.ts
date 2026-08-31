@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BoundaryMetricsSnapshot } from "../../src/adapters/boundary-telemetry.js";
 import {
+  describeCapabilityDegradation,
   evaluateCapabilitySecurity,
   evaluateCapabilityRollout,
   isLoopbackControlPlane,
@@ -99,8 +100,46 @@ describe("full capability rollout gate", () => {
       rollout: expect.objectContaining({ eligible: true }),
       security: expect.objectContaining({ eligible: true }),
     });
-    expect(() => resolveCapabilitySurface("full-agent", metrics({ eligibleTasks: 3 }), security))
-      .toThrow(/insufficient_sample/u);
+  });
+
+  it("degrades to restricted instead of refusing to start when evidence is short", () => {
+    const security = {
+      runtime: "codex" as const,
+      ownerApprovalGateway: true,
+      codexAppServer: true,
+    };
+    // The first run of a hosted bridge is exactly this case: zero eligible tasks against a
+    // 20-task threshold. Refusing here made `ccd onboard --capability-surface full-agent` fail
+    // for every new owner, and because the bridge is launched detached the reason never reached
+    // them — they saw a readiness timeout instead.
+    const activation = resolveCapabilitySurface("full-agent", metrics({ eligibleTasks: 0 }), security);
+    expect(activation).toMatchObject({ requested: "full-agent", active: "restricted" });
+    expect(activation.rollout.reasons).toEqual(["insufficient_sample"]);
+    expect(describeCapabilityDegradation(activation)).toContain("20 more");
+
+    const unhealthy = resolveCapabilitySurface("full-agent", metrics({ rebuildFailureRate: 0.5 }), security);
+    expect(unhealthy.active).toBe("restricted");
+    expect(describeCapabilityDegradation(unhealthy)).toContain("rebuild_failure_rate_too_high");
+
+    // A surface that came up as asked has nothing to explain.
+    expect(describeCapabilityDegradation(
+      resolveCapabilitySurface("full-agent", metrics(), security),
+    )).toBeUndefined();
+  });
+
+  it("still refuses to start when full-agent could not be operated safely", () => {
+    // A missing approval gateway has no narrower-but-honest fallback: the owner asked for a
+    // surface whose whole safety story is being asked. That must stay a hard failure.
+    expect(() => resolveCapabilitySurface("full-agent", metrics(), {
+      runtime: "codex",
+      ownerApprovalGateway: false,
+      codexAppServer: true,
+    })).toThrow(/owner_approval_unavailable/u);
+    // Security failures are not silently downgraded by short evidence either.
+    expect(() => resolveCapabilitySurface("full-agent", metrics({ eligibleTasks: 0 }), {
+      runtime: "fake",
+      ownerApprovalGateway: true,
+    })).toThrow(/kernel_boundary_unavailable/u);
   });
 
   it("keeps the full surface closed until the runtime has an enforceable approval gate", () => {
