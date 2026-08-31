@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
+import { PRESET_TOOLS } from "../security/relationship-access.js";
 import type { ToolApprovalRequest } from "./aicoo-transport.js";
 import type {
   ToolApprovalGateway,
@@ -12,14 +13,19 @@ export interface LocalToolApprovalGatewayOptions {
   log?: (line: string) => void;
 }
 
-const SESSION_SCOPE_TOOLS = new Set([
-  "Read",
-  "Write",
-  "Edit",
-  "Glob",
-  "Grep",
-  "GitStatus",
-]);
+/**
+ * Which tools an owner may answer once for the whole collaboration.
+ *
+ * This is the read-only preset, taken from the one table that already defines it rather than
+ * restated here. The hand-written list this replaced had the risk ordering backwards: it let a
+ * single `s` grant standing `Write` and `Edit` — mutation of the owner's files for the rest of
+ * the collaboration — while forcing `GitDiff` and `GitLog`, which are strictly weaker than the
+ * `Read` it did allow, back to a prompt on every call and calling them "high-risk" in the log.
+ *
+ * Deriving it keeps mutation, execution, network, delegation and MCP on `once`, which is the
+ * property that matters, and it removes a seventh copy of the tool vocabulary.
+ */
+const SESSION_SCOPE_TOOLS = new Set<string>(PRESET_TOOLS["read-project"]);
 
 /**
  * Foreground-only approval gateway for the self-hosted localhost control plane.
@@ -65,7 +71,10 @@ export class LocalToolApprovalGateway implements ToolApprovalGateway {
         ? "session"
         : "once";
       if (requestedSession && scope === "once") {
-        this.#log?.(`localhost approval for ${input.toolName} limited to once because it is high-risk`);
+        this.#log?.(
+          `localhost approval for ${input.toolName} limited to once because standing approval is `
+          + "only offered for read-only project tools",
+        );
       }
       const state = {
         approvalId,

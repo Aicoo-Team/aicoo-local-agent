@@ -82,3 +82,30 @@ describe("localhost tool approval", () => {
     await expect(Promise.all([first, second])).resolves.toHaveLength(2);
   });
 });
+
+describe("localhost standing approval scope", () => {
+  it.each(["GitDiff", "GitLog"])(
+    "offers standing approval for %s, which is weaker than the Read it already allowed",
+    async (toolName) => {
+      const gateway = new LocalToolApprovalGateway({ prompt: async () => "s" });
+
+      const result = await gateway.requestToolApproval({ ...request, toolName });
+
+      expect(result).toMatchObject({ decision: "allow", scope: "session" });
+    },
+  );
+
+  it.each(["Write", "Edit", "GitAdd", "GitCommit", "Bash", "WebFetch"])(
+    "keeps %s on a per-call answer even when standing approval is asked for",
+    async (toolName) => {
+      const log = vi.fn();
+      const gateway = new LocalToolApprovalGateway({ prompt: async () => "s", log });
+
+      const result = await gateway.requestToolApproval({ ...request, toolName });
+
+      // Still allowed — the owner said yes — but the yes does not become standing.
+      expect(result).toMatchObject({ decision: "allow", scope: "once" });
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("limited to once"));
+    },
+  );
+});
