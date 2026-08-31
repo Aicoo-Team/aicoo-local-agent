@@ -295,6 +295,8 @@ export interface ManagedBridgeStatus {
   endpointId?: string;
   runtime?: OnboardingRuntime;
   capabilitySurface?: CapabilitySurface;
+  /** What the bridge was launched asking for, when that differs from what it got. */
+  requestedCapabilitySurface?: CapabilitySurface;
   workspace?: string;
 }
 
@@ -311,11 +313,17 @@ export function inspectManagedBridge(options: {
       const endpointId = spool.getIdentity("endpointId");
       const runtime = spool.getIdentity("launchRuntime");
       const capabilitySurface = spool.getIdentity("launchCapabilitySurface");
+      const requestedCapabilitySurface = spool.getIdentity("launchRequestedCapabilitySurface");
       const workspace = spool.getIdentity("launchWorkspace");
       if (endpointId) status.endpointId = endpointId;
       if (runtime === "codex" || runtime === "claude-code") status.runtime = runtime;
       if (capabilitySurface === "restricted" || capabilitySurface === "full-agent") {
         status.capabilitySurface = capabilitySurface;
+      }
+      // Reported separately so a bridge that asked for full-agent and came up restricted reads
+      // as a pending gate rather than as an owner who never asked.
+      if (requestedCapabilitySurface === "restricted" || requestedCapabilitySurface === "full-agent") {
+        status.requestedCapabilitySurface = requestedCapabilitySurface;
       }
       if (workspace) status.workspace = workspace;
     } finally {

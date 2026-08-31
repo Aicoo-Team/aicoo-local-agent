@@ -120,7 +120,30 @@ export function evaluateCapabilitySecurity(
   return { eligible: reasons.length === 0, reasons, controls };
 }
 
-/** An explicit owner request cannot bypass unhealthy or insufficient local evidence. */
+/**
+ * Resolve the surface a bridge may actually run, given what the owner asked for.
+ *
+ * The two gates fail differently, because they answer different questions.
+ *
+ * `evaluateCapabilitySecurity` asks whether full-agent can be *operated* at all: is there an
+ * owner to approve tool calls, is the runtime real, can Codex be interrupted mid-turn. A "no"
+ * there has no safe fallback that still honours the request, so it throws and the bridge
+ * refuses to start.
+ *
+ * `evaluateCapabilityRollout` asks a quality question: has this machine shown that boundary
+ * rebuilding is rare, reliable and fast? A "no" there — and `insufficient_sample`, meaning the
+ * machine has not shown anything yet, is the answer every new bridge gives — is not a reason to
+ * refuse to start. It is a reason to come up on the narrower surface. Throwing made the first
+ * ever run of `--capability-surface full-agent` fail against a hosted control plane, and because
+ * `ccd onboard` launches the bridge detached, the reason only ever reached a log file while the
+ * owner watched a bidirectional-readiness timeout.
+ *
+ * So a rollout blocker degrades instead. `active` is the surface the caller must use; the wider
+ * capability set is simply never advertised while it is `restricted`, which is the same posture
+ * the owner would have had by asking for `restricted` in the first place. Evidence accrues from
+ * ordinary folder-scoped tasks, so a later restart activates full-agent without the owner having
+ * to know this gate exists.
+ */
 export function resolveCapabilitySurface(
   requested: CapabilitySurface,
   metrics: BoundaryMetricsSnapshot,
@@ -129,10 +152,23 @@ export function resolveCapabilitySurface(
 ): CapabilitySurfaceActivation {
   const rollout = evaluateCapabilityRollout(metrics, thresholds);
   const security = evaluateCapabilitySecurity(securityContext);
-  if (requested === "full-agent" && (!rollout.eligible || !security.eligible)) {
-    throw new Error(
-      `full-agent capability is not ready: ${[...rollout.reasons, ...security.reasons].join(", ")}`,
-    );
+  if (requested !== "full-agent") return { requested, active: requested, rollout, security };
+  if (!security.eligible) {
+    throw new Error(`full-agent capability is not ready: ${security.reasons.join(", ")}`);
   }
-  return { requested, active: requested, rollout, security };
+  return { requested, active: rollout.eligible ? "full-agent" : "restricted", rollout, security };
+}
+
+/** Owner-facing explanation of a surface that came up narrower than it was asked to. */
+export function describeCapabilityDegradation(
+  activation: CapabilitySurfaceActivation,
+): string | undefined {
+  if (activation.active === activation.requested) return undefined;
+  const { rollout } = activation;
+  const detail = rollout.reasons.includes("insufficient_sample")
+    ? `${Math.max(rollout.thresholds.minimumEligibleTasks - rollout.metrics.eligibleTasks, 0)} more `
+      + "folder-scoped collaboration tasks are needed before it activates"
+    : `local boundary-rebuild health is outside its limits (${rollout.reasons.join(", ")})`;
+  return `Full agent is not active yet, so this bridge is running on the restricted surface: ${detail}. `
+    + "Everything else works; restart the bridge once the gate clears.";
 }

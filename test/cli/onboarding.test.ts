@@ -219,6 +219,41 @@ describe("local-agent onboarding", () => {
     });
   });
 
+  it("separates the surface a degraded bridge asked for from the one it is running", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccd-bridge-degraded-"));
+    const spoolFile = join(directory, "bridge.spool");
+    const pidFile = join(directory, "bridge.pid");
+    writeFileSync(pidFile, "4321\n");
+    const spool = new BridgeSpool(spoolFile);
+    spool.setIdentity("launchRuntime", "codex");
+    spool.setIdentity("launchCapabilitySurface", "restricted");
+    spool.setIdentity("launchRequestedCapabilitySurface", "full-agent");
+    spool.setIdentity("launchWorkspace", "/tmp/project");
+    spool.close();
+
+    const status = inspectManagedBridge({ spoolFile, pidFile, probe: (pid) => pid === 4321 });
+    expect(status).toMatchObject({
+      capabilitySurface: "restricted",
+      requestedCapabilitySurface: "full-agent",
+    });
+
+    // The relaunch comparison must run on what was asked for. Comparing the active surface would
+    // see "restricted" against a "full-agent" request and kill a healthy bridge on every onboard.
+    const requested = {
+      runtime: "codex" as const,
+      capabilitySurface: "full-agent" as const,
+      workspace: "/tmp/project",
+    };
+    expect(bridgeLaunchConfigMatches(
+      { ...requested, capabilitySurface: status.requestedCapabilitySurface! },
+      requested,
+    )).toBe(true);
+    expect(bridgeLaunchConfigMatches(
+      { ...requested, capabilitySurface: status.capabilitySurface! },
+      requested,
+    )).toBe(false);
+  });
+
   it("stops the exact managed PID and removes its stale PID file", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-bridge-stop-"));
     const pidFile = join(directory, "bridge.pid");

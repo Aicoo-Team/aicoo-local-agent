@@ -73,6 +73,7 @@ import {
 import { getCredentialsFile, loadSavedToken, saveSavedCredentials } from "./credentials.js";
 import {
   DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS,
+  describeCapabilityDegradation,
   evaluateCapabilityRollout,
   isLoopbackControlPlane,
   resolveCapabilitySurface,
@@ -1250,10 +1251,6 @@ async function startBridge(options: {
   const rolloutThresholds = localFunctionalValidation
     ? { ...DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS, minimumEligibleTasks: 0 }
     : DEFAULT_CAPABILITY_ROLLOUT_THRESHOLDS;
-  const rebuildReadiness = evaluateCapabilityRollout(boundaryMetrics, rolloutThresholds);
-  if (options.capabilitySurface === "full-agent" && !rebuildReadiness.eligible) {
-    throw new Error(`full-agent capability is not ready: ${rebuildReadiness.reasons.join(", ")}`);
-  }
   const bridgeInstanceId = randomUUID();
   const relationshipPolicyFile = options.relationshipPolicy ?? `${resolve(options.spool)}.relationships.json`;
   const trustedToolPolicyFile = `${resolve(options.spool)}.trusted-tools.json`;
@@ -1285,6 +1282,11 @@ async function startBridge(options: {
     },
     rolloutThresholds,
   );
+  // A narrower surface than the owner asked for is a normal outcome, not a failure, but it must
+  // be said out loud. The bridge is started detached by `ccd onboard`, so anything that is not
+  // printed here is only ever visible to somebody who goes looking in the log file.
+  const capabilityDegradation = describeCapabilityDegradation(capabilityActivation);
+  if (capabilityDegradation) console.log(`! ${capabilityDegradation}`);
   const selected = await selectRuntimeAdapter({
     kind: options.adapter,
     sessions: Number.parseInt(options.sessions, 10),
@@ -1321,6 +1323,12 @@ async function startBridge(options: {
   spool.setIdentity("spoolFile", resolve(options.spool));
   spool.setIdentity("launchRuntime", selected.runtime);
   spool.setIdentity("launchCapabilitySurface", capabilityActivation.active);
+  // Both surfaces are recorded because they answer different questions. `launchCapabilitySurface`
+  // is what this bridge is running, which `ccd status` reports. The requested one is what it was
+  // asked for, and that is what relaunch comparison must use: a bridge that degraded to
+  // `restricted` is still the bridge `--capability-surface full-agent` asked for, and comparing
+  // the active surface instead would make every later `ccd onboard` kill and relaunch it.
+  spool.setIdentity("launchRequestedCapabilitySurface", capabilityActivation.requested);
   spool.setIdentity("launchWorkspace", resolve(options.workspace ?? process.cwd()));
   // This watchdog owns a separate event loop. Unlike heartbeat timers in this process, it can
   // still stop the daemon if runtime execution completely starves the bridge's main thread.
@@ -1458,7 +1466,10 @@ function readBridgeLaunchConfig(spoolFile: string): BridgeLaunchConfig | undefin
     const spool = new BridgeSpool(spoolFile);
     try {
       const runtime = spool.getIdentity("launchRuntime");
-      const capabilitySurface = spool.getIdentity("launchCapabilitySurface");
+      // Bridges launched before the requested surface was recorded only have the active one.
+      // Falling back to it keeps their comparison exactly as accurate as it was.
+      const capabilitySurface = spool.getIdentity("launchRequestedCapabilitySurface")
+        ?? spool.getIdentity("launchCapabilitySurface");
       const workspace = spool.getIdentity("launchWorkspace");
       if ((runtime !== "claude-code" && runtime !== "codex")
         || (capabilitySurface !== "restricted" && capabilitySurface !== "full-agent")
