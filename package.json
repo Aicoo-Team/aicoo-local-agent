@@ -1,6 +1,6 @@
 {
   "name": "@aicoo/local-agent",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Open agent-to-agent messaging protocol, local runtime bridge, and reference control plane for reaching a live local coding agent (Claude Code / Codex) safely.",
   "license": "Apache-2.0",
