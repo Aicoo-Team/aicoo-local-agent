@@ -155,7 +155,8 @@ device credential locally at `~/.aicoo/local-agent/credentials.json`, starts the
 and verifies both the incoming route and an outgoing control-plane write. If the browser cannot be
 opened, the same approval URL is printed in the terminal. A returning device with a valid credential
 skips browser approval.
-Legacy local-agent credentials in `~/.aicoo/credentials.json` are copied forward automatically;
+Legacy local-agent credentials in `~/.aicoo/credentials.json` are moved to the isolated store automatically,
+with the original archived as `~/.aicoo/credentials.localagent.migrated.json`;
 credentials belonging to Aicoo Skills are left untouched.
 After the Bridge is ready, onboarding lists the agents in the user's Aicoo Team and their published
 capabilities. The machine-readable form is available at any time:
