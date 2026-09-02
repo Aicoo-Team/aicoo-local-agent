@@ -1,5 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, parse } from "node:path";
 import type { RelationshipAccessPreset } from "../../security/relationship-policy.js";
@@ -60,6 +71,14 @@ export interface CodexPermissionProfileInput {
   commandExecutables?: readonly string[];
   /** Test seam for the shell PATH written into the isolated runtime environment. */
   commandSearchPath?: string;
+  /** Create a private, deny-by-default runtime even when no project or MCP grant is active. */
+  isolateRuntime?: boolean;
+  /** Import skill bundles only; plugin manifests, hooks, settings, and MCP config are never copied. */
+  includeOwnerSkills?: boolean;
+  /** Test seam; production discovers the owner's standard Codex and agent skill roots. */
+  ownerSkillRoots?: readonly string[];
+  /** Internal path granted read access after sanitized skill import. */
+  runtimeSkillsDirectory?: string;
 }
 
 const PROJECT_COMMAND_EXECUTABLES = [
@@ -81,11 +100,11 @@ const PROJECT_COMMAND_EXECUTABLES = [
  */
 export function renderCodexPermissionProfile(input: CodexPermissionProfileInput): string | undefined {
   const mcpServers = parseRemoteMcpGrants(input.mcpServers ?? []);
-  if (input.preset === "chat-only" && mcpServers.length === 0) return undefined;
+  if (input.preset === "chat-only" && mcpServers.length === 0 && !input.isolateRuntime) return undefined;
   const folders = input.preset === "chat-only"
     ? []
     : [...new Set(input.folders)].filter((folder) => folder.trim().length > 0);
-  if (folders.length === 0 && mcpServers.length === 0) return undefined;
+  if (folders.length === 0 && mcpServers.length === 0 && !input.isolateRuntime) return undefined;
 
   const name = input.profileName ?? CODEX_PROFILE_NAME;
   // read-project may only read; edit-project may also write. Codex resolves "deny" ahead of any
@@ -110,7 +129,10 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
   ])];
   const developerDirectory = folders.length > 0 ? resolveDeveloperDirectory(input) : undefined;
   const runtimeTempDirectory = folders.length > 0 ? input.runtimeTempDirectory : undefined;
-  const runtimeExecutablePaths = folders.length > 0 ? resolveRuntimeExecutablePaths(input.runtimeExecutable) : [];
+  // app-server launches its sandbox helper through the Codex executable even for a zero-grant
+  // thread. Keep that exact launcher/runtime readable inside every isolated profile; otherwise
+  // the private home fails before a model turn can start.
+  const runtimeExecutablePaths = resolveRuntimeExecutablePaths(input.runtimeExecutable);
   const commandRuntimePaths = folders.length > 0
     ? resolveCommandExecutablePaths(input.commandExecutables ?? [], input.platform ?? process.platform)
     : [];
@@ -124,6 +146,15 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     // The private home must not fall back to owner OAuth stored in a system keyring. A granted
     // server either uses its named bearer environment variable or connects without credentials.
     'mcp_oauth_credentials_store = "file"',
+    "",
+    "[features]",
+    // Account-backed plugins/apps can be reported as installed even with a fresh CODEX_HOME.
+    // Disable their runtime injection explicitly; sanitized skills and exact relationship MCP
+    // grants below are the only capability sources this session receives.
+    "plugins = false",
+    "apps = false",
+    "remote_plugin = false",
+    "hooks = false",
     "",
     "[history]",
     'persistence = "none"',
@@ -156,6 +187,7 @@ export function renderCodexPermissionProfile(input: CodexPermissionProfileInput)
     ...runtimeExecutablePaths.map((path) => `${tomlString(path)} = "read"`),
     ...commandRuntimePaths.map((path) => `${tomlString(path)} = "read"`),
     ...(runtimeTempDirectory ? [`${tomlString(runtimeTempDirectory)} = "write"`] : []),
+    ...(input.runtimeSkillsDirectory ? [`${tomlString(input.runtimeSkillsDirectory)} = "read"`] : []),
     ...writableFolders.map((folder) => `${tomlString(folder)} = "write"`),
     "",
     ...(folders.length > 0 ? [
@@ -369,12 +401,16 @@ export function writeCodexPermissionProfile(
   const commandExecutables = hasProjectAccess
     ? input.commandExecutables ?? discoverCommandExecutables(input.commandSearchPath ?? process.env.PATH, platform)
     : [];
+  const runtimeSkillsDirectory = input.includeOwnerSkills
+    ? importOwnerSkills(directory, input.ownerSkillRoots)
+    : undefined;
   const profile = renderCodexPermissionProfile({
     ...input,
     platform,
     commandExecutables,
     ...(developerDirectory ? { developerDirectory } : {}),
     ...(runtimeTempDirectory ? { runtimeTempDirectory } : {}),
+    ...(runtimeSkillsDirectory ? { runtimeSkillsDirectory } : {}),
   });
   if (!profile) return undefined;
   writeFileSync(join(directory, "config.toml"), profile, { mode: 0o600 });
@@ -396,6 +432,56 @@ export function writeCodexPermissionProfile(
     workspaceRoots: [...new Set(input.folders)],
     ...(environment ? { environment } : {}),
   };
+}
+
+function importOwnerSkills(directory: string, configuredRoots?: readonly string[]): string | undefined {
+  const ownerCodexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
+  const roots = configuredRoots ?? [
+    join(ownerCodexHome, "skills"),
+    join(homedir(), ".agents", "skills"),
+    join(ownerCodexHome, "plugins", "cache"),
+  ];
+  const skills = [...new Set(roots.flatMap((root) => discoverSkillDirectories(root)))].sort();
+  if (skills.length === 0) return undefined;
+  const targetRoot = join(directory, "skills");
+  rmSync(targetRoot, { recursive: true, force: true });
+  mkdirSync(targetRoot, { recursive: true, mode: 0o700 });
+  for (const source of skills) {
+    const slug = basename(source).replace(/[^a-zA-Z0-9_-]/gu, "-") || "skill";
+    const suffix = createHash("sha256").update(source).digest("hex").slice(0, 10);
+    copySkillTree(source, join(targetRoot, `${slug}-${suffix}`));
+  }
+  return targetRoot;
+}
+
+function discoverSkillDirectories(root: string, depth = 0): string[] {
+  if (depth > 10 || !existsSync(root)) return [];
+  try {
+    if (!lstatSync(root).isDirectory() || lstatSync(root).isSymbolicLink()) return [];
+    const skillFile = join(root, "SKILL.md");
+    if (existsSync(skillFile) && lstatSync(skillFile).isFile() && !lstatSync(skillFile).isSymbolicLink()) {
+      return [root];
+    }
+    return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+      if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name === ".git" || entry.name === "node_modules") {
+        return [];
+      }
+      return discoverSkillDirectories(join(root, entry.name), depth + 1);
+    });
+  } catch {
+    return [];
+  }
+}
+
+function copySkillTree(source: string, target: string): void {
+  mkdirSync(target, { recursive: true, mode: 0o700 });
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue;
+    const from = join(source, entry.name);
+    const to = join(target, entry.name);
+    if (entry.isDirectory()) copySkillTree(from, to);
+    else if (entry.isFile()) copyFileSync(from, to);
+  }
 }
 
 function nullDevice(platform: NodeJS.Platform): string {

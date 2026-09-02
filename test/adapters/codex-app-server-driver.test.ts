@@ -21,6 +21,7 @@ async function run(options: {
   writableRoots?: string[];
   permissionProfile?: { codexHome: string; profileName: string };
   turnTimeoutMs?: number;
+  onDynamicToolCall?: (call: { tool: string; arguments: unknown }) => Promise<{ success: boolean; text: string }>;
 } = {}): Promise<RunResult> {
   const asked: CodexApprovalRequest[] = [];
   const previous: Record<string, string | undefined> = {};
@@ -46,6 +47,15 @@ async function run(options: {
     ...(options.writableRoots ? { writableRoots: options.writableRoots } : {}),
     ...(options.permissionProfile ? { permissionProfile: options.permissionProfile } : {}),
     ...(options.turnTimeoutMs ? { turnTimeoutMs: options.turnTimeoutMs } : {}),
+    ...(options.onDynamicToolCall ? { onDynamicToolCall: options.onDynamicToolCall } : {}),
+    ...(options.onDynamicToolCall ? {
+      dynamicTools: [{
+        type: "function" as const,
+        name: "request_capability",
+        description: "Ask the owner for a capability",
+        inputSchema: { type: "object" },
+      }],
+    } : {}),
   });
 
   const events: CodexThreadEvent[] = [];
@@ -193,6 +203,23 @@ describe("CodexAppServerDriver", () => {
 
     expect(result.events).toContainEqual(expect.objectContaining({ type: "turn.completed" }));
     expect(result.events).not.toContainEqual(expect.objectContaining({ type: "error", fatal: true }));
+  });
+
+  it("registers dynamic tools and routes their calls to the host", async () => {
+    const calls: Array<{ tool: string; arguments: unknown }> = [];
+    const result = await run({
+      env: { FAKE_CALL_DYNAMIC_TOOL: "1" },
+      onDynamicToolCall: async (call) => {
+        calls.push(call);
+        return { success: true, text: "owner approved; rebuild required" };
+      },
+    });
+
+    expect(calls).toEqual([expect.objectContaining({
+      tool: "request_capability",
+      arguments: { capability: "mcp.lark.search_messages", reason: "Find the requested discussion" },
+    })]);
+    expect(result.replyText).toBe("owner approved; rebuild required");
   });
 
   it("terminates a full-capability turn that exceeds its execution budget", async () => {

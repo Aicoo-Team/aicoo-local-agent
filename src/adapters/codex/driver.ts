@@ -47,9 +47,35 @@ export interface CodexTurnStartInput {
    * Only the app-server driver can honour this; `codex exec` has no way to be interrupted.
    */
   onApproval?: (request: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
+  /** Experimental app-server tools registered when a new provider thread is created. */
+  dynamicTools?: readonly CodexDynamicToolSpec[];
+  /** Handles `item/tool/call`; absence fails closed in the app-server driver. */
+  onDynamicToolCall?: (call: CodexDynamicToolCall) => Promise<CodexDynamicToolResult>;
   /** Hard wall-clock limit for one app-server turn, including tool execution. */
   turnTimeoutMs?: number;
   log?: (line: string) => void;
+}
+
+export interface CodexDynamicToolSpec {
+  type: "function";
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  deferLoading?: boolean;
+}
+
+export interface CodexDynamicToolCall {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  namespace: string | null;
+  tool: string;
+  arguments: unknown;
+}
+
+export interface CodexDynamicToolResult {
+  success: boolean;
+  text: string;
 }
 
 export interface CodexTurn extends AsyncIterable<CodexThreadEvent> {

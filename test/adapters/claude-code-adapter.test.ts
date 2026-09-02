@@ -1021,14 +1021,20 @@ describe("CodeAdapter just-in-time tool approval", () => {
     const g = gateway("allow");
     const options = await startedAdapter(g, editPolicyFile(), "collab-full", "full-agent");
 
-    expect(options.tools).toEqual(expect.arrayContaining([
-      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill",
-    ]));
+    // Full-agent must not cap the provider's capability surface before PreToolUse can
+    // turn an attempted call into an owner-resolvable permission decision.
+    expect(options.tools).toBeUndefined();
     expect(options.disallowedTools).toEqual([]);
     expect(options.settingSources).toEqual(["user", "project", "local"]);
-    expect(options.mcpServers).toEqual({});
+    expect(options.skills).toBe("all");
+    expect(options.extraArgs).not.toHaveProperty("safe-mode");
+    expect(options.extraArgs).toMatchObject({ "replay-user-messages": null });
+    expect(options.mcpServers).toHaveProperty("aicoo_capabilities");
     expect(options.strictMcpConfig).toBe(true);
     expect(options.managedSettings).toMatchObject({
+      disableSkillShellExecution: true,
+      allowManagedHooksOnly: true,
+      allowManagedPermissionRulesOnly: true,
       sandbox: {
         enabled: true,
         failIfUnavailable: true,
@@ -1040,6 +1046,9 @@ describe("CodeAdapter just-in-time tool approval", () => {
         },
       },
     });
+    expect(options.systemPrompt).toContain("Requestable capability catalogue:");
+    expect(options.systemPrompt).toContain("network.search (WebSearch)");
+    expect(options.systemPrompt).toContain("request_capability");
 
     expect(await options.canUseTool?.("Bash", {
       command: "npm test",
@@ -1056,6 +1065,30 @@ describe("CodeAdapter just-in-time tool approval", () => {
     expect(g.asked).toEqual([
       expect.objectContaining({ toolName: "Bash", toolInputSummary: "Bash npm test" }),
     ]);
+
+    expect(await options.canUseTool?.(
+      "mcp__aicoo_capabilities__request_capability",
+      { capability: "mcp.lark.search_messages", reason: "Find the requested message" },
+      permissionContext(),
+    )).toMatchObject({ behavior: "allow" });
+    expect(g.asked.at(-1)).toMatchObject({
+      toolName: "mcp__aicoo_capabilities__request_capability",
+      toolInputSummary: expect.stringContaining("mcp.lark.search_messages"),
+    });
+
+    // A provider-added tool must reach the same approval loop instead of becoming a capability
+    // refusal merely because this adapter version predates the tool. The edit boundary and
+    // kernel sandbox remain authoritative even after the owner allows the attempt.
+    expect(await options.canUseTool?.(
+      "FutureDangerousTool",
+      { target: "owner-account" },
+      permissionContext(),
+    )).toMatchObject({ behavior: "allow" });
+    expect(g.asked.at(-1)).toMatchObject({
+      toolName: "FutureDangerousTool",
+      toolInputSummary: expect.stringContaining("owner-account"),
+    });
+    expect(g.asked).toHaveLength(3);
 
     const preToolUseHook = options.hooks?.PreToolUse?.[0]?.hooks?.[0];
     expect(await preToolUseHook?.({
@@ -1100,6 +1133,7 @@ describe("CodeAdapter just-in-time tool approval", () => {
     const options = await startedAdapter(g, mcpOnlyPolicyFile(tokenVariable), "collab-mcp", "full-agent");
 
     expect(options.mcpServers).toEqual({
+      aicoo_capabilities: expect.anything(),
       docs: {
         type: "http",
         url: "https://mcp.example.com/v1",
@@ -1113,6 +1147,8 @@ describe("CodeAdapter just-in-time tool approval", () => {
         alwaysLoad: true,
       },
     });
+    expect(options.systemPrompt).toContain("mcp.docs.read");
+    expect(options.systemPrompt).not.toContain("mcp.docs.search");
     expect(options.strictMcpConfig).toBe(true);
     expect(options.additionalDirectories).toBeUndefined();
 

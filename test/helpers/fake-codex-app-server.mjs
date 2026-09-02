@@ -25,6 +25,7 @@ const APPROVAL_PARAMS = JSON.parse(
 );
 
 let approvalRequestId = null;
+let dynamicToolRequestId = null;
 let threadStartParams = null;
 let experimentalApiEnabled = false;
 
@@ -43,6 +44,12 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     const decision = msg.result?.decision ?? (msg.result?.permissions ? "permissions-answered" : "unknown");
     // Deliberately camelCase, like the real server: the driver has to normalize it.
     notify("item/completed", { item: { type: "agentMessage", id: "msg_1", text: `decision=${decision}` } });
+    notify("turn/completed", { threadId: "th_fake" });
+    return;
+  }
+  if (msg.id !== undefined && msg.method === undefined && msg.id === dynamicToolRequestId) {
+    const text = msg.result?.contentItems?.[0]?.text ?? "missing dynamic tool response";
+    notify("item/completed", { item: { type: "agentMessage", id: "msg_1", text } });
     notify("turn/completed", { threadId: "th_fake" });
     return;
   }
@@ -85,6 +92,31 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     notify("thread/tokenUsage/updated", { tokenUsage: { total: { totalTokens: 1 } } });
 
     if (process.env.FAKE_HANG_AFTER_TURN_START) return;
+
+    if (process.env.FAKE_CALL_DYNAMIC_TOOL) {
+      if (!threadStartParams?.dynamicTools?.some((candidate) => candidate.name === "request_capability")) {
+        notify("item/completed", {
+          item: { type: "agentMessage", id: "msg_1", text: "dynamic tool was not registered" },
+        });
+        notify("turn/completed", { threadId: "th_fake" });
+        return;
+      }
+      dynamicToolRequestId = 9002;
+      send({
+        jsonrpc: "2.0",
+        id: dynamicToolRequestId,
+        method: "item/tool/call",
+        params: {
+          threadId: "th_fake",
+          turnId: "turn_fake",
+          callId: "call_fake",
+          namespace: null,
+          tool: "request_capability",
+          arguments: { capability: "mcp.lark.search_messages", reason: "Find the requested discussion" },
+        },
+      });
+      return;
+    }
 
     if (process.env.FAKE_SKIP_APPROVAL) {
       const text = process.env.FAKE_REPORT_THREAD_START
