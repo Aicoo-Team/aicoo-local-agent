@@ -50,7 +50,9 @@ export function capabilityRequestSummary(input: CapabilityRequestArguments): str
 }
 
 export function approvedCapabilityRequestText(capability: string): string {
-  return `The owner approved the request for ${capability}. It is not active yet. Wait for Aicoo to rebuild and expose the exact tool before using it.`;
+  return `The owner approved the request for ${capability}, but it is not active yet. `
+    + "The owner must configure and grant the exact capability. Aicoo will rebuild the affected session "
+    + "when that grant arrives; do not retry until the tool is exposed.";
 }
 
 export function capabilityCatalogue(grants: readonly CapabilityCatalogueMcpGrant[]): string {

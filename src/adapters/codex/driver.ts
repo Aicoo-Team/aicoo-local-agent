@@ -83,6 +83,8 @@ export interface CodexTurn extends AsyncIterable<CodexThreadEvent> {
 }
 
 export interface CodexDriver {
+  /** True only for transports that can expose and answer app-server dynamic tools. */
+  readonly supportsDynamicTools?: boolean;
   startTurn(input: CodexTurnStartInput): CodexTurn;
 }
 

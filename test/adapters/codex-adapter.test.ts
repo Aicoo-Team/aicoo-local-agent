@@ -254,6 +254,57 @@ describe("CodexAdapter managed sessions", () => {
     })]);
   });
 
+  it("exposes capability requests to restricted app-server sessions", async () => {
+    // Regression: restricted Codex knew only its mounted tools, so unavailable integrations could
+    // never create an owner-resolvable approval request even when app-server callbacks existed.
+    const directory = mkdtempSync(join(tmpdir(), "ccd-codex-restricted-capability-request-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const policyFile = join(directory, "relationships.json");
+    writeFileSync(policyFile, JSON.stringify({ version: 1, relationships: [] }));
+    const driver = new FakeCodexDriver("done");
+    (driver as FakeCodexDriver & { supportsDynamicTools: boolean }).supportsDynamicTools = true;
+    const asked: Array<{ toolName: string; toolInputSummary: string }> = [];
+    const adapter = new CodexAdapter({
+      stateFile: ":memory:",
+      cwd: directory,
+      relationshipPolicyFile: policyFile,
+      driver,
+      capabilitySurface: "restricted",
+      approvalGateway: {
+        async requestToolApproval(input) {
+          asked.push(input);
+          return { approvalId: "appr-restricted-cap", status: "allow", decision: "allow" };
+        },
+        async getToolApproval() {
+          return { status: "allow", decision: "allow" };
+        },
+      },
+    });
+    cleanups.push(() => adapter.close());
+
+    await adapter.initialize();
+    const events = collectEvents(adapter, "codex-managed-1", 2);
+    await adapter.deliverToSession("codex-managed-1", inbound("msg_restricted_cap_request"), "queue");
+    await events;
+
+    expect(driver.turns[0]?.prompt).toContain("Requestable capability catalogue:");
+    expect(driver.turns[0]?.dynamicTools).toEqual([
+      expect.objectContaining({ name: "request_capability" }),
+    ]);
+    await expect(driver.turns[0]?.onDynamicToolCall?.({
+      threadId: "thread",
+      turnId: "turn",
+      callId: "call",
+      namespace: null,
+      tool: "request_capability",
+      arguments: { capability: "mcp.lark.search_messages", reason: "Find the requested discussion" },
+    })).resolves.toEqual(expect.objectContaining({
+      success: true,
+      text: expect.stringContaining("not active"),
+    }));
+    expect(asked).toEqual([expect.objectContaining({ toolName: "request_capability" })]);
+  });
+
   it("always isolates full-agent Codex even before project or MCP access is granted", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccd-codex-empty-full-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));

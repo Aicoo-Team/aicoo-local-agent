@@ -29,6 +29,7 @@ export interface CodexAppServerDriverConfig {
 }
 
 export class CodexAppServerDriver implements CodexDriver {
+  readonly supportsDynamicTools = true;
   readonly #config: CodexAppServerDriverConfig;
 
   constructor(config: CodexAppServerDriverConfig = {}) {

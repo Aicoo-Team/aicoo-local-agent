@@ -254,7 +254,7 @@ export class CodexAdapter implements RuntimeAdapter {
     message: InboundMessage,
     sessionHandle: string,
   ): Pick<CodexTurnStartInput, "dynamicTools" | "onDynamicToolCall"> {
-    if (this.#config.capabilitySurface !== "full-agent") return {};
+    if (this.#config.capabilitySurface !== "full-agent" && !this.#driver.supportsDynamicTools) return {};
     return {
       dynamicTools: [CAPABILITY_REQUEST_DYNAMIC_TOOL],
       onDynamicToolCall: async (call) => {
@@ -560,7 +560,9 @@ export class CodexAdapter implements RuntimeAdapter {
           }
         })()
       : [];
-    const capabilityInstructions = this.#config.capabilitySurface === "full-agent"
+    const capabilityInstructions = (
+      this.#config.capabilitySurface === "full-agent" || this.#driver.supportsDynamicTools
+    )
       ? capabilityCatalogue(mcpServers)
       : undefined;
     const turn = this.#driver.startTurn({
