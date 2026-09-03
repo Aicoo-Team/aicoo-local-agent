@@ -29,6 +29,7 @@ export interface CodexAppServerDriverConfig {
 }
 
 export class CodexAppServerDriver implements CodexDriver {
+  readonly supportsDynamicTools = true;
   readonly #config: CodexAppServerDriverConfig;
 
   constructor(config: CodexAppServerDriverConfig = {}) {
@@ -116,6 +117,7 @@ class CodexAppServerTurn implements CodexTurn {
         ? await this.#request("thread/resume", { threadId: this.#input.resumeThreadId })
         : await this.#request("thread/start", {
           cwd: this.#input.cwd,
+          ...(this.#input.dynamicTools?.length ? { dynamicTools: this.#input.dynamicTools } : {}),
           // Everything the sandbox cannot serve becomes a question for the owner rather than a
           // silent refusal. That is the entire point of using app-server over exec.
           approvalPolicy: "untrusted",
@@ -204,6 +206,21 @@ class CodexAppServerTurn implements CodexTurn {
   }
 
   async #answerServerRequest(id: number, method: string, params: unknown): Promise<void> {
+    if (method === "item/tool/call") {
+      if (!this.#input.onDynamicToolCall) {
+        this.#config.log?.("codex dynamic tool refused: no host route configured");
+        this.#respond(id, dynamicToolResponse(false, "Aicoo capability request route is unavailable"));
+        return;
+      }
+      try {
+        const result = await this.#input.onDynamicToolCall(params as Parameters<NonNullable<CodexTurnStartInput["onDynamicToolCall"]>>[0]);
+        this.#respond(id, dynamicToolResponse(result.success, result.text));
+      } catch (error) {
+        this.#config.log?.(`codex dynamic tool failed closed: ${String(error)}`);
+        this.#respond(id, dynamicToolResponse(false, "Aicoo capability request failed"));
+      }
+      return;
+    }
     if (!method.endsWith("requestApproval")) {
       // Anything else the server asks gets a minimal answer so it does not stall waiting on us.
       this.#respond(id, {});
@@ -270,6 +287,10 @@ class CodexAppServerTurn implements CodexTurn {
   [Symbol.asyncIterator](): AsyncIterator<CodexThreadEvent> {
     return this.#events[Symbol.asyncIterator]();
   }
+}
+
+function dynamicToolResponse(success: boolean, text: string): Record<string, unknown> {
+  return { success, contentItems: [{ type: "inputText", text }] };
 }
 
 /**

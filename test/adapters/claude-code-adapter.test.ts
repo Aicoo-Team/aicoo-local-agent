@@ -51,15 +51,21 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     const events = collectEvents(adapter, "claude-managed-1", 2);
     const result = await adapter.deliverToSession("claude-managed-1", inbound("msg_initial"), "new_turn");
     const options = driver.starts.at(-1)!.options;
-    expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
+    expect(options.tools).toBeUndefined();
     expect(options.allowedTools).toEqual([]);
     expect(options.settingSources).toEqual([]);
-    expect(options.mcpServers).toEqual({});
+    expect(options.mcpServers).toHaveProperty("aicoo_capabilities");
     expect(options.strictMcpConfig).toBe(true);
     // "dontAsk" would resolve every permission internally — auto-allowing reads inside cwd
     // and auto-denying the rest — without ever consulting the hook or canUseTool.
     expect(options.permissionMode).toBe("default");
-    expect(options.extraArgs).toMatchObject({ "safe-mode": null, "replay-user-messages": null });
+    expect(options.extraArgs).not.toHaveProperty("safe-mode");
+    expect(options.extraArgs).toMatchObject({ "replay-user-messages": null });
+    expect(options.managedSettings).toMatchObject({
+      disableSkillShellExecution: true,
+      allowManagedHooksOnly: true,
+      allowManagedPermissionRulesOnly: true,
+    });
     expect(await options.canUseTool?.("Bash", { command: "touch /tmp/aicoo-pwned" }, {
       signal: new AbortController().signal,
       toolUseID: "malicious-tool-call",
@@ -145,7 +151,7 @@ describe("ClaudeCodeAdapter managed sessions", () => {
     expect(await adapter.deliverToSession("claude-managed-1", inbound("msg_permission"), "new_turn"))
       .toMatchObject({ status: "runtime_acked" });
     const options = driver.starts.at(-1)!.options;
-    expect(options.tools).toEqual(["Bash", "Edit", "Read", "Write"]);
+    expect(options.tools).toBeUndefined();
     expect(options.allowedTools).toEqual([]);
     expect(await options.canUseTool?.("Read", { file_path: "README.md" }, {
       signal: new AbortController().signal,
@@ -1021,14 +1027,20 @@ describe("CodeAdapter just-in-time tool approval", () => {
     const g = gateway("allow");
     const options = await startedAdapter(g, editPolicyFile(), "collab-full", "full-agent");
 
-    expect(options.tools).toEqual(expect.arrayContaining([
-      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill",
-    ]));
+    // Full-agent must not cap the provider's capability surface before PreToolUse can
+    // turn an attempted call into an owner-resolvable permission decision.
+    expect(options.tools).toBeUndefined();
     expect(options.disallowedTools).toEqual([]);
     expect(options.settingSources).toEqual(["user", "project", "local"]);
-    expect(options.mcpServers).toEqual({});
+    expect(options.skills).toBe("all");
+    expect(options.extraArgs).not.toHaveProperty("safe-mode");
+    expect(options.extraArgs).toMatchObject({ "replay-user-messages": null });
+    expect(options.mcpServers).toHaveProperty("aicoo_capabilities");
     expect(options.strictMcpConfig).toBe(true);
     expect(options.managedSettings).toMatchObject({
+      disableSkillShellExecution: true,
+      allowManagedHooksOnly: true,
+      allowManagedPermissionRulesOnly: true,
       sandbox: {
         enabled: true,
         failIfUnavailable: true,
@@ -1040,6 +1052,9 @@ describe("CodeAdapter just-in-time tool approval", () => {
         },
       },
     });
+    expect(options.systemPrompt).toContain("Requestable capability catalogue:");
+    expect(options.systemPrompt).toContain("network.search (WebSearch)");
+    expect(options.systemPrompt).toContain("request_capability");
 
     expect(await options.canUseTool?.("Bash", {
       command: "npm test",
@@ -1056,6 +1071,30 @@ describe("CodeAdapter just-in-time tool approval", () => {
     expect(g.asked).toEqual([
       expect.objectContaining({ toolName: "Bash", toolInputSummary: "Bash npm test" }),
     ]);
+
+    expect(await options.canUseTool?.(
+      "mcp__aicoo_capabilities__request_capability",
+      { capability: "mcp.lark.search_messages", reason: "Find the requested message" },
+      permissionContext(),
+    )).toMatchObject({ behavior: "allow" });
+    expect(g.asked.at(-1)).toMatchObject({
+      toolName: "mcp__aicoo_capabilities__request_capability",
+      toolInputSummary: expect.stringContaining("mcp.lark.search_messages"),
+    });
+
+    // A provider-added tool must reach the same approval loop instead of becoming a capability
+    // refusal merely because this adapter version predates the tool. The edit boundary and
+    // kernel sandbox remain authoritative even after the owner allows the attempt.
+    expect(await options.canUseTool?.(
+      "FutureDangerousTool",
+      { target: "owner-account" },
+      permissionContext(),
+    )).toMatchObject({ behavior: "allow" });
+    expect(g.asked.at(-1)).toMatchObject({
+      toolName: "FutureDangerousTool",
+      toolInputSummary: expect.stringContaining("owner-account"),
+    });
+    expect(g.asked).toHaveLength(3);
 
     const preToolUseHook = options.hooks?.PreToolUse?.[0]?.hooks?.[0];
     expect(await preToolUseHook?.({
@@ -1092,6 +1131,58 @@ describe("CodeAdapter just-in-time tool approval", () => {
     });
   });
 
+  it("lets a restricted peer request an unavailable capability through owner approval", async () => {
+    // Regression: the restricted tools whitelist hid WebSearch and every unmounted MCP tool, so
+    // the model could only refuse; no tool_use reached PreToolUse and the owner was never asked.
+    const g = gateway("allow");
+    const options = await startedAdapter(g, readPolicyFile(), "collab-restricted", "restricted");
+
+    expect(options.systemPrompt).toContain("Requestable capability catalogue:");
+    expect(options.systemPrompt).toContain("network.search (WebSearch)");
+    expect(options.tools).toBeUndefined();
+    expect(options.disallowedTools).toEqual([]);
+    expect(options.mcpServers).toHaveProperty("aicoo_capabilities");
+
+    await expect(options.canUseTool?.(
+      "WebSearch",
+      { query: "current TypeScript release" },
+      permissionContext(),
+    )).resolves.toMatchObject({ behavior: "allow" });
+    expect(g.asked.at(-1)).toMatchObject({
+      toolName: "WebSearch",
+      toolInputSummary: expect.stringContaining("current TypeScript release"),
+    });
+
+    const preToolUseHook = options.hooks?.PreToolUse?.[0]?.hooks?.[0];
+    expect(preToolUseHook).toBeTypeOf("function");
+    await expect(preToolUseHook!(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "WebSearch",
+        tool_input: { query: "current TypeScript release" },
+        tool_use_id: "restricted-web-search",
+        session_id: "s",
+        transcript_path: "",
+        cwd: options.cwd ?? "",
+        permission_mode: "default",
+      } as never,
+      "restricted-web-search",
+      { signal: new AbortController().signal },
+    )).resolves.toMatchObject({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+    });
+
+    await expect(options.canUseTool?.(
+      "mcp__aicoo_capabilities__request_capability",
+      { capability: "network.search", reason: "Research the requested topic" },
+      permissionContext(),
+    )).resolves.toMatchObject({ behavior: "allow" });
+    expect(g.asked.at(-1)).toMatchObject({
+      toolName: "mcp__aicoo_capabilities__request_capability",
+      toolInputSummary: expect.stringContaining("network.search"),
+    });
+  });
+
   it("projects only exact MCP grants into an MCP-only full-agent session", async () => {
     const tokenVariable = "AICOO_TEST_CLAUDE_MCP_TOKEN";
     process.env[tokenVariable] = "test-token";
@@ -1100,6 +1191,7 @@ describe("CodeAdapter just-in-time tool approval", () => {
     const options = await startedAdapter(g, mcpOnlyPolicyFile(tokenVariable), "collab-mcp", "full-agent");
 
     expect(options.mcpServers).toEqual({
+      aicoo_capabilities: expect.anything(),
       docs: {
         type: "http",
         url: "https://mcp.example.com/v1",
@@ -1113,6 +1205,8 @@ describe("CodeAdapter just-in-time tool approval", () => {
         alwaysLoad: true,
       },
     });
+    expect(options.systemPrompt).toContain("mcp.docs.read");
+    expect(options.systemPrompt).not.toContain("mcp.docs.search");
     expect(options.strictMcpConfig).toBe(true);
     expect(options.additionalDirectories).toBeUndefined();
 

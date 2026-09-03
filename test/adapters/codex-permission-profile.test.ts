@@ -241,7 +241,58 @@ describe("codex permission profile", () => {
     // A plugin can bundle skills, MCP servers, and executable hooks. Copying the owner's
     // plugin directory would grant all of those without a relationship-level capability record.
     expect(existsSync(join(prepared.codexHome, "plugins"))).toBe(false);
+    expect(profile).toContain("[features]");
+    expect(profile).toContain("plugins = false");
+    expect(profile).toContain("apps = false");
+    expect(profile).toContain("remote_plugin = false");
+    expect(profile).toContain("hooks = false");
     expect(profile).toContain('":root" = "deny"');
+  });
+
+  it("copies only owner skill bundles into an isolated full-agent home", () => {
+    const dir = tempDir("codex-owner-skills-");
+    const ownerRoot = join(dir, "owner");
+    const skill = join(ownerRoot, "plugins", "calendar", "skills", "schedule");
+    mkdirSync(join(skill, "scripts"), { recursive: true });
+    writeFileSync(join(skill, "SKILL.md"), "# Schedule\nUse the calendar safely.\n");
+    writeFileSync(join(skill, "scripts", "list.js"), "console.log('listed')\n");
+    writeFileSync(join(ownerRoot, "plugins", "calendar", "plugin.json"), '{"hooks":["unsafe"]}');
+    writeFileSync(join(ownerRoot, "plugins", "calendar", "hooks.json"), '{"SessionStart":"shell"}');
+
+    const prepared = writeCodexPermissionProfile(join(dir, "isolated"), {
+      preset: "chat-only",
+      folders: [],
+      isolateRuntime: true,
+      includeOwnerSkills: true,
+      ownerSkillRoots: [ownerRoot],
+      authFile: join(dir, "missing-auth.json"),
+    })!;
+
+    const copiedSkills = join(prepared.codexHome, "skills");
+    expect(existsSync(copiedSkills)).toBe(true);
+    const discovered = execFileSync("find", [copiedSkills, "-name", "SKILL.md"], { encoding: "utf8" });
+    expect(discovered).toContain("SKILL.md");
+    expect(execFileSync("find", [prepared.codexHome, "-name", "plugin.json"], { encoding: "utf8" })).toBe("");
+    expect(execFileSync("find", [prepared.codexHome, "-name", "hooks.json"], { encoding: "utf8" })).toBe("");
+    expect(readFileSync(join(prepared.codexHome, "config.toml"), "utf8")).toContain(
+      `${JSON.stringify(copiedSkills)} = "read"`,
+    );
+  });
+
+  it("allows the exact Codex runtime to launch in an isolated zero-grant profile", () => {
+    const dir = tempDir("codex-isolated-runtime-");
+    const runtime = join(dir, "codex");
+    writeFileSync(runtime, "runtime");
+
+    const profile = renderCodexPermissionProfile({
+      preset: "chat-only",
+      folders: [],
+      isolateRuntime: true,
+      runtimeExecutable: runtime,
+    })!;
+
+    expect(profile).toContain(`${JSON.stringify(runtime)} = "read"`);
+    expect(profile).toContain(`${JSON.stringify(dirname(runtime))} = "read"`);
   });
 });
 
