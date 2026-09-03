@@ -152,8 +152,8 @@ export async function authorizeDevice(options: {
   const start = await options.client.startDeviceCode({
     deviceId: options.deviceId,
     runtime: options.runtime,
-    bridgeVersion: "0.5.1",
-    adapterVersion: "0.5.1",
+    bridgeVersion: "0.5.2",
+    adapterVersion: "0.5.2",
     capabilities: ["comm:c2c", "runtime:adapter"],
   });
   const approvalUrl = validApprovalUrl(start.approvalUrl)

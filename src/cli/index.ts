@@ -91,7 +91,7 @@ const DEFAULT_SPOOL = process.env.CCD_SPOOL?.trim()
 
 const program = new Command()
   .name("ccd")
-  .version("0.5.1")
+  .version("0.5.2")
   .description("aicoo-local-agent realtime runtime-messaging CLI")
   .option("--server <url>", "control-plane URL", process.env.CCD_SERVER_URL ?? LOCAL_SERVER_URL)
   .option("--token <token>", "device bearer token", process.env.CCD_TOKEN);
@@ -114,8 +114,8 @@ program.command("login")
     const start = await unauthClient.startDeviceCode({
       deviceId,
       runtime: options.runtime,
-      bridgeVersion: "0.5.1",
-      adapterVersion: "0.5.1",
+      bridgeVersion: "0.5.2",
+      adapterVersion: "0.5.2",
       capabilities: ["comm:c2c", "runtime:adapter"],
       label: `${hostname()} (${options.runtime})`,
     });
